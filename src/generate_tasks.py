@@ -17,7 +17,7 @@ _CODE_DEFINITIONS = """Problem code definitions (report a code only when its def
 - duplicate: a row has the same ticker and the same date as an earlier row.
 - missing: a weekday inside the ticker's date range has no row.
 - bad_price: a single close deviates by more than 50% from both the previous and the next close and then reverts (a one-day spike, not a sustained level change).
-- split: a sustained drop to about half the previous close (ratio 0.4-0.6) that holds, from an unadjusted 2-for-1 split."""
+- split: a sustained drop to about half the previous close (ratio 0.4-0.6) that holds, from an unadjusted 2-for-1 split. Ratios are written as new shares per old share: A:B or A-for-B means A new shares for B old shares (1:0.5 is a forward split)."""
 
 
 class TaskGenerator:

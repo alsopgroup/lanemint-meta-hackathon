@@ -317,6 +317,85 @@ class TestZeroCountVsDecimals:
         assert categories_for_items([phrase]) == set()
 
 
+class TestNothingFoundPurity:
+    """A none/zero detail negates only when it is purely a nothing phrase.
+
+    A detail that goes on to describe a finding (a date, a spike, a
+    non-unique row) is a detection, and decimals are values, not counts.
+    """
+
+    @pytest.mark.parametrize(('phrase', 'want'), [
+        ('missing - no row for 2024-05-27', {'missing'}),
+        ('missing: no row for 2024-05-27', {'missing'}),
+        ('duplicate - not unique on 2024-03-04', {'duplicate'}),
+        ('bad_price - no reversion? spike', {'bad_price'}),
+        ('missing: no data on 2024-05-27', {'missing'}),
+        ('bad_price: 0,1x', {'bad_price'}),
+        ('bad_price: 0x10', {'bad_price'}),
+    ])
+    def test_findings_after_separator_stay_detected(self, phrase, want):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == want
+
+    @pytest.mark.parametrize('phrase', [
+        'bad prices: 0', 'count of duplicates: 0',
+    ])
+    def test_wordy_zero_counts_negate(self, phrase):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == set()
+
+    def test_ratio_notation_convention(self):
+        from src.scorer import categories_for_text
+        # A:B = A new shares for B old shares: 1:0.5 is 2-for-1, forward.
+        assert categories_for_text('split 1:0.5') == {'split'}
+        assert categories_for_text('reverse split 1:3') == {'reverse_split'}
+        assert categories_for_text('2:1 split') == {'split'}
+
+
+class TestRatiosVsClockTimes:
+    """A bare A:B is a share ratio only when it cannot be a clock time."""
+
+    @pytest.mark.parametrize('phrase', [
+        'duplicate row at 09:30',
+        'missing bar 2024-03-15 16:45',
+        'out of order: 10:45 before 10:15',
+        'market opens at 9:30 and bars are missing',
+        'timestamps at 09:30 use mixed Z and -05:00 offsets',
+    ])
+    def test_times_add_no_split_category(self, phrase):
+        from src.scorer import categories_for_text
+        got = categories_for_text(phrase)
+        assert 'split' not in got and 'reverse_split' not in got, (phrase, got)
+
+    def test_named_duplicate_timestamp_is_duplicate_not_timezone(self):
+        from src.scorer import categories_for_text
+        got = categories_for_text('duplicate timestamp 2024-03-13T09:30:00-04:00')
+        assert got == {'duplicate'}
+
+    def test_unit_scale_ratio_is_not_a_split(self):
+        from src.scorer import categories_for_text
+        assert categories_for_text('prices switched 100:1 to cents') == {'unit_change'}
+
+    @pytest.mark.parametrize(('phrase', 'want'), [
+        ('2-for-1', {'split'}), ('3:1', {'split'}), ('10:1', {'split'}),
+        ('1-for-10', {'reverse_split'}), ('1-for-3', {'reverse_split'}),
+        ('1:10 reverse split', {'reverse_split'}),
+        ('split 1:2', {'reverse_split'}), ('ratio 1:2', {'reverse_split'}),
+    ])
+    def test_real_ratios_still_classify(self, phrase, want):
+        from src.scorer import categories_for_text
+        assert categories_for_text(phrase) == want
+
+    @pytest.mark.parametrize(('phrase', 'want'), [
+        ('split: 1:2', {'reverse_split'}),
+        ('split: 1-for-10', {'reverse_split'}),
+        ('split: 2:1', {'split'}),
+    ])
+    def test_split_code_colon_reads_the_ratio(self, phrase, want):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == want
+
+
 class TestSplitRatioMapping:
     """Only 1-for-N (or explicit 'reverse') is a reverse split; N-for-1 is a split."""
 
