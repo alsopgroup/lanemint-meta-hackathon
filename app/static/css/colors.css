@@ -1,0 +1,52 @@
+/* LaneMint color tokens. Raw values transcribed from UIKit.fig Style Guide + Variables. */
+:root{
+/* Neutral (Style Guide / Neutral) */
+--neutral-900:#111111;--neutral-800:#424242;--neutral-700:#555555;--neutral-600:#6D6D6D;--neutral-500:#787878;--neutral-400:#939393;--neutral-300:#A5A5A5;--neutral-200:#DEDEDE;--neutral-20:#F5F5F5;--neutral-10:#FFFFFF;
+/* Graphite — additional dark fills used in the file */
+--graphite-1000:#010101;--graphite-950:#0F0E0E;--graphite-900:#0F0F0F;--graphite-850:#111111;--graphite-800:#2C2C2C;--graphite-700:#595959;
+/* Ink + hairlines used for text/strokes in the file */
+--ink-900:#0E121B;--ink-800:#0D0D12;--ink-700:#2B303B;--ink-500:#666D80;--line-light:#E4E7EC;--line-light-2:#DFE1E6;--line-light-3:#F6F6F6;
+/* Mint (Variables: primary-500, colors/green-500) + greens used in the file */
+--mint-500:#009D5E;--mint-600:#187A24;--mint-700:#125D1B;--mint-950:#213721;
+/* Lime (Style Guide / Primary — note: 900 is lightest in the source) */
+--lime-900:#FBFFE0;--lime-850:#FDFFE6;--lime-800:#F1FF96;--lime-700:#EBFF6A;--lime-600:#E2FF26;--lime-500:#DDFF00;--lime-450:#EFFF21;--lime-400:#D4E850;
+/* Semantic tints (Style Guide) */
+--success-50:#EFEBFC;--error-10:#FCEBEB;--warning-10:#FFFDEC;
+/* Violet used in the file (pairs with success-50) */
+--violet-500:#8971F4;
+/* Solid error/warning — NOT in source (only tints are); derived in oklch for loss/fail states */
+--error-500:oklch(0.64 0.19 25);--warning-500:oklch(0.86 0.15 95);
+
+/* ---- Semantic aliases: dark graphite theme (default) ---- */
+--surface-page:var(--graphite-950);
+--surface-panel:var(--neutral-900);
+--surface-raised:oklch(0.21 0 0);
+--surface-sunken:var(--graphite-1000);
+--surface-inverse:var(--neutral-10);
+--line-1:var(--graphite-800);
+--line-2:var(--neutral-800);
+--line-focus:var(--mint-500);
+--text-1:var(--neutral-10);
+--text-2:var(--neutral-300);
+--text-3:var(--neutral-500);
+--text-inverse:var(--neutral-900);
+--accent:var(--mint-500);
+--accent-ink:var(--neutral-10);
+--accent-soft:color-mix(in oklch,var(--mint-500) 16%,transparent);
+--signal:var(--lime-500);
+--signal-ink:var(--neutral-900);
+--pnl-up:var(--mint-500);
+--pnl-down:var(--error-500);
+--status-pass:var(--mint-500);
+--status-fail:var(--error-500);
+--status-warn:var(--warning-500);
+--status-info:var(--violet-500);
+--chart-1:var(--mint-500);--chart-2:var(--lime-500);--chart-3:var(--violet-500);--chart-4:var(--neutral-400);--chart-grid:var(--graphite-800);
+}
+/* Light scope — mirrors the source's white Style Guide pages */
+[data-theme="light"]{
+--surface-page:var(--neutral-10);--surface-panel:var(--neutral-10);--surface-raised:var(--neutral-20);--surface-sunken:var(--neutral-20);--surface-inverse:var(--neutral-900);
+--line-1:var(--line-light);--line-2:var(--line-light-2);
+--text-1:var(--ink-900);--text-2:var(--ink-500);--text-3:var(--neutral-500);--text-inverse:var(--neutral-10);
+--chart-grid:var(--line-light);
+}

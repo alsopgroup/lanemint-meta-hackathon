@@ -1,0 +1,27 @@
+/* Fonts: Manrope (type ramp) + Inter (UI labels) from the Figma file; JetBrains Mono is an addition for numbers/code. Loaded from Google Fonts — no binaries were supplied. */
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Inter:wght@400;500;600&family=Inter+Tight:wght@500;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+:root{
+--font-display:"Manrope",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+--font-body:"Manrope",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+--font-ui:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+--font-tight:"Inter Tight","Inter",sans-serif;
+--font-mono:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace;
+--weight-regular:400;--weight-medium:500;--weight-semibold:600;--weight-bold:700;
+/* Manrope ramp — exact values from Style Guide / Typography */
+--h1-size:64px;--h1-lh:0.9;/* @kind font */--h1-ls:-0.03em;/* @kind font */
+--h2-size:48px;--h2-lh:1;/* @kind font */--h2-ls:-0.02em;/* @kind font */
+--h3-size:36px;--h3-lh:1;/* @kind font */--h3-ls:-0.01em;/* @kind font */
+--h4-size:32px;--h4-lh:1;/* @kind font */--h4-ls:-0.01em;/* @kind font */
+--h5-size:24px;--h5-lh:1.2;/* @kind font */--h5-ls:-0.02em;/* @kind font */
+--body-20-size:20px;--body-20-lh:28px;/* @kind font */--body-20-ls:-0.01em;/* @kind font */
+--body-18-size:18px;--body-18-lh:26px;/* @kind font */--body-18-ls:-0.01em;/* @kind font */
+--body-16-size:16px;--body-16-lh:24px;/* @kind font */--body-16-ls:0;/* @kind font */
+--body-14-size:14px;--body-14-lh:1.4;/* @kind font */--body-14-ls:-0.01em;/* @kind font */
+--body-12-size:12px;--body-12-lh:1.4;/* @kind font */--body-12-ls:-0.01em;/* @kind font */
+--body-8-size:8px;--body-8-lh:12px;/* @kind font */--body-8-ls:-0.01em;/* @kind font */
+/* Inter UI labels */
+--label-16-size:16px;--label-12-size:12px;--label-ls:0.25px;/* @kind font */
+/* Semantic */
+--text-display:var(--weight-regular) var(--h1-size)/var(--h1-lh) var(--font-display);
+--text-body:var(--weight-regular) var(--body-16-size)/var(--body-16-lh) var(--font-body);
+}
