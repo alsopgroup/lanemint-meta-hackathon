@@ -90,14 +90,19 @@ class TaskGenerator:
         return df, f"bad_price_{date_str}_{bad_multiplier}"
 
     def inject_stock_split(self, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-        """Inject an unadjusted 2-for-1 stock split."""
+        """
+        Inject an unadjusted 2-for-1 stock split.
+
+        Real 2-for-1 split: post-split prices are halved, volume doubles.
+        """
         idx = random.randint(20, len(df) - 20)
         split_ratio = 2.0
-        df.loc[idx:, ['open', 'high', 'low', 'close']] *= split_ratio
+        # Post-split: prices halved, volume doubled
+        df.loc[idx:, ['open', 'high', 'low', 'close']] /= split_ratio
         df.loc[idx:, ['open', 'high', 'low', 'close']] = df.loc[
             idx:, ['open', 'high', 'low', 'close']
         ].round(2)
-        df.loc[idx:, 'volume'] //= int(split_ratio)
+        df.loc[idx:, 'volume'] *= int(split_ratio)
         date_str = df.iloc[idx]['date'].strftime('%Y-%m-%d')
         return df, f"stock_split_{date_str}_{split_ratio}"
 
@@ -136,12 +141,13 @@ class TaskGenerator:
             'type': 'return_calculation',
             'prompt': f"""You are given price data for {ticker} in CSV format.
 The data may contain quality issues such as duplicate rows, missing days,
-or bad prices (single-day moves >50%).
+or bad price ticks.
 
 Cleaning rules:
 1. Remove duplicate rows (keep first occurrence)
 2. Note any missing trading days but proceed with available data
-3. Remove rows where the close price moved >50% from the previous day's close
+3. Remove bad price ticks: a tick is bad if its close price is >50% different from
+   BOTH the previous close AND the next close (use a 3-day window to identify outliers)
 4. After cleaning, calculate daily returns as: (close_t - close_t-1) / close_t-1
 
 Your task:
@@ -199,14 +205,15 @@ Return your answer as JSON with fields:
             'id': f'task_{self.task_id:03d}',
             'type': 'backtest',
             'prompt': f"""You are given price data for {ticker} in CSV format.
-The data may contain quality issues such as duplicate rows, bad prices,
+The data may contain quality issues such as duplicate rows, bad price ticks,
 or unadjusted stock splits.
 
 Cleaning rules:
 1. Remove duplicate rows (keep first occurrence)
-2. Remove rows where close price moved >50% from previous day
-3. If you detect a 2-for-1 split (prices roughly double), adjust all prices
-   BEFORE the split by multiplying by 2 (so post-split is the baseline)
+2. Remove bad price ticks: a tick is bad if its close is >50% different from
+   BOTH the previous and next close (identifies spike outliers)
+3. If you detect a 2-for-1 split (prices roughly halve, ~50% drop that stays),
+   adjust all prices BEFORE the split by dividing by 2 (normalize to post-split basis)
 4. Calculate total return as: (final_close - initial_close) / initial_close
 
 Your task:
@@ -283,34 +290,63 @@ Return your answer as JSON with fields:
 
         Implements the exact cleaning rules stated in prompts:
         1. Remove duplicates (keep first)
-        2. Remove bad prices (>50% single-day moves)
-        3. Adjust for splits if present (multiply pre-split by 2)
+        2. Adjust for splits if present (divide pre-split by 2 to match post-split basis)
+        3. Remove bad price ticks (outliers from both neighbors)
+
+        Order matters: detect splits BEFORE filtering bad prices, so split day isn't removed.
         """
         df = df.copy()
+        df = df.reset_index(drop=True)
 
         # 1. Remove duplicates
         df = df.drop_duplicates(subset=['date', 'ticker'], keep='first')
+        df = df.reset_index(drop=True)
 
-        # 2. Remove bad prices (>50% single-day moves)
-        # Calculate pct_change, but keep first row
-        df['pct_change'] = df['close'].pct_change().abs()
-        # Remove rows where pct_change >= 0.5 (but not NaN first row)
-        df = df[(df['pct_change'] < 0.5) | (df['pct_change'].isna())]
-        df = df.drop(columns=['pct_change'])
-
-        # 3. Adjust for stock split if present
+        # 2. Adjust for stock split FIRST (before filtering bad prices)
         if has_split:
-            # Detect split: find where price roughly doubles
+            # Detect split: find where price roughly halves (ratio ~0.5)
             df['ratio'] = df['close'] / df['close'].shift(1)
-            split_idx = df[df['ratio'] > 1.8].index
-            if len(split_idx) > 0:
-                # Adjust all prices BEFORE the split by multiplying by 2
-                first_split = split_idx[0]
-                df.loc[:first_split-1, ['open', 'high', 'low', 'close']] *= 2.0
-                df.loc[:first_split-1, ['open', 'high', 'low', 'close']] = df.loc[
-                    :first_split-1, ['open', 'high', 'low', 'close']
-                ].round(2)
+            split_indices = df[df['ratio'] < 0.6].index.tolist()
+
+            if len(split_indices) > 0:
+                # Use the first detected split
+                split_pos = split_indices[0]
+
+                # Adjust all prices BEFORE the split by dividing by 2
+                # (to match post-split basis)
+                # Use iloc for safe position-based indexing
+                if split_pos > 0:
+                    df.loc[df.index < split_pos, ['open', 'high', 'low', 'close']] /= 2.0
+                    df.loc[df.index < split_pos, ['open', 'high', 'low', 'close']] = df.loc[
+                        df.index < split_pos, ['open', 'high', 'low', 'close']
+                    ].round(2)
+                    # Volume adjustment: multiply pre-split volume by 2
+                    df.loc[df.index < split_pos, 'volume'] *= 2
+
             df = df.drop(columns=['ratio'])
+            df = df.reset_index(drop=True)
+
+        # 3. Remove bad price ticks AFTER split adjustment
+        # A tick is bad if it's >50% away from BOTH previous AND next close
+        # This correctly identifies spikes without removing the day after
+        df['prev_close'] = df['close'].shift(1)
+        df['next_close'] = df['close'].shift(-1)
+
+        # Calculate deviations from neighbors
+        df['dev_from_prev'] = ((df['close'] - df['prev_close']) / df['prev_close']).abs()
+        df['dev_from_next'] = ((df['close'] - df['next_close']) / df['next_close']).abs()
+
+        # A tick is bad if BOTH deviations are > 0.5
+        # Keep first and last rows (they don't have both neighbors)
+        df['is_bad_tick'] = (
+            (df['dev_from_prev'] > 0.5) &
+            (df['dev_from_next'] > 0.5) &
+            df['prev_close'].notna() &
+            df['next_close'].notna()
+        )
+
+        df = df[~df['is_bad_tick']]
+        df = df.drop(columns=['prev_close', 'next_close', 'dev_from_prev', 'dev_from_next', 'is_bad_tick'])
 
         df = df.reset_index(drop=True)
         return df
