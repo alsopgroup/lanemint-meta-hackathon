@@ -103,18 +103,24 @@ class TaskRunner:
         if self.dry_run:
             response = self.client.chat_completions_create(messages=messages)
         else:
+            extra = {}
+            if os.getenv('META_REASONING_EFFORT'):
+                extra['reasoning_effort'] = os.getenv('META_REASONING_EFFORT')
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
                 temperature=0.1,
-                max_tokens=1000
+                # muse-spark-1.3 is a reasoning model: reasoning tokens count against
+                # max_tokens, so 1000 left no room for the answer (empty content).
+                max_tokens=int(os.getenv('META_MAX_TOKENS', '16000')),
+                **extra
             )
 
         return {
             'task_id': task['id'],
             'task_type': task['type'],
             'response': response['choices'][0]['message']['content'] if self.dry_run
-                       else response.choices[0].message.content
+                       else (response.choices[0].message.content or '')
         }
 
     def run_all_tasks(
