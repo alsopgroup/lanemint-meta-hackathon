@@ -119,7 +119,7 @@ class TestTaskGenerator:
         # Same seed should produce identical data
         assert len(df1) == len(df2)
         assert df1.iloc[0]['close'] == df2.iloc[0]['close']
-        
+
         # Expected values should match (they might differ in task_id but not in expected results)
         # The key is that the actual data and calculations are the same
         assert task1['expected']['mean_return'] == task2['expected']['mean_return']
