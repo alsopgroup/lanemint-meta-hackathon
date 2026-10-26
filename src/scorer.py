@@ -25,7 +25,7 @@ _IDIOM_NEG = re.compile(
 _UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
                   "suspected", "unconfirmed", "maybe", "perhaps", "unlikely"}
 _CODE_NEGATED = re.compile(
-    r"^\s*(none\b|not\b|no\b|0\b|zero\b|absent\b|ruled out\b|not present\b|"
+    r"^\s*(none\b|not\b|no\b|0(?!\.?\d)|zero\b|absent\b|ruled out\b|not present\b|"
     r"not detected\b|not found\b|no issues?\b|nothing\b|n/?a\b)")
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
@@ -91,7 +91,8 @@ def _occurrence_positive(text, match):
     # found", "there are 0 duplicate rows") means not detected. Decimals
     # such as 0.1 do not match: the 0 must be a standalone token.
     lo_bound, _ = _clause_bounds(text, match.start(), match.end())
-    if re.search(r"(?:^|\s)0\s+(?:\w+\s+)?$", text[lo_bound:match.start()]):
+    if re.search(r"(?:^|\s)0(?!\.?\d)\s+(?:\w+\s+)?$",
+                 text[lo_bound:match.start()]):
         return False
     if _UNCERTAIN.search(clause) or _IDIOM_NEG.search(clause):
         # "besides/except" re-asserts what follows it: "no issues besides a duplicate"
@@ -184,6 +185,17 @@ def categories_for_items(items):
     found = set()
     for item in items or []:
         text = str(item).strip().lower()
+        # Explicit non-detections with a code-like head, including plural
+        # or wordy heads and dash separators ("duplicates: 0",
+        # "missing days: 0", "split - none"). Decimals never negate.
+        neg = re.match(
+            r"^([a-z_]+)(?:\s+[a-z]+)?\s*(?::|—|–|-)\s*"
+            r"(?:none|zero|no|not|nothing|n/?a|0(?!\.?\d))\b", text)
+        if neg:
+            head = neg.group(1)
+            if head in CANONICAL_CATEGORIES or \
+                    (head.endswith("s") and head[:-1] in CANONICAL_CATEGORIES):
+                continue
         m = re.match(r"^([a-z_]+)\s*(?::|—|–|$)", text)
         code = m.group(1).replace(" ", "_") if m else None
         if code in CANONICAL_CATEGORIES:
@@ -198,7 +210,8 @@ def categories_for_items(items):
                          if text.startswith(c + "_")), None)
         if key_code is not None:
             rest = text[len(key_code):]
-            if not re.search(r"[:\-—–]\s*(none|0|zero|no|not|nothing|n/?a)\b", rest):
+            if not re.search(r"[:\-—–]\s*(none|0(?!\.?\d)|zero|no|not|nothing|n/?a)\b",
+                             rest):
                 found.add(key_code)
         else:
             found |= categories_for_text(text)

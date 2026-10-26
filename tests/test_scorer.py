@@ -292,6 +292,31 @@ class TestNewNegationPhrases:
         assert categories_for_text('timestamps mix utc and offsets') == {'timezone'}
 
 
+class TestZeroCountVsDecimals:
+    """Explicit none/0 counts negate; decimals (0.1, 0.5) never do."""
+
+    @pytest.mark.parametrize(('phrase', 'want'), [
+        ('bad_price: 0.1x spike on 2024-07-09', {'bad_price'}),
+        ('bad_price: 0.10x', {'bad_price'}),
+        ('split: 0.5 ratio on 2024-06-03', {'split'}),
+        ('split_2024-06-03: 0.5 ratio', {'split'}),
+        ('bad_price_2024-07-09: 0.1x', {'bad_price'}),
+        ('missing: 0.5% of days', {'missing'}),
+    ])
+    def test_decimals_still_detect(self, phrase, want):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == want
+
+    @pytest.mark.parametrize('phrase', [
+        'duplicate_rows: none', 'missing: 0', '0 duplicates found',
+        'duplicate: 0', 'duplicates: 0', 'missing days: 0', 'split - none',
+        'There are 0 duplicate rows',
+    ])
+    def test_zero_counts_do_not_detect(self, phrase):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == set()
+
+
 class TestSplitRatioMapping:
     """Only 1-for-N (or explicit 'reverse') is a reverse split; N-for-1 is a split."""
 
