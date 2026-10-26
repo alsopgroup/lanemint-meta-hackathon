@@ -97,9 +97,18 @@ Edit `.env` and set your Meta API credentials (do not commit this file):
 META_API_KEY=your_api_key_here
 META_BASE_URL=https://api.meta.ai/v1
 META_MODEL_NAME=muse-spark-1.3
+
+# Optional: muse-spark-1.3 is a reasoning model
+# Reasoning tokens count against max_tokens; increase if answers are truncated
+META_MAX_TOKENS=16000
+
+# Optional: control reasoning effort (if supported by model)
+# META_REASONING_EFFORT=medium
 ```
 
 The API is OpenAI-compatible. Available models: `muse-spark-1.3` (default), `muse-spark-1.2`, `muse-spark-1.1`.
+
+**Note**: `META_MAX_TOKENS` defaults to 16000. Muse Spark 1.3 is a reasoning model where reasoning tokens count against the limit, so a higher value prevents truncated answers.
 
 ---
 
@@ -117,6 +126,22 @@ This creates:
 - `tasks/tasks.json` - Task definitions and prompts
 - `tasks/task_*.csv` - Dirty market data CSV files
 - `tasks/answers/` - Expected answers (hidden from model)
+
+**Options**:
+- `--seed SEED`: Random seed for reproducibility (default: 42)
+- `--count COUNT`: Number of tasks to generate (default: 25)
+- `--output-dir DIR`: Output directory (default: tasks/)
+
+**Important**: The default seed 42 is reserved for the evaluation set. Use different seeds when generating training data to avoid train/eval overlap:
+
+```bash
+# Evaluation set (seed 42, default)
+python -m src.generate_tasks
+
+# Training data (different seeds)
+python -m src.generate_tasks --seed 100 --count 100 --output-dir train_tasks_100
+python -m src.generate_tasks --seed 200 --count 100 --output-dir train_tasks_200
+```
 
 ### 2. Run Tasks (Dry Run)
 
