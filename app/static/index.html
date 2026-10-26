@@ -48,7 +48,7 @@
       <button class="btn btn-primary btn-lg" id="heroTrySample" type="button">Try a sample →</button>
       <button class="btn btn-secondary btn-lg" id="heroUpload" type="button">Upload CSV</button>
     </div>
-    <div class="hero-meta"><img src="/static/assets/meta-ai.png" alt="Meta"><span>Built with Meta's Muse models</span></div>
+    <div class="hero-meta"><span>Built with</span><img class="meta-wordmark" src="/static/assets/meta-ai-logo.png" alt="Meta AI"><span>Muse models</span></div>
   </div>
 </section>
 
@@ -59,6 +59,10 @@
   </div>
 
   <div class="panel app-panel">
+    <div class="demo-banner" id="demoBanner">
+      <strong>Demo mode</strong>
+      <span id="demoBannerText">No Meta API key is configured on the server, so no model is called. Findings, timings, and scores below are simulated for illustration — set <span class="mono">META_API_KEY</span> on the server for live Muse Spark runs.</span>
+    </div>
     <div class="stepper" id="stepper"></div>
 
     <div id="stepData"></div>

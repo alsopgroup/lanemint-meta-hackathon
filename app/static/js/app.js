@@ -8,11 +8,12 @@
 const STEPS = [['read', 'Reading file', 0.16], ['dups', 'Checking duplicates', 0.18], ['gaps', 'Checking gaps', 0.2], ['prices', 'Checking prices', 0.24], ['splits', 'Checking splits', 0.22]];
 const TYPES = { dups: ['Duplicate', 'var(--violet-500)'], gaps: ['Gap', 'var(--warning-500)'], prices: ['Bad price', 'var(--error-500)'], splits: ['Split', 'var(--lime-500)'] };
 
-const state = { sid: 's1', step: 'data', stage: 'idle', elapsed: 0, view: 'raw', active: -1, drag: false, upload: null, live: null, err: null };
+const state = { sid: 's1', step: 'data', stage: 'idle', elapsed: 0, view: 'raw', active: -1, drag: false, upload: null, live: null, err: null, runMode: null };
 let appConfig = { live: false, mode: 'simulated', model: 'muse-spark' };
 let timer = null;
 let pendingLive = false;
-let liveFailed = false;
+let currentRunId = 0;
+let currentAbort = null;
 
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -146,7 +147,16 @@ function parseCSV(text, name) {
 }
 function toCSV(s) { return [s.cols.map(c => c[1]).join(',')].concat(s.rows.map(r => s.cols.map(c => fmtV(r.cells[c[0]], c[2]).replace('−', '-').replace(/,/g, '')).join(','))).join('\n'); }
 function cur() { return state.upload || S.find(s => s.id === state.sid); }
-function isLive() { return appConfig.live && !liveFailed; }
+function serverLive() { return !!appConfig.live; }
+/* Mode of the current/last run, snapshotted when the run starts so a
+   late /api/config response or a mid-run failure cannot change what
+   the timer is waiting for. Falls back to the server mode when idle. */
+function simulatedRun() { return state.runMode ? state.runMode !== 'live' : !serverLive(); }
+function cancelInFlight() {
+  currentRunId++;
+  if (currentAbort) { currentAbort.abort(); currentAbort = null; }
+  pendingLive = false;
+}
 function score(s, findings) {
   if (s.upload) return null;
   const m = new Set();
@@ -160,29 +170,46 @@ function scrollToApp() { const el = $('app'); if (el) window.scrollTo({ top: el.
 function run() {
   if (state.stage === 'running') return;
   clearInterval(timer);
-  const s = cur(), live = isLive(), t0 = performance.now();
-  Object.assign(state, { step: 'analyze', stage: 'running', elapsed: 0, live: null, err: null, active: -1, view: 'raw' });
-  liveFailed = false;
+  cancelInFlight();
+  const runId = currentRunId;
+  const s = cur(), live = serverLive(), t0 = performance.now();
+  Object.assign(state, { step: 'analyze', stage: 'running', elapsed: 0, live: null, err: null, active: -1, view: 'raw', runMode: live ? 'live' : 'simulated' });
   if (live) {
     pendingLive = true;
-    fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: appConfig.model || 'muse-spark', filename: s.file, csv: toCSV(s) }) })
+    const controller = new AbortController();
+    currentAbort = controller;
+    fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ filename: s.file, csv: toCSV(s) }) })
       .then(r => { if (!r.ok) throw new Error('Endpoint returned HTTP ' + r.status); return r.json(); })
-      .then(j => { pendingLive = false; state.live = { findings: (j.findings || []).map(f => ({ step: f.type || f.step, title: f.title || 'Problem', rows: (f.rows || []).map(Number), explain: f.explain || f.explanation || '' })), ms: Math.round(j.latency_ms || performance.now() - t0), model: j.model }; })
-      .catch(() => { pendingLive = false; liveFailed = true; state.err = 'Live call failed — showing simulated responses.'; renderMode(); });
+      .then(j => {
+        if (runId !== currentRunId) return; // stale run: a newer run owns the UI
+        pendingLive = false;
+        state.live = { findings: (j.findings || []).map(f => ({ step: f.type || f.step, title: f.title || 'Problem', rows: (f.rows || []).map(Number), explain: f.explain || f.explanation || '' })), ms: Math.round(j.latency_ms || performance.now() - t0), model: j.model };
+      })
+      .catch(() => {
+        if (runId !== currentRunId) return; // aborted/superseded: stay silent
+        pendingLive = false;
+        // Fall back to simulated *within this run*: flipping runMode is
+        // safe because the timer reads the per-run snapshot, and this
+        // run now completes on simulated pacing instead of hanging.
+        state.runMode = 'simulated';
+        state.err = 'Live call failed — showing simulated demo results, not a live model run.';
+        renderMode();
+      });
   }
   render();
   timer = setInterval(() => {
+    if (runId !== currentRunId) { clearInterval(timer); return; }
     const el = performance.now() - t0;
     const fin = ms => { clearInterval(timer); state.stage = 'done'; state.elapsed = ms; render(); };
-    if (isLive()) { if (!pendingLive && state.live) fin(state.live.ms); else { state.elapsed = el; renderAnalyze(); renderStepper(); } }
+    if (state.runMode === 'live') { if (!pendingLive && state.live) fin(state.live.ms); else { state.elapsed = el; renderAnalyze(); renderStepper(); } }
     else if (el >= s.ms) fin(s.ms); else { state.elapsed = el; renderAnalyze(); renderStepper(); }
   }, 40);
 }
-function trySample() { clearInterval(timer); Object.assign(state, { sid: 's1', upload: null, stage: 'idle', step: 'data', live: null, err: null }); render(); scrollToApp(); setTimeout(run, 500); }
+function trySample() { clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: 's1', upload: null, stage: 'idle', step: 'data', live: null, err: null, runMode: null }); render(); scrollToApp(); setTimeout(run, 500); }
 function pickFile() { const f = $('fileInput'); if (f) f.click(); }
 function loadFile(file) {
   if (!file) return; const rd = new FileReader();
-  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); Object.assign(state, { upload: up, err: null, stage: 'idle', step: 'data', live: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
+  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
   rd.readAsText(file);
 }
 
@@ -196,9 +223,20 @@ function badge(tone, label, sm) {
 function currentFindings() { return state.stage === 'done' ? (state.live ? state.live.findings : cur().findings) : []; }
 
 function renderMode() {
-  const live = isLive();
+  const fallback = state.runMode === 'simulated' && serverLive();
+  const live = serverLive() && !fallback;
   $('modeDot').style.background = live ? 'var(--accent)' : 'var(--warning-500)';
-  $('modeText').textContent = live ? 'live · /api/check · ' + (appConfig.model || 'muse-spark') : 'simulated responses · set mode to live to call Muse';
+  $('modeText').textContent = live
+    ? 'live · /api/check · ' + (appConfig.model || 'muse-spark')
+    : fallback
+      ? 'live call failed · showing simulated demo results'
+      : 'demo mode · no API key configured — simulated responses';
+  const banner = $('demoBanner');
+  if (banner) {
+    banner.hidden = live;
+    const bannerText = $('demoBannerText');
+    if (bannerText && fallback) bannerText.textContent = 'The live Muse call failed, so the findings, timings, and scores below are simulated demo results — not a live model run.';
+  }
 }
 
 function renderStepper() {
@@ -208,7 +246,7 @@ function renderStepper() {
   const sc = done ? score(s, findings) : null;
   const model = (st.live && st.live.model) || appConfig.model || 'muse-spark';
   const order = ['data', 'analyze', 'findings', 'score'], ci = order.indexOf(st.step);
-  const subs = { data: s.file, analyze: running ? 'running…' : done ? fmtV(st.elapsed, 'int') + ' ms' : model, findings: done ? findings.length + ' found' : '—', score: sc ? sc.val.toFixed(2) + (sc.pass ? ' · pass' : ' · fail') : (done && s.upload ? 'no answer key' : '—') };
+  const subs = { data: s.file, analyze: running ? 'running…' : done ? (simulatedRun() ? 'simulated' : fmtV(st.elapsed, 'int') + ' ms') : (serverLive() ? model : 'simulated'), findings: done ? findings.length + ' found' : '—', score: sc ? sc.val.toFixed(2) + (simulatedRun() ? ' · demo' : (sc.pass ? ' · pass' : ' · fail')) : (done && s.upload ? 'no answer key' : '—') };
   $('stepper').innerHTML = [['data', 'Data'], ['analyze', 'Analyze'], ['findings', 'Findings'], ['score', 'Score']].map(([k, label], i) => {
     const enabled = k === 'data' || k === 'analyze' ? (k === 'data' || st.stage !== 'idle') : done;
     const isCur = st.step === k, past = i < ci;
@@ -243,7 +281,7 @@ function renderData() {
     <div class="col-main table-card">
       <div class="table-card-head">
         <div class="table-file"><span class="table-file-name">${esc(s.file)}</span><span class="table-file-meta">${(s.total || s.rows.length)} rows × ${s.cols.length} cols${s.total > 500 ? ' · first 500 analyzed' : ''}</span></div>
-        <button class="btn btn-primary btn-md" data-action="run" type="button">Run Muse Spark →</button>
+        <button class="btn btn-primary btn-md" data-action="run" type="button">${serverLive() ? 'Run Muse Spark →' : 'Run simulated check →'}</button>
       </div>
       <div class="table-scroll"><div class="table-inner">${tableHead(s, false)}${previewRows}</div></div>
     </div></div>`;
@@ -251,9 +289,9 @@ function renderData() {
 
 function renderAnalyze() {
   const el = $('stepAnalyze'); if (!el || state.step !== 'analyze') return;
-  const st = state, s = cur(), live = isLive();
+  const st = state, s = cur(), simulated = simulatedRun(), live = !simulated;
   const running = st.stage === 'running', done = st.stage === 'done';
-  const model = (st.live && st.live.model) || appConfig.model || 'muse-spark';
+  const model = simulated ? 'Simulated demo — no model called' : ((st.live && st.live.model) || appConfig.model || 'muse-spark');
   const total = live ? 5000 : s.ms, fr = done ? 1 : Math.min(st.elapsed / total, 0.97);
   const simF = live ? (st.live ? st.live.findings : []) : s.findings;
   let cum = 0;
@@ -262,31 +300,39 @@ function renderAnalyze() {
     const n = simF.filter(f => f.step === k).length, showN = isDone && (!live || done);
     const count = !isDone ? (isRun ? 'running' : '') : k === 'read' ? s.rows.length + ' rows · ' + s.cols.length + ' cols' : (showN ? (n ? n + ' found' : 'clear') : '');
     const dot = isDone ? (k !== 'read' && n ? TYPES[k][1] : 'var(--accent)') : isRun ? 'var(--lime-500)' : 'var(--line-2)';
-    return `<div class="analyze-step"><span class="analyze-dot" style="background:${dot};animation:${isRun ? 'lmPulse 900ms ease-in-out infinite' : 'none'}"></span><span class="analyze-step-label" style="color:${isDone || isRun ? 'var(--text-1)' : 'var(--text-3)'}">${label}</span><span class="analyze-step-count" style="color:${isDone && k !== 'read' && n ? TYPES[k][1] : 'var(--text-3)'}">${esc(count)}</span><span class="analyze-step-ms">${isDone && !live ? fmtV(w * s.ms, 'int') + ' ms' : ''}</span></div>`;
+    return `<div class="analyze-step"><span class="analyze-dot" style="background:${dot};animation:${isRun ? 'lmPulse 900ms ease-in-out infinite' : 'none'}"></span><span class="analyze-step-label" style="color:${isDone || isRun ? 'var(--text-1)' : 'var(--text-3)'}">${label}</span><span class="analyze-step-count" style="color:${isDone && k !== 'read' && n ? TYPES[k][1] : 'var(--text-3)'}">${esc(count)}</span><span class="analyze-step-ms"></span></div>`;
   }).join('');
   const logLines = [];
   if (st.stage !== 'idle') {
-    logLines.push({ t: `→ POST /v1/chat/completions  model=${model}`, c: 'var(--text-2)' });
-    logLines.push({ t: `  file=${s.file}  rows=${s.rows.length}  cols=${s.cols.length}`, c: 'var(--text-3)' });
-    let c2 = 0; STEPS.forEach(([k, , w]) => { c2 += w; if (done || fr >= c2) simF.filter(f => f.step === k).forEach(f => logLines.push({ t: `{"type":"${k}","rows":[${(f.rows || []).join(',')}],"title":"${f.title}"}`, c: TYPES[k] ? TYPES[k][1] : 'var(--text-1)' })); });
-    if (running) logLines.push({ t: '▍', c: 'var(--accent)' });
-    if (done) logLines.push({ t: `← 200 OK  ${fmtV(st.elapsed, 'int')} ms  ·  ${currentFindings().length} findings`, c: 'var(--accent)' });
+    if (simulated) {
+      logLines.push({ t: '[simulated] No API request was sent — demo data only, no model was called', c: 'var(--warning-500)' });
+      logLines.push({ t: `  file=${s.file}  rows=${s.rows.length}  cols=${s.cols.length}`, c: 'var(--text-3)' });
+      let c2 = 0; STEPS.forEach(([k, , w]) => { c2 += w; if (done || fr >= c2) simF.filter(f => f.step === k).forEach(f => logLines.push({ t: `[simulated] {"type":"${k}","rows":[${(f.rows || []).join(',')}],"title":"${f.title}"}`, c: TYPES[k] ? TYPES[k][1] : 'var(--text-1)' })); });
+      if (running) logLines.push({ t: '▍', c: 'var(--accent)' });
+      if (done) logLines.push({ t: `Demo complete · ${currentFindings().length} simulated findings`, c: 'var(--warning-500)' });
+    } else {
+      logLines.push({ t: `→ POST /api/check  model=${model}`, c: 'var(--text-2)' });
+      logLines.push({ t: `  file=${s.file}  rows=${s.rows.length}  cols=${s.cols.length}`, c: 'var(--text-3)' });
+      let c2 = 0; STEPS.forEach(([k, , w]) => { c2 += w; if (done || fr >= c2) simF.filter(f => f.step === k).forEach(f => logLines.push({ t: `{"type":"${k}","rows":[${(f.rows || []).join(',')}],"title":"${f.title}"}`, c: TYPES[k] ? TYPES[k][1] : 'var(--text-1)' })); });
+      if (running) logLines.push({ t: '▍', c: 'var(--accent)' });
+      if (done) logLines.push({ t: `← 200 OK  ${fmtV(st.elapsed, 'int')} ms  ·  ${currentFindings().length} findings`, c: 'var(--accent)' });
+    }
     if (st.err) logLines.push({ t: '← ' + st.err, c: 'var(--status-fail)' });
   }
-  const statusLabel = { idle: 'Ready', running: 'Running', done: 'Complete', error: 'Error' }[st.stage];
+  const statusLabel = simulated && st.stage === 'done' ? 'Demo complete' : { idle: 'Ready', running: 'Running', done: 'Complete', error: 'Error' }[st.stage];
   const statusTone = { idle: 'neutral', running: 'warn', done: 'pass', error: 'fail' }[st.stage];
   el.innerHTML = `<div class="step-body step-body-stretch">
     <div class="analyze-card">
       <div class="analyze-head">
-        <div class="analyze-field"><span class="card-label">Model</span><span class="analyze-model"><img src="/static/assets/meta-ai.png" alt="">${esc(model)}</span></div>
-        <div class="analyze-field analyze-field-end"><span class="card-label">Response time</span><span class="analyze-elapsed">${fmtV(st.elapsed, 'int')}<small>ms</small></span></div>
+        <div class="analyze-field"><span class="card-label">Model</span><span class="analyze-model" style="${simulated ? 'font-size:16px;color:var(--warning-500)' : ''}"><img src="/static/assets/meta-ai.png" alt="">${esc(model)}</span></div>
+        <div class="analyze-field analyze-field-end"><span class="card-label">${simulated ? 'Simulated run' : 'Response time'}</span><span class="analyze-elapsed">${simulated ? '—' : fmtV(st.elapsed, 'int') + '<small>ms</small>'}</span></div>
       </div>
       <div class="progress-track"><div class="progress-bar" style="width:${Math.round(fr * 100)}%"></div></div>
       <div class="analyze-steps">${stepsHtml}</div>
       <div class="analyze-status">${badge(statusTone, statusLabel, true)}${st.err ? `<span class="form-error" style="font-size:13px">${esc(st.err)}</span>` : ''}</div>
     </div>
     <div class="stream-card">
-      <div class="stream-head"><span>response stream</span><span>${done ? currentFindings().length + ' findings' : running ? 'streaming' : ''}</span></div>
+      <div class="stream-head"><span>${simulated ? 'simulated stream — no request sent' : 'response stream'}</span><span>${done ? currentFindings().length + ' findings' : running ? 'streaming' : ''}</span></div>
       <div class="stream-log">${logLines.map(ln => `<span style="color:${ln.c}">${esc(ln.t)}</span>`).join('')}</div>
       ${done ? '<div class="stream-foot"><button class="btn btn-primary btn-sm" data-action="go" data-step="findings" type="button">See findings →</button></div>' : ''}
     </div></div>`;
@@ -347,13 +393,14 @@ function renderScore() {
     html += '<div class="score-empty">Uploaded files have no answer key, so they can\'t be scored. Run one of the seeded samples to see a score.</div>';
   }
   if (sc) {
+    const simulated = simulatedRun();
     const verdicts = findings.map((f, i) => ({ tag: sc.verdict[i] === 'ok' ? 'Caught' : 'False flag', tone: sc.verdict[i] === 'ok' ? 'pass' : 'warn', title: f.title, rowsTxt: rowsTxt(f.rows), note: sc.verdict[i] === 'ok' ? '' : (f.note || 'Does not match any planted problem.'), hasNote: sc.verdict[i] !== 'ok' }))
       .concat(sc.missed.map(m => ({ tag: 'Missed', tone: 'fail', title: m.title, rowsTxt: rowsTxt(m.rows), note: m.explain, hasNote: true })));
     html += `<div class="score-flex">
       <div class="score-main" style="box-shadow:inset 0 0 0 1px ${sc.pass ? 'var(--accent)' : 'var(--status-fail)'}">
-        <div class="score-main-top"><span class="card-label">Deterministic scorer</span>${badge(sc.pass ? 'pass' : 'fail', sc.pass ? 'Pass' : 'Fail', false)}</div>
+        <div class="score-main-top"><span class="card-label">Deterministic scorer${simulated ? ' (demo)' : ''}</span>${badge(sc.pass ? 'pass' : 'fail', simulated ? (sc.pass ? 'Demo pass' : 'Demo fail') : (sc.pass ? 'Pass' : 'Fail'), false)}</div>
         <div class="score-value-row"><span class="score-value" style="color:${sc.pass ? 'var(--accent)' : 'var(--status-fail)'}">${sc.val.toFixed(2)}</span><span class="score-scale">/ 1.00 · pass at 0.80</span></div>
-        <span class="score-formula">score = (caught − 0.5 × false flags) ÷ planted</span>
+        <span class="score-formula">score = (caught − 0.5 × false flags) ÷ planted${simulated ? '<br>Demo score against the seeded answer key — not a live model result.' : ''}</span>
       </div>
       <div class="score-side">
         <div class="score-tiles">
@@ -439,22 +486,24 @@ document.addEventListener('click', (e) => {
   const t = e.target.closest('[data-action]'); if (!t) return;
   const a = t.dataset.action; if (!a) return;
   if (a === 'go') { state.step = t.dataset.step; render(); }
-  else if (a === 'sample') { const id = t.dataset.id; if (id === 'upload') return; clearInterval(timer); Object.assign(state, { sid: id, upload: null, stage: 'idle', step: 'data', live: null, err: null, active: -1 }); render(); }
+  else if (a === 'sample') { const id = t.dataset.id; if (id === 'upload') return; clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: id, upload: null, stage: 'idle', step: 'data', live: null, err: null, active: -1, runMode: null }); render(); }
   else if (a === 'pick-file') pickFile();
   else if (a === 'run') run();
   else if (a === 'card') { const i = Number(t.dataset.index); state.active = state.active === i ? -1 : i; render(); }
   else if (a === 'view') { state.view = t.dataset.view; render(); }
-  else if (a === 'restart') { Object.assign(state, { step: 'data', stage: 'idle', active: -1, live: null }); clearInterval(timer); render(); scrollToApp(); }
+  else if (a === 'restart') { clearInterval(timer); cancelInFlight(); Object.assign(state, { step: 'data', stage: 'idle', active: -1, live: null, runMode: null }); render(); scrollToApp(); }
 });
 $('fileInput').addEventListener('change', (e) => { loadFile(e.target.files && e.target.files[0]); e.target.value = ''; });
 $('heroTrySample').addEventListener('click', trySample);
 $('heroUpload').addEventListener('click', pickFile);
-document.addEventListener('dragover', (e) => { if (e.target.closest && e.target.closest('#dropZone')) { e.preventDefault(); if (!state.drag) { state.drag = true; render(); } } });
-document.addEventListener('dragleave', (e) => { if (e.target.closest && e.target.closest('#dropZone')) { state.drag = false; render(); } });
-document.addEventListener('drop', (e) => { if (e.target.closest && e.target.closest('#dropZone')) { e.preventDefault(); state.drag = false; loadFile(e.dataTransfer.files && e.dataTransfer.files[0]); } });
+/* Drag styling toggles the class directly on the node: re-rendering
+   here would destroy the drop zone mid-drag and flicker/miss drops. */
+document.addEventListener('dragover', (e) => { const z = e.target.closest && e.target.closest('#dropZone'); if (z) { e.preventDefault(); z.classList.add('dragging'); } });
+document.addEventListener('dragleave', (e) => { const z = e.target.closest && e.target.closest('#dropZone'); if (z && !(e.relatedTarget instanceof Node && z.contains(e.relatedTarget))) z.classList.remove('dragging'); });
+document.addEventListener('drop', (e) => { const z = e.target.closest && e.target.closest('#dropZone'); if (z) { e.preventDefault(); z.classList.remove('dragging'); loadFile(e.dataTransfer.files && e.dataTransfer.files[0]); } });
 
 /* ---------------- boot ---------------- */
 renderBenchmark();
 render();
 initWaves();
-fetch('/api/config').then(r => r.ok ? r.json() : null).then(cfg => { if (cfg) { appConfig = cfg; renderMode(); renderStepper(); } }).catch(() => {});
+fetch('/api/config').then(r => r.ok ? r.json() : null).then(cfg => { if (cfg) { appConfig = cfg; render(); } }).catch(() => {});

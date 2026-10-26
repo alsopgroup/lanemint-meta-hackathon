@@ -61,6 +61,7 @@ button{font:inherit}
 .hero-actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
 .hero-meta{display:flex;align-items:center;gap:10px;margin-top:8px;color:var(--text-3);font-family:var(--font-ui);font-size:13px;letter-spacing:.25px}
 .hero-meta img{width:22px;height:22px}
+.hero-meta img.meta-wordmark{width:auto;height:24px}
 
 /* ---------- App / demo panel ---------- */
 .app-section{scroll-margin-top:68px;max-width:1200px;margin:0 auto;padding:72px 24px 96px;display:flex;flex-direction:column;gap:24px}
@@ -71,6 +72,9 @@ button{font:inherit}
 .mode-text{font-family:var(--font-mono);font-size:12px;color:var(--text-3)}
 .panel{background:var(--surface-panel);box-shadow:inset 0 0 0 1px var(--line-1)}
 .app-panel{border-radius:24px;overflow:hidden}
+.demo-banner{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:14px 20px;background:color-mix(in oklch,var(--warning-500) 10%,transparent);border-bottom:1px solid color-mix(in oklch,var(--warning-500) 45%,transparent);color:var(--text-2);font-size:14px;line-height:1.5}
+.demo-banner strong{color:var(--warning-500);font-family:var(--font-ui);font-size:12px;letter-spacing:.25px;text-transform:uppercase;white-space:nowrap}
+.demo-banner .mono{font-family:var(--font-mono);font-size:12px}
 .stepper{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-bottom:1px solid var(--line-1)}
 .step{display:flex;align-items:center;gap:12px;padding:18px 20px;border-right:1px solid var(--line-1);transition:background 200ms}
 .step:last-child{border-right:none}
