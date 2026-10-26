@@ -263,16 +263,16 @@ class TestCleaningRegressions:
 
         # Inject duplicate (adds 1 row, will be removed)
         df, _p1 = generator.inject_duplicate_row(df)
-        
+
         # Inject missing day (removes 1 row permanently)
         len_before_missing = len(df)
         df, _p2 = generator.inject_missing_day(df)
         rows_lost_to_missing = len_before_missing - len(df)
 
         # Inject bad tick (doesn't change count before cleaning)
-        len_before_bad = len(df)
+        len(df)
         df, _p3 = generator.inject_bad_price(df)
-        
+
         # Inject split (doesn't change count)
         df, _p4 = generator.inject_stock_split(df)
 
@@ -285,11 +285,11 @@ class TestCleaningRegressions:
         # So: original_clean_count - rows_lost_to_missing - 1 (bad tick)
         # But we need to account for edge cases where the bad tick might be
         # at the boundary and not detected
-        
+
         # More robust check: just verify it's close to expected
         expected_min = original_clean_count - rows_lost_to_missing - 2  # Allow for some variation
         expected_max = original_clean_count - rows_lost_to_missing
-        
+
         assert expected_min <= len(cleaned) <= expected_max, \
             f"Row count out of range: got {len(cleaned)}, " \
             f"expected between {expected_min} and {expected_max} " \
