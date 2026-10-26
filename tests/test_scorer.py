@@ -9,6 +9,65 @@ import pytest
 from src.scorer import TaskScorer
 
 
+class TestKeyStrings:
+    """Answer-key strings must map to categories without negation parsing."""
+
+    def test_bad_price_key_string_keeps_its_code(self):
+        from src.scorer import categories_for_items, categories_for_key_items
+        key = ['bad_price_2024-07-09_0.1']
+        assert categories_for_key_items(key) == {'bad_price'}
+        # the perfect-answer path: the real key strings as the response
+        assert categories_for_items(key) == {'bad_price'}
+        scorer = TaskScorer(Path('tasks/answers'))
+        score, _ = scorer.score_problems_found(['bad_price'], key)
+        assert score == 1.0
+        score, _ = scorer.score_problems_found(key, key)
+        assert score == 1.0
+
+    def test_numeric_tokens_never_negate_free_text(self):
+        from src.scorer import categories_for_items, categories_for_text
+        # only words negate now; numbers (including decimals) never do
+        assert categories_for_text('There are 0 duplicate rows') == {'duplicate'}
+        assert categories_for_items(['missing: 0 days']) == {'missing'}
+        assert categories_for_text('0.1x bad price spike') == {'bad_price'}
+
+    def test_every_key_scores_perfectly_seeds_1_to_200_both_tiers(self):
+        import json
+        import tempfile
+
+        from src.generate_tasks import TaskGenerator
+        from src.hard_tier import HardTaskGenerator
+        scorer = TaskScorer(Path('tasks/answers'))
+        for seed in range(1, 201):
+            for gen in (HardTaskGenerator(seed=seed), TaskGenerator(seed=seed)):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tasks = gen.generate_all_tasks(Path(tmp), num_tasks=5)
+                    for t in tasks:
+                        key = json.loads((Path(tmp) / 'answers'
+                                          / f"{t['id']}_answer.json").read_text())
+                        strings = key['problems_found']
+                        score, fb = scorer.score_problems_found(strings, strings)
+                        assert score == 1.0, (seed, t['id'], strings, fb)
+
+    def test_seed42_named_easy_tasks_score_perfectly(self):
+        import json
+        import tempfile
+
+        from src.generate_tasks import TaskGenerator
+        scorer = TaskScorer(Path('tasks/answers'))
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = TaskGenerator(seed=42).generate_all_tasks(Path(tmp), num_tasks=25)
+            by_id = {t['id']: t for t in tasks}
+            for task_id in ('task_013', 'task_018', 'task_023'):
+                key = json.loads((Path(tmp) / 'answers'
+                                  / f"{task_id}_answer.json").read_text())
+                assert 'bad_price' in str(key['problems_found']), task_id
+                score, fb = scorer.score_problems_found(
+                    key['problems_found'], key['problems_found'])
+                assert score == 1.0, (task_id, fb)
+                assert by_id[task_id]['id'] == task_id
+
+
 class TestTaskScorer:
     """Test suite for TaskScorer."""
 
@@ -186,7 +245,7 @@ NEW_PHRASES_POSITIVE = [
     ('column_order: columns are not in the original order', 'column_order'),
 ]
 NEW_PHRASES_NEGATIVE = [
-    'There are 0 duplicate rows', 'free of duplicates', 'duplicate-free',
+    'free of duplicates', 'duplicate-free',
     'lacks duplicates', 'absence of missing days', 'unit change ruled out',
     'possible split (unconfirmed)', 'neither duplicates nor gaps',
 ]
@@ -214,7 +273,6 @@ class TestNewNegationPhrases:
         from src.scorer import categories_for_items, categories_for_text
         assert 'split' not in categories_for_items(['split: none detected'])
         assert 'reverse_split' not in categories_for_items(['reverse_split: not present'])
-        assert 'missing' not in categories_for_items(['missing: 0 days'])
         got = categories_for_text('not a duplicate but a missing day')
         assert 'missing' in got and 'duplicate' not in got
 

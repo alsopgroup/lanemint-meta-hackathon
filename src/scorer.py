@@ -17,7 +17,7 @@ _CLAUSE_SEP = ";.,()"
 _NEG_CUES = {
     "no", "not", "none", "nothing", "never", "without", "cannot", "can't",
     "couldn't", "wasn't", "isn't", "aren't", "doesn't", "don't", "won't", "zero",
-    "0", "neither", "nor", "lacks", "lack", "absence", "free",
+    "neither", "nor", "lacks", "lack", "absence", "free",
 }
 _UNCERTAIN = re.compile(r"\b(cannot|can't|can not|could not|couldn't) rule out\b")
 _IDIOM_NEG = re.compile(
@@ -25,7 +25,7 @@ _IDIOM_NEG = re.compile(
 _UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
                   "suspected", "unconfirmed", "maybe", "perhaps", "unlikely"}
 _CODE_NEGATED = re.compile(
-    r"^\s*(none\b|not\b|no\b|0\b|zero\b|absent\b|ruled out\b|not present\b|"
+    r"^\s*(none\b|not\b|no\b|zero\b|absent\b|ruled out\b|not present\b|"
     r"not detected\b|not found\b|no issues?\b|nothing\b|n/?a\b)")
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
@@ -100,8 +100,11 @@ def _occurrence_positive(text, match):
     exc = re.search(r"\b(besides|except)\b", clause[:m_lo])
     if exc:
         exception_at = exc.end()
+    # Numeric tokens (e.g. the 0.1 in a bad-price label or a date) are
+    # never negation cues; only words can negate.
     cues = [(m.group(0), m.start(), m.end())
-            for m in re.finditer(r"\b\w+(?:'t)?\b", clause)]
+            for m in re.finditer(r"\b\w+(?:'t)?\b", clause)
+            if not any(ch.isdigit() for ch in m.group(0))]
     for word, s, e in cues:
         if word in _UNCERTAIN_ADJ and e <= m_lo:
             return False
@@ -139,6 +142,32 @@ def categories_for_text(text):
     return _canonical(found, norm)
 
 
+_CODES_BY_LENGTH = sorted(CANONICAL_CATEGORIES, key=len, reverse=True)
+
+
+def categories_for_key_items(items):
+    """Categories from answer-key problem strings.
+
+    Key strings are machine-generated labels such as
+    ``bad_price_2024-07-09_0.1`` or ``calendar_misalignment_US_EU_holidays``.
+    They are parsed by code prefix only: no negation or free-text
+    heuristics apply, so numeric suffixes can never suppress a category.
+    """
+    found = set()
+    for item in items or []:
+        text = str(item).strip().lower()
+        if text.startswith("stock_split"):
+            found.add("split")
+            continue
+        for code in _CODES_BY_LENGTH:
+            if text == code or text.startswith((code + "_", code + ":", code + " ")):
+                found.add(code)
+                break
+        else:
+            found |= categories_for_items([item])
+    return _canonical(found)
+
+
 def categories_for_items(items):
     """Categories from a problems list.
 
@@ -155,6 +184,13 @@ def categories_for_items(items):
             detail = text[m.end():]
             if not _CODE_NEGATED.match(detail):
                 found.add(code)
+            continue
+        # A verbatim key string (``bad_price_2024-07-09_0.1``) is an
+        # assertion of its leading code, suffix and all.
+        key_code = next((c for c in _CODES_BY_LENGTH
+                         if text.startswith(c + "_")), None)
+        if key_code is not None:
+            found.add(key_code)
         else:
             found |= categories_for_text(text)
     return _canonical(found)
@@ -194,7 +230,7 @@ class TaskScorer:
         Extra categories lower precision, so listing every possible code
         scores poorly on both tiers.
         """
-        expected_issues = categories_for_items(expected)
+        expected_issues = categories_for_key_items(expected)
         if not expected_issues:
             return (1.0, "No problems to identify") if not categories_for_items(actual) \
                 else (0.0, "False positives: problems reported where none expected")
