@@ -23,7 +23,7 @@ POSSIBLE_ISSUES = """Problem category definitions (fixed list; report a code onl
 - duplicate: a row has the same ticker and the same date (daily data), or the same ticker and an identical timestamp string (intraday data), as an earlier row. The same instant written in a different timestamp form is not a duplicate (see timezone).
 - missing: a ticker has no row for a trading day inside its own date range (a weekday that is not a holiday in that ticker's market); intraday, a bar instant is absent from its New-York date, so that date has fewer bars than the others. A date missing from one ticker but present in another is calendar, not missing, when each ticker is complete on its own calendar.
 - bad_price: a single close deviates by more than 50% from both the previous and the next close and then reverts; a one-day spike, not a sustained level shift.
-- split: a sustained drop to about half the previous close (ratio 0.4-0.6) that holds, from a 2-for-1 forward split.
+- split: a sustained drop to about half the previous close (ratio 0.4-0.6) that holds, from a 2-for-1 forward split. Ratios are written as new shares per old share: A:B or A-for-B means A new shares for B old shares, so A>B is a forward split and A<B is a reverse split (1:0.5 is a forward split).
 - reverse_split: a sustained jump to about 3x or about 10x the previous close that holds, from a 1-for-3 or 1-for-10 reverse split.
 - unit_change: a sustained jump to about 100x the previous close that holds, because prices switch from dollars to cents.
 - out_of_order: within a ticker, rows are not in ascending order of date (daily data) or of instant (intraday data, after converting timestamps to America/New_York). A repeated instant placed next to its first occurrence is not out of order.

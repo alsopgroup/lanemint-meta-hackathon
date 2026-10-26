@@ -24,9 +24,27 @@ _IDIOM_NEG = re.compile(
     r"\bfree of\b|\bruled out\b|\babsence of\b|\blacks?\b|\bneither\b")
 _UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
                   "suspected", "unconfirmed", "maybe", "perhaps", "unlikely"}
-_CODE_NEGATED = re.compile(
-    r"^\s*(none\b|not\b|no\b|0(?!\.?\d)|zero\b|absent\b|ruled out\b|not present\b|"
-    r"not detected\b|not found\b|no issues?\b|nothing\b|n/?a\b)")
+# A post-separator detail negates its code only when it is *purely* a
+# none/zero/no-count phrase ("none", "0", "0 rows", "not found",
+# "nothing missing"). A detail that goes on to describe a finding
+# ("no row for 2024-05-27", "not unique on 2024-03-04") never negates,
+# and neither does a decimal (0.1, 0,1 or 0x10 are values, not counts).
+_NOTHING_DETAIL = re.compile(
+    r"^\s*(?:none|nothing|absent|zero|no|not|n/?a|not found|not detected|"
+    r"not present|no issues?|ruled out)"
+    r"(?:\s+(?:found|detected|present|missing|issues?|rows?|days?|bars?|entries))?"
+    r"\s*[.!]?\s*$")
+_ZERO_COUNT_DETAIL = re.compile(
+    r"^\s*0(?!\.?\d)(?![.,]\d)(?!\w)"
+    r"(?:\s+(?:rows?|days?|found|issues?|detected|present|bars?|entries))?"
+    r"\s*[.!]?\s*$")
+
+
+def _is_nothing_detail(detail):
+    """True when a post-separator detail is purely a 'nothing found' phrase."""
+    if re.search(r"\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}", detail):
+        return False  # a named date or timestamp is a finding, not a negation
+    return bool(_NOTHING_DETAIL.match(detail) or _ZERO_COUNT_DETAIL.match(detail))
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
     "out_of_order", "timezone", "currency", "adj_close", "column_order", "calendar",
@@ -37,8 +55,8 @@ _PATTERNS = {
     "duplicate": r"\bduplicat\w*\b",
     "missing": r"\bmissing\b|\bgaps?\b",
     "bad_price": r"\bbad(?:ly)?\b|\bincorrect\w*\b|\bspikes?\b|\bjump\w*\b",
-    "split": r"\bsplits?\b|\b\d+-for-1\b|\b\d+:1\b",
-    "reverse_split": r"\breverse splits?\b|\b1-for-\d+\b|\b1:\d+\b",
+    "split": r"\bsplits?\b",
+    "reverse_split": r"\breverse splits?\b",
     "unit_change": r"\bunit change\b|\bdollars? to cents\b|\bcents\b|\b100x\b",
     "out_of_order": r"\bout of (?:chronological )?order\b|\bchronological order\b"
                     r"|\bunsorted\b|\bout of sequence\b|\brow order\b",
@@ -146,6 +164,17 @@ def categories_for_text(text):
             if _occurrence_positive(norm, match):
                 found.add(category)
                 break
+    # Split ratios are read numerically, per the prompt convention
+    # "A:B (or A-for-B) = A new shares for B old shares": A>B is a
+    # forward split, A<B a reverse split (so 1:0.5 is a forward split).
+    for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*(?::|-for-)\s*(\d+(?:\.\d+)?)\b",
+                             norm):
+        new_shares, old_shares = float(match.group(1)), float(match.group(2))
+        if old_shares > 0 and _occurrence_positive(norm, match):
+            if new_shares / old_shares > 1:
+                found.add("split")
+            elif new_shares / old_shares < 1:
+                found.add("reverse_split")
     return _canonical(found, norm)
 
 
@@ -175,6 +204,25 @@ def categories_for_key_items(items):
     return _canonical(found)
 
 
+def _head_code(segment):
+    """Resolve the code named by the head of a 'head: detail' answer, if any."""
+    seg = segment.strip().lower().replace(" ", "_")
+    for code in _CODES_BY_LENGTH:
+        if seg.startswith(code):
+            return code
+    if seg.endswith("s") and seg[:-1] in CANONICAL_CATEGORIES:
+        return seg[:-1]
+    if "duplicat" in seg:
+        return "duplicate"
+    if "bad" in seg:
+        return "bad_price"
+    if "missing" in seg or "gap" in seg:
+        return "missing"
+    if "split" in seg:
+        return "split"
+    return None
+
+
 def categories_for_items(items):
     """Categories from a problems list.
 
@@ -185,33 +233,30 @@ def categories_for_items(items):
     found = set()
     for item in items or []:
         text = str(item).strip().lower()
-        # Explicit non-detections with a code-like head, including plural
-        # or wordy heads and dash separators ("duplicates: 0",
-        # "missing days: 0", "split - none"). Decimals never negate.
-        neg = re.match(
-            r"^([a-z_]+)(?:\s+[a-z]+)?\s*(?::|—|–|-)\s*"
-            r"(?:none|zero|no|not|nothing|n/?a|0(?!\.?\d))\b", text)
-        if neg:
-            head = neg.group(1)
-            if head in CANONICAL_CATEGORIES or \
-                    (head.endswith("s") and head[:-1] in CANONICAL_CATEGORIES):
-                continue
+        # Explicit non-detections: a code-like head, a separator, and a
+        # detail that is purely a nothing/zero phrase ("duplicates: 0",
+        # "missing days: 0", "split - none", "count of duplicates: 0").
+        # A detail describing a finding never negates (see _is_nothing_detail).
+        neg = re.match(r"^(.+?)\s*(?::|—|–|-)\s*(.*)$", text)
+        if neg and _head_code(neg.group(1)) is not None \
+                and _is_nothing_detail(neg.group(2)):
+            continue
         m = re.match(r"^([a-z_]+)\s*(?::|—|–|$)", text)
         code = m.group(1).replace(" ", "_") if m else None
         if code in CANONICAL_CATEGORIES:
             detail = text[m.end():]
-            if not _CODE_NEGATED.match(detail):
+            if not _is_nothing_detail(detail):
                 found.add(code)
             continue
         # A verbatim key string (``bad_price_2024-07-09_0.1``) is an
-        # assertion of its leading code, suffix and all; an explicit
-        # none/0 count after a separator (``duplicate_rows: none``) is not.
+        # assertion of its leading code, suffix and all; a purely-nothing
+        # detail after a separator (``duplicate_rows: none``) is not.
         key_code = next((c for c in _CODES_BY_LENGTH
                          if text.startswith(c + "_")), None)
         if key_code is not None:
             rest = text[len(key_code):]
-            if not re.search(r"[:\-—–]\s*(none|0(?!\.?\d)|zero|no|not|nothing|n/?a)\b",
-                             rest):
+            sep = re.search(r":", rest) or re.search(r"[—–-]", rest)
+            if not (sep and _is_nothing_detail(rest[sep.end():])):
                 found.add(key_code)
         else:
             found |= categories_for_text(text)

@@ -317,6 +317,41 @@ class TestZeroCountVsDecimals:
         assert categories_for_items([phrase]) == set()
 
 
+class TestNothingFoundPurity:
+    """A none/zero detail negates only when it is purely a nothing phrase.
+
+    A detail that goes on to describe a finding (a date, a spike, a
+    non-unique row) is a detection, and decimals are values, not counts.
+    """
+
+    @pytest.mark.parametrize(('phrase', 'want'), [
+        ('missing - no row for 2024-05-27', {'missing'}),
+        ('missing: no row for 2024-05-27', {'missing'}),
+        ('duplicate - not unique on 2024-03-04', {'duplicate'}),
+        ('bad_price - no reversion? spike', {'bad_price'}),
+        ('missing: no data on 2024-05-27', {'missing'}),
+        ('bad_price: 0,1x', {'bad_price'}),
+        ('bad_price: 0x10', {'bad_price'}),
+    ])
+    def test_findings_after_separator_stay_detected(self, phrase, want):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == want
+
+    @pytest.mark.parametrize('phrase', [
+        'bad prices: 0', 'count of duplicates: 0',
+    ])
+    def test_wordy_zero_counts_negate(self, phrase):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == set()
+
+    def test_ratio_notation_convention(self):
+        from src.scorer import categories_for_text
+        # A:B = A new shares for B old shares: 1:0.5 is 2-for-1, forward.
+        assert categories_for_text('split 1:0.5') == {'split'}
+        assert categories_for_text('reverse split 1:3') == {'reverse_split'}
+        assert categories_for_text('2:1 split') == {'split'}
+
+
 class TestSplitRatioMapping:
     """Only 1-for-N (or explicit 'reverse') is a reverse split; N-for-1 is a split."""
 
