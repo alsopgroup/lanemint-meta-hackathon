@@ -79,7 +79,10 @@ def _aligned(frames):
 
 
 def _frames(block):
-    return dict(block.groupby("ticker", sort=False))
+    frames = {}
+    for ticker, group in block.groupby("ticker", sort=False):
+        frames[ticker] = group
+    return frames
 
 
 def solve(task, csv_path):
