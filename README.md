@@ -50,6 +50,8 @@ META_BASE_URL=https://api.meta.ai/v1
 META_MODEL_NAME=llama-3.1-8b
 ```
 
+**Note**: `META_BASE_URL` is a placeholder. Confirm the actual API endpoint from the hackathon's official documentation before running any real API calls.
+
 ## Usage
 
 ### 1. Generate Tasks
@@ -217,10 +219,6 @@ Edit scoring logic in `src/scorer.py`:
 - Modify tolerance in `compare_float()`
 - Adjust pass threshold (default: 80%)
 - Add new field validators
-
-## License
-
-MIT
 
 ## Hackathon Context
 

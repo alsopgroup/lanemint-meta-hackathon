@@ -117,7 +117,7 @@ class TaskGenerator:
             'type': 'return_calculation',
             'prompt': f"""You are given price data for {ticker} in CSV format. 
 The data may contain quality issues such as duplicate rows, missing days, 
-incorrect prices, or unadjusted corporate actions.
+incorrect prices, or unadjusted stock splits.
 
 1. Identify and describe any data quality problems
 2. Clean the data appropriately
