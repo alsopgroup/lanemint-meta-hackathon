@@ -1,23 +1,70 @@
 # Meta AI Developer Hackathon Benchmark
 
-A self-contained benchmark and fine-tuning playground for evaluating language models on financial data quality tasks, built for Meta's AI Developer Hackathon (October 26 - November 4, 2026).
+[![Tests](https://github.com/alsopgroup/lanemint-meta-hackathon/actions/workflows/test.yml/badge.svg)](https://github.com/alsopgroup/lanemint-meta-hackathon/actions/workflows/test.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
-**Project by:** [LaneMint](https://lanemint.com)
+> A synthetic benchmark for evaluating language models on financial data quality tasks
 
-## What It Is
+<!-- ![Banner](docs/assets/banner.png) -->
+<!-- Placeholder for banner image - add docs/assets/banner.png when ready -->
 
-An agent receives synthetic market data CSV files with intentional data quality problems (duplicate rows, missing days, bad prices, unadjusted stock splits). Each task includes a written prompt asking the model to identify issues and compute a metric (returns, volatility, backtest results). A deterministic scorer validates the responses.
+Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [LaneMint](https://lanemint.com).
 
-The project runs a Meta Llama model before and after a light fine-tune on these tasks, using only the hackathon's $150 credit allocation.
+---
 
-## Key Features
+## Overview
 
-- **~25 synthetic tasks** with known data quality issues
-- **Deterministic scoring** with detailed per-problem feedback
-- **Dry-run mode** for safe testing without API costs
-- **Fine-tuning pipeline** with train/validation split
-- **Cost estimation** before running paid operations
-- **Zero external dependencies** on proprietary data or code
+Test language models on their ability to detect and handle data quality issues in financial time series. Each task provides synthetic market data with intentional problems (duplicate rows, missing days, bad prices, unadjusted stock splits) and asks the model to identify issues and compute metrics. A deterministic scorer validates responses with detailed feedback.
+
+### Workflow
+
+```mermaid
+graph LR
+    A[Generate Tasks] --> B[Run Model]
+    B --> C[Score Results]
+    A --> D[Prepare Fine-tuning Data]
+    D --> E[Fine-tune Model]
+    E --> B
+    
+    style A fill:#e1f5ff
+    style B fill:#fff4e1
+    style C fill:#e8f5e9
+    style D fill:#f3e5f5
+    style E fill:#fce4ec
+```
+
+### Key Features
+
+- 🎯 **~25 synthetic tasks** with known data quality issues
+- ✅ **Deterministic scoring** with detailed per-problem feedback
+- 🧪 **Dry-run mode** for safe testing without API costs
+- 🔧 **Fine-tuning pipeline** with train/validation split
+- 💰 **Cost estimation** before running paid operations
+- 🔓 **Zero external dependencies** on proprietary data or code
+
+---
+
+## Quickstart
+
+```bash
+# Clone and install
+git clone https://github.com/alsopgroup/lanemint-meta-hackathon.git
+cd lanemint-meta-hackathon
+pip install -r requirements.txt
+
+# Generate tasks
+python -m src.generate_tasks
+
+# Run dry-run (no API calls)
+python -m src.runner --dry-run
+
+# Score results
+python -m src.scorer output/results.json
+```
+
+See [full usage guide](#usage) below.
+
+---
 
 ## Setup
 
@@ -51,6 +98,8 @@ META_MODEL_NAME=llama-3.1-8b
 ```
 
 **Note**: `META_BASE_URL` is a placeholder. Confirm the actual API endpoint from the hackathon's official documentation before running any real API calls.
+
+---
 
 ## Usage
 
@@ -116,7 +165,7 @@ python -m src.finetune --dry-run
 python -m src.finetune --run
 ```
 
-## Running Real Model Evaluation
+### Running Real Model Evaluation
 
 Once you have Meta API access configured:
 
@@ -135,37 +184,35 @@ python -m src.runner --output-dir output/finetuned
 python -m src.scorer output/finetuned/results.json
 ```
 
-## Cost Estimate
-
-Per full benchmark run with ~25 tasks:
-
-- **Baseline run**: ~$0.50 (inference on 25 tasks)
-- **Fine-tuning**: ~$2-5 (training tokens + validation)
-- **Fine-tuned run**: ~$0.50 (inference on 25 tasks)
-
-**Total estimated cost**: ~$3-6 per full cycle (well within $150 budget)
-
-*Note: Actual costs depend on final model size, token counts, and Meta's pricing. Always run `--dry-run` first to see estimates.*
+---
 
 ## Project Structure
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── test.yml              # CI/CD configuration
 ├── src/
-│   ├── generate_tasks.py    # Task and data generator
-│   ├── scorer.py             # Deterministic scoring engine
-│   ├── runner.py             # Model runner with dry-run mode
-│   ├── finetune_prep.py      # Fine-tuning data preparation
-│   └── finetune.py           # Fine-tuning job launcher
+│   ├── __init__.py
+│   ├── generate_tasks.py         # Task and data generator
+│   ├── scorer.py                 # Deterministic scoring engine
+│   ├── runner.py                 # Model runner with dry-run mode
+│   ├── finetune_prep.py          # Fine-tuning data preparation
+│   └── finetune.py               # Fine-tuning job launcher
 ├── tests/
-│   └── test_scorer.py        # Unit tests for scorer
-├── tasks/                    # Generated tasks (gitignored)
-├── output/                   # Model results (gitignored)
-├── finetune_data/           # Training files (gitignored)
-├── .env.example             # Environment template
-├── requirements.txt         # Python dependencies
-└── README.md               # This file
+│   ├── __init__.py
+│   └── test_scorer.py            # Unit tests for scorer
+├── tasks/                        # Generated tasks (gitignored)
+├── output/                       # Model results (gitignored)
+├── finetune_data/                # Training files (gitignored)
+├── .env.example                  # Environment template
+├── .gitignore                    # Git ignore rules
+├── requirements.txt              # Python dependencies
+└── README.md                     # This file
 ```
+
+---
 
 ## Data Quality Issues
 
@@ -178,6 +225,8 @@ The generator injects these types of problems:
 
 Each task contains 2-3 random issues. The model must identify and handle them appropriately.
 
+---
+
 ## Testing
 
 Run unit tests:
@@ -188,15 +237,17 @@ pytest tests/ -v
 
 Tests cover scorer logic, JSON parsing, and tolerance checks.
 
-## CI/CD
+### CI/CD
 
-GitHub Actions runs tests automatically on every push:
-
-```bash
-# See .github/workflows/test.yml
-```
+GitHub Actions runs tests automatically on every push. The workflow includes:
+- Unit test execution
+- Full pipeline dry-run
+- Scoring validation
+- Fine-tuning data preparation
 
 No secrets or API keys required for CI.
+
+---
 
 ## Development
 
@@ -220,12 +271,34 @@ Edit scoring logic in `src/scorer.py`:
 - Adjust pass threshold (default: 80%)
 - Add new field validators
 
-## Hackathon Context
+---
 
-**Event**: Meta AI Developer Hackathon  
-**Dates**: October 26 - November 4, 2026  
-**Budget**: $150 in Meta API credits  
-**Goal**: Demonstrate measurable improvement in data quality task performance through fine-tuning
+## Cost Estimate
+
+Per full benchmark run with ~25 tasks:
+
+- **Baseline run**: ~$0.50 (inference on 25 tasks)
+- **Fine-tuning**: ~$2-5 (training tokens + validation)
+- **Fine-tuned run**: ~$0.50 (inference on 25 tasks)
+
+**Total estimated cost**: ~$3-6 per full cycle (well within $150 budget)
+
+*Note: Actual costs depend on final model size, token counts, and Meta's pricing. Always run `--dry-run` first to see estimates.*
+
+---
+
+## Hackathon
+
+**Meta AI Developer Hackathon**  
+📅 October 26 - November 4, 2026  
+💰 $150 in Meta API credits  
+🎯 Goal: Demonstrate measurable improvement in data quality task performance through fine-tuning
+
+---
+
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
