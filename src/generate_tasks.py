@@ -153,12 +153,12 @@ Cleaning rules:
 Your task:
 1. Identify and describe any data quality problems
 2. Clean the data using the rules above
-3. Calculate the mean and standard deviation of daily returns
+3. Calculate the mean and sample standard deviation (ddof=1) of daily returns
 
 Return your answer as JSON with fields:
 - problems_found: list of issues you identified (be specific about dates/types)
 - mean_return: mean daily return (6 decimal places)
-- std_return: standard deviation of daily returns (6 decimal places)""",
+- std_return: sample standard deviation (ddof=1) of daily returns (6 decimal places)""",
             'data_file': f'task_{self.task_id:03d}.csv',
             'expected': expected
         }
@@ -268,11 +268,11 @@ The data may contain quality issues such as duplicate rows or missing days.
 Cleaning rules:
 1. Remove duplicate rows (keep first occurrence)
 2. Note any missing trading days but proceed with available data
-3. Calculate daily returns, then annualized volatility as: std(daily_returns) * sqrt(252)
+3. Calculate daily returns, then annualized volatility as: std(daily_returns, ddof=1) * sqrt(252)
 
 Your task:
 1. Identify and fix data quality problems
-2. Calculate annualized volatility using the formula above
+2. Calculate annualized volatility using the formula above (sample std with ddof=1)
 3. Count the number of valid trading days after cleaning
 
 Return your answer as JSON with fields:
@@ -449,6 +449,13 @@ def main():
         default=Path('tasks'),
         help='Output directory (default: tasks/)'
     )
+    parser.add_argument(
+        '--tier',
+        type=str,
+        choices=['easy', 'hard'],
+        default='easy',
+        help='Difficulty tier: easy (default) or hard'
+    )
 
     args = parser.parse_args()
 
@@ -458,9 +465,16 @@ def main():
         print("   Default seed 42 is reserved for the evaluation set.")
         print("   Use different seeds for training data to avoid train/eval overlap.\n")
 
-    generator = TaskGenerator(seed=args.seed)
+    if args.tier == 'hard':
+        from src.hard_tier import HardTaskGenerator
+        print("Generating HARD tier tasks...")
+        generator = HardTaskGenerator(seed=args.seed)
+    else:
+        print("Generating EASY tier tasks...")
+        generator = TaskGenerator(seed=args.seed)
+
     tasks = generator.generate_all_tasks(args.output_dir, num_tasks=args.count)
-    print(f"Created {len(tasks)} tasks with seed {args.seed}")
+    print(f"Created {len(tasks)} {args.tier} tier tasks with seed {args.seed}")
 
 
 if __name__ == '__main__':

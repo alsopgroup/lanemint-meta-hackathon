@@ -52,7 +52,7 @@ class TaskScorer:
 
         We're lenient here - the model needs to identify issues but exact
         matching of problem strings is hard since they're synthetic identifiers.
-        We check for keywords instead.
+        We check for keywords instead, skipping negative statements.
         """
         if not actual:
             return 0.0, "No problems identified"
@@ -60,17 +60,31 @@ class TaskScorer:
         actual_lower = [p.lower() for p in actual]
         expected_lower = [p.lower() for p in expected]
 
-        # Check for key issue types
+        # Helper to check for keyword without negation
+        def has_keyword_positive(text: str, keyword: str) -> bool:
+            """Check if text contains keyword but not in a negative context."""
+            if keyword not in text:
+                return False
+            # Skip if the keyword appears with common negation patterns
+            negation_words = ['no ', 'not ', 'without ', 'none ', 'zero ', 'n\'t ']
+            # Look for negation within 10 characters before the keyword
+            idx = text.find(keyword)
+            prefix = text[max(0, idx-10):idx]
+            return not any(neg in prefix for neg in negation_words)
+
+        # Check for key issue types in actual responses
         found_issues = set()
-        if any('duplicate' in p for p in actual_lower):
+        if any(has_keyword_positive(p, 'duplicate') for p in actual_lower):
             found_issues.add('duplicate')
-        if any('missing' in p or 'gap' in p for p in actual_lower):
+        if any(has_keyword_positive(p, 'missing') or has_keyword_positive(p, 'gap') for p in actual_lower):
             found_issues.add('missing')
-        if any('bad' in p or 'incorrect' in p or 'spike' in p or 'jump' in p for p in actual_lower):
+        if any(has_keyword_positive(p, 'bad') or has_keyword_positive(p, 'incorrect') or
+               has_keyword_positive(p, 'spike') or has_keyword_positive(p, 'jump') for p in actual_lower):
             found_issues.add('bad_price')
-        if any('split' in p for p in actual_lower):
+        if any(has_keyword_positive(p, 'split') for p in actual_lower):
             found_issues.add('split')
 
+        # Expected issues (always positive, no negation check needed)
         expected_issues = set()
         if any('duplicate' in p for p in expected_lower):
             expected_issues.add('duplicate')

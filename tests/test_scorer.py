@@ -111,6 +111,37 @@ class TestProblemDetection:
         problems = ['stock split detected', '2-for-1 split']
         assert any('split' in p.lower() for p in problems)
 
+    def test_negative_statements_not_counted(self):
+        """Test that negative statements don't count as problem detections."""
+        scorer = TaskScorer(Path('tasks/answers'))
+
+        # Case 1: "No duplicate" should not match duplicate
+        actual = ['No duplicate rows found', 'Data looks clean']
+        expected = ['duplicate_row_2024-01-15']
+        score, _feedback = scorer.score_problems_found(actual, expected)
+        assert score == 0.0, "Negative statement should not count as detection"
+
+        # Case 2: "No missing" should not match missing
+        actual = ['No missing days', 'Complete dataset']
+        expected = ['missing_day_2024-01-20']
+        score, _feedback = scorer.score_problems_found(actual, expected)
+        assert score == 0.0
+
+        # Case 3: "Not a split" should not match split
+        actual = ['This is not a split issue']
+        expected = ['stock_split_2024-02-01_2.0']
+        score, _feedback = scorer.score_problems_found(actual, expected)
+        assert score == 0.0
+
+    def test_positive_detections_still_work(self):
+        """Test that actual problem mentions still work after negation fix."""
+        scorer = TaskScorer(Path('tasks/answers'))
+
+        actual = ['Found duplicate row on 2024-01-15']
+        expected = ['duplicate_row_2024-01-15']
+        score, _feedback = scorer.score_problems_found(actual, expected)
+        assert score == 1.0
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
