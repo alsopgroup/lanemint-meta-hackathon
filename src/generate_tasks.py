@@ -446,8 +446,8 @@ def main():
     parser.add_argument(
         '--output-dir',
         type=Path,
-        default=Path('tasks'),
-        help='Output directory (default: tasks/)'
+        default=None,
+        help='Output directory (default: tasks/ for easy, tasks_hard/ for hard)'
     )
     parser.add_argument(
         '--tier',
@@ -473,7 +473,8 @@ def main():
         print("Generating EASY tier tasks...")
         generator = TaskGenerator(seed=args.seed)
 
-    tasks = generator.generate_all_tasks(args.output_dir, num_tasks=args.count)
+    output_dir = args.output_dir or (Path('tasks_hard') if args.tier == 'hard' else Path('tasks'))
+    tasks = generator.generate_all_tasks(output_dir, num_tasks=args.count)
     print(f"Created {len(tasks)} {args.tier} tier tasks with seed {args.seed}")
 
 

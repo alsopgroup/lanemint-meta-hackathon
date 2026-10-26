@@ -143,5 +143,72 @@ class TestProblemDetection:
         assert score == 1.0
 
 
+# Phrases supplied by the PR #6 reviewer (neg.py).
+NEGATION_CASES = [
+    ('no duplicates', set()), ('there were no duplicate rows', set()),
+    ('found 2 duplicate rows, no missing days', {'duplicate'}),
+    ('not a bad tick', set()), ('duplicates: none', set()),
+    ('No duplicate rows found', set()), ('No missing days', set()),
+    ('This is not a split issue', set()), ('no evidence of any duplicate rows', set()),
+    ('checked for duplicates but found none', set()), ('nothing missing', set()),
+    ("wasn't a split", set()),
+    ('no split detected; 1-for-3 reverse split found on 2024-02-16', {'split'}),
+    ('duplicate row on 2024-01-15 (not a missing day)', {'duplicate'}),
+    ('missing day 2024-01-20, no duplicate', {'missing'}),
+    ('known issue: 2024-01-15 duplicate', {'duplicate'}),
+    ('cannot rule out a 3:1 reverse split', set()),
+    ('prices badly scaled after 2024-03-04', {'bad_price'}),
+    ('jumped 100x: unit change to cents', {'bad_price'}),
+    ('timestamp gap of 3 days', {'missing'}), ('nonduplicated', set()),
+    ('zero-volume bar, no gap', set()), ('NO DUPLICATES', set()),
+]
+
+
+class TestNegationPhrases:
+    @pytest.mark.parametrize(('phrase', 'want'), NEGATION_CASES)
+    def test_phrase(self, phrase, want):
+        from src.scorer import categories_for_text
+        got = categories_for_text(phrase) & {'duplicate', 'missing', 'bad_price', 'split'}
+        assert got == want
+
+    def test_hard_categories(self):
+        from src.scorer import categories_for_text
+        assert 'unit_change' in categories_for_text('prices switch from dollars to cents')
+        assert 'out_of_order' in categories_for_text('rows out of chronological order')
+        assert 'reverse_split' in categories_for_text('1-for-3 reverse split')
+        assert 'out_of_order' not in categories_for_text('no out of order issues')
+
+
+class TestHardNumericScoring:
+    def _scorer_with(self, tmp_path, answer):
+        import json as _json
+        (tmp_path / 'task_h_1001_answer.json').write_text(_json.dumps(answer))
+        return TaskScorer(tmp_path)
+
+    def test_max_drawdown_scored(self, tmp_path):
+        import json as _json
+        scorer = self._scorer_with(tmp_path, {'max_drawdown': -0.20, 'num_clean_days': 10,
+                                               'problems_found': ['unit_change_x']})
+        good = scorer.score_task('task_h_1001', _json.dumps(
+            {'max_drawdown': -0.20, 'num_clean_days': 10,
+             'problems_found': ['unit change to cents']}))
+        wrong = scorer.score_task('task_h_1001', _json.dumps(
+            {'max_drawdown': -1.40, 'num_clean_days': 10, 'problems_found': ['junk']}))
+        assert good['score'] == 1.0
+        assert wrong['score'] < 1.0
+        assert wrong['component_scores']['max_drawdown'] == 0.0
+        assert wrong['component_scores']['problems'] == 0.0
+
+    def test_portfolio_fields_scored(self, tmp_path):
+        import json as _json
+        scorer = self._scorer_with(tmp_path, {'portfolio_return': 0.05, 'num_assets': 3,
+                                              'num_aligned_days': 40,
+                                              'problems_found': ['reverse_split_x']})
+        perfect = scorer.score_task('task_h_1001', _json.dumps(
+            {'portfolio_return': 0.05, 'num_assets': 3, 'num_aligned_days': 40,
+             'problems_found': ['1-for-3 reverse split']}))
+        assert perfect['score'] == 1.0
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

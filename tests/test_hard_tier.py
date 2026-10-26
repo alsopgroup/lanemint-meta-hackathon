@@ -1,7 +1,7 @@
-"""
-Unit tests for the hard-tier task generator.
-"""
+"""Tests for the hard tier, including an independent-solver key check."""
 
+import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -9,206 +9,164 @@ import pandas as pd
 import pytest
 
 from src.hard_tier import HardTaskGenerator
+from tests.independent_solver import solve
+
+OFF_LIMITS = ["delisted", "survivorship", "ticker_rename", "rename", "dividend",
+              "stale", "repeated_price", "too_short", "insufficient_history"]
+
+
+def _gen_tasks(seed, count, tmp):
+    gen = HardTaskGenerator(seed=seed)
+    out = Path(tmp)
+    tasks = gen.generate_all_tasks(out, num_tasks=count)
+    return tasks, out
 
 
 class TestHardTaskGenerator:
-    """Test suite for HardTaskGenerator."""
+    def test_reproducibility(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            t1, d1 = _gen_tasks(42, 5, a)
+            t2, d2 = _gen_tasks(42, 5, b)
+            assert t1 == t2
+            for t in t1:
+                assert (d1 / t["data_file"]).read_bytes() == (d2 / t["data_file"]).read_bytes()
+                k1 = json.loads((d1 / "answers" / f"{t['id']}_answer.json").read_text())
+                k2 = json.loads((d2 / "answers" / f"{t['id']}_answer.json").read_text())
+                assert k1 == k2
 
-    def test_hard_tier_reproducibility(self):
-        """Test that hard tasks are reproducible with same seed."""
-        gen1 = HardTaskGenerator(seed=42)
-        task1, df1 = gen1.generate_task_max_drawdown()
-
-        gen2 = HardTaskGenerator(seed=42)
-        task2, df2 = gen2.generate_task_max_drawdown()
-
-        # Task structure should be the same
-        assert task1['id'] == task2['id']
-        assert task1['type'] == task2['type']
-        # Data should be identical
-        pd.testing.assert_frame_equal(df1, df2)
-        # Expected answers should match
-        assert task1['expected'] == task2['expected']
-
-    def test_hard_tasks_use_h_prefix(self):
-        """Test that hard tasks use 'task_h_' prefix to avoid ID conflicts."""
-        generator = HardTaskGenerator(seed=42)
-        task, _df = generator.generate_task_max_drawdown()
-
-        assert task['id'].startswith('task_h_')
-        assert 'task_h_' in task['data_file']
+    def test_task_ids_use_h_prefix(self):
+        gen = HardTaskGenerator(seed=42)
+        task, _ = gen.generate_task_max_drawdown()
+        assert task["id"].startswith("task_h_")
 
     def test_no_off_limits_problem_types(self):
-        """Test that hard tasks don't use forbidden problem types."""
-        generator = HardTaskGenerator(seed=42)
+        gen = HardTaskGenerator(seed=42)
+        for maker in gen.task_generators():
+            task, _ = maker()
+            for problem in task["expected"]["problems_found"]:
+                for word in OFF_LIMITS:
+                    assert word not in problem.lower()
 
-        off_limits = [
-            'delisted', 'survivorship', 'ticker_rename',
-            'dividend', 'stale_price', 'repeated_price',
-            'too_short', 'insufficient_history'
-        ]
+    def test_default_25_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks, _ = _gen_tasks(42, 25, tmp)
+        assert len(tasks) == 25
+        types = [t["type"] for t in tasks]
+        for expected_type in ["multi_asset_portfolio", "max_drawdown", "rolling_beta",
+                              "dst_intraday", "volatility_column_order"]:
+            assert types.count(expected_type) == 5
+        all_problems = []
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks, out = _gen_tasks(42, 25, tmp)
+            for t in tasks:
+                key = json.loads((out / "answers" / f"{t['id']}_answer.json").read_text())
+                all_problems.extend(key["problems_found"])
+                assert 2 <= len(key["problems_found"]) <= 4
+        joined = " ".join(all_problems).lower()
+        for marker in ["calendar", "out_of_order", "reverse_split", "unit_change",
+                       "currency", "adj_close", "timezone", "column_order"]:
+            assert marker in joined, marker
 
-        # Generate a few tasks and check problem descriptions
-        for _i in range(10):
-            task, _df = generator.generate_task_max_drawdown()
-            problems = task['expected']['problems_found']
+    def test_prompts_state_rules_not_problems(self):
+        gen = HardTaskGenerator(seed=7)
+        for maker in gen.task_generators():
+            task, _ = maker()
+            prompt = task["prompt"]
+            # fixed possible-issues list and general rules are present
+            assert "may contain any" in prompt or "any\nsubset" in prompt or "subset" in prompt
+            assert "ddof=1" in prompt
+            assert "inner join" in prompt
+            assert "America/New_York" in prompt
+            assert "adj_close" in prompt
+            assert "fx_rate" in prompt
+            # the concrete injected problem strings must not appear
+            for problem in task["expected"]["problems_found"]:
+                assert problem not in prompt
 
-            for problem in problems:
-                problem_lower = problem.lower()
-                for forbidden in off_limits:
-                    assert forbidden not in problem_lower, \
-                        f"Found forbidden problem type '{forbidden}' in: {problem}"
-
-    def test_hard_tier_answer_reproducibility(self):
-        """Test that reference answers are reproducible from same starting state."""
-        # Generate same task with same seed - should get identical answers
-        gen1 = HardTaskGenerator(seed=100)
-        task1, _df1 = gen1.generate_task_max_drawdown()
-
-        gen2 = HardTaskGenerator(seed=100)
-        task2, _df2 = gen2.generate_task_max_drawdown()
-
-        # Expected answers should match exactly
-        assert task1['expected'] == task2['expected']
-
-    def test_hard_tier_across_seeds(self):
-        """Test hard tier generation across 50 seeds for consistency."""
-        for seed in range(50):
-            generator = HardTaskGenerator(seed=seed)
-            task, df = generator.generate_task_max_drawdown()
-
-            # Basic structure checks
-            assert 'id' in task
-            assert 'type' in task
-            assert 'prompt' in task
-            assert 'expected' in task
-            assert 'problems_found' in task['expected']
-            assert 'max_drawdown' in task['expected']
-
-            # Data checks
-            assert len(df) > 0
-            assert 'date' in df.columns or 'timestamp' in df.columns
-            assert 'close' in df.columns
-
-            # Answer should be a valid number
-            assert isinstance(task['expected']['max_drawdown'], (int, float))
-            assert task['expected']['max_drawdown'] <= 0  # Drawdown is negative
-
-    def test_multi_asset_task_has_multiple_tickers(self):
-        """Test that multi-asset tasks actually have multiple tickers."""
-        generator = HardTaskGenerator(seed=42)
-        task, df = generator.generate_task_multi_asset_alignment()
-
-        assert 'ticker' in df.columns
-        num_tickers = df['ticker'].nunique()
-        assert num_tickers >= 3, f"Expected >= 3 tickers, got {num_tickers}"
-
-        # Check expected fields
-        assert 'portfolio_return' in task['expected']
-        assert 'num_assets' in task['expected']
-        assert task['expected']['num_assets'] >= 3
-
-    def test_prompts_dont_list_problems(self):
-        """Test that hard tier prompts don't explicitly list which problems are present."""
-        generator = HardTaskGenerator(seed=42)
-
-        task1, _df1 = generator.generate_task_max_drawdown()
-        task2, _df2 = generator.generate_task_multi_asset_alignment()
-
-        # Prompts should say "may contain" not "contains" or list specific problems
-        for task in [task1, task2]:
-            prompt_lower = task['prompt'].lower()
-            assert 'may contain' in prompt_lower or 'data may' in prompt_lower
-
-            # Should not enumerate specific problems
-            problems = task['expected']['problems_found']
-            for problem in problems:
-                # Extract the problem type (e.g., "out_of_order" from "out_of_order_rows_3_swaps")
-                problem.split('_')[0:3]  # Get first few words
-                # Prompt shouldn't explicitly mention this specific problem instance
-                assert problem not in task['prompt'], \
-                    f"Prompt should not explicitly list problem: {problem}"
-
-    def test_prompts_specify_computation_rules(self):
-        """Test that prompts explicitly state computation rules."""
-        generator = HardTaskGenerator(seed=42)
-
-        task1, _df1 = generator.generate_task_max_drawdown()
-        assert 'drawdown' in task1['prompt'].lower()
-        assert 'cummax' in task1['prompt'].lower() or 'maximum' in task1['prompt'].lower()
-
-        task2, _df2 = generator.generate_task_multi_asset_alignment()
-        assert 'equal-weight' in task2['prompt'].lower() or 'equal weight' in task2['prompt'].lower()
-        assert 'rebalanc' in task2['prompt'].lower()
-
-    def test_hard_tier_default_count(self):
-        """Test that hard tier can generate default 25 tasks."""
-        generator = HardTaskGenerator(seed=100)
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tasks = generator.generate_all_tasks(Path(tmpdir), num_tasks=25)
-            assert len(tasks) == 25
-
-            # Check all tasks have unique IDs
-            task_ids = [t['id'] for t in tasks]
-            assert len(set(task_ids)) == len(task_ids)
+    def test_intraday_prices_vary(self):
+        gen = HardTaskGenerator(seed=42)
+        _, intra = gen.generate_task_dst_intraday()
+        assert intra["close"].nunique() > len(intra) // 2
 
 
-class TestHardTierProblems:
-    """Test specific hard-tier problem types."""
+class TestHandComputed:
+    def _df(self, dates, closes):
+        return pd.DataFrame({"date": pd.to_datetime(dates), "ticker": "T",
+                             "open": closes, "high": closes, "low": closes,
+                             "close": closes, "volume": 1000})
 
-    def test_inject_unit_change(self):
-        """Test unit change injection (dollars to cents)."""
-        generator = HardTaskGenerator(seed=42)
-        dfs = generator.generate_clean_prices_multi_asset(['TEST'], datetime(2024, 1, 1), 60)
-        df = dfs['TEST']
+    def test_max_drawdown_hand(self):
+        gen = HardTaskGenerator(seed=1)
+        assert gen.compute_max_drawdown(pd.Series([100.0, 120.0, 60.0, 90.0])) == pytest.approx(-0.5)
 
-        original_close = df.iloc[30]['close']
-        df_modified, problem = generator.inject_unit_change(df, 30)
+    def test_inner_join_and_drift_hand(self):
+        gen = HardTaskGenerator(seed=1)
+        dates_a = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+        dates_b = ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
+        dfs = {"A": self._df(dates_a, [100.0, 110.0, 121.0, 121.0]),
+               "B": self._df(dates_b, [200.0, 180.0, 198.0, 198.0])}
+        ret, n = gen.compute_equal_weight_portfolio_return(dfs, rebalance_freq=20)
+        # inner join keeps 01-02..01-04; A +10% then 0%, B -10% then +10%
+        # holdings start .5/.5 on 01-02; after: .55/.45; then .55/.495 -> total 1.045
+        assert n == 3
+        assert ret == pytest.approx(0.045, abs=1e-9)
 
-        # After change point, prices should be 100x higher
-        assert df_modified.iloc[35]['close'] > original_close * 50
-        assert 'unit_change' in problem
+    def test_rebalance_is_not_daily_hand(self):
+        gen = HardTaskGenerator(seed=1)
+        frame = pd.DataFrame(
+            {"A": [100.0, 200.0, 200.0, 200.0], "B": [100.0, 100.0, 200.0, 200.0]},
+            index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]))
+        # rebalance every 2 return observations:
+        # start .5/.5; obs1: 1.0/.5 (total1.5); obs2: 1.0/1.0 -> rebalance to 1/1
+        # obs3: no moves -> 2.0 total => return 1.0
+        ret = gen._portfolio_from_prices(frame, rebalance_freq=2)
+        assert ret == pytest.approx(1.0, abs=1e-9)
+        # daily-rebalanced would give (1+.5)*(1+.5)*(1+0)-1 = 1.25, so this differs
+        assert ret != pytest.approx(1.25)
 
-    def test_inject_reverse_split(self):
-        """Test reverse split injection."""
-        generator = HardTaskGenerator(seed=42)
-        dfs = generator.generate_clean_prices_multi_asset(['TEST'], datetime(2024, 1, 1), 60)
-        df = dfs['TEST']
+    def test_beta_window_off_by_one_hand(self):
+        gen = HardTaskGenerator(seed=1)
+        idx = pd.Series([0.01, -0.02, 0.03, 0.005])
+        asset = idx * 2.0
+        # window=3 over 4 returns gives windows ending at obs 3 and 4 -> 2 betas of 2.0
+        assert gen.compute_rolling_beta(asset, idx, window=3) == pytest.approx(2.0)
 
-        original_close = df.iloc[30]['close']
-        df_modified, problem = generator.inject_reverse_split(df, ratio=0.1)
+    def test_reverse_split_exact_multiple(self):
+        gen = HardTaskGenerator(seed=3)
+        dfs = gen.generate_clean_prices_multi_asset(["T"], datetime(2024, 1, 1), 60)
+        df = dfs["T"]
+        before = df.iloc[40]["close"]
+        out, problems = gen.inject_reverse_split(df.copy(), multiple=3)
+        assert out.iloc[40]["close"] == pytest.approx(before * 3)
+        assert any("1-for-3" in p for p in problems)
 
-        # After split, prices should be ~10x higher
-        assert df_modified.iloc[35]['close'] > original_close * 5
-        assert 'reverse_split' in problem or 'split' in problem
-
-    def test_inject_out_of_order(self):
-        """Test out-of-order row injection."""
-        generator = HardTaskGenerator(seed=42)
-        dfs = generator.generate_clean_prices_multi_asset(['TEST'], datetime(2024, 1, 1), 60)
-        df = dfs['TEST']
-
-        original_order = df['date'].tolist()
-        df_modified, problem = generator.inject_out_of_order_rows(df, num_swaps=3)
-        new_order = df_modified['date'].tolist()
-
-        # Some dates should be out of order
-        assert original_order != new_order
-        assert 'out_of_order' in problem
-
-    def test_max_drawdown_computation(self):
-        """Test max drawdown calculation."""
-        generator = HardTaskGenerator(seed=42)
-
-        # Simple test case: prices go 100 -> 150 -> 75 -> 120
-        prices = pd.Series([100, 150, 75, 120])
-        max_dd = generator.compute_max_drawdown(prices)
-
-        # Peak is 150, trough after peak is 75, drawdown = (75-150)/150 = -0.5
-        assert max_dd < -0.45  # Account for floating point
-        assert max_dd > -0.55
+    def test_out_of_order_label_counts_actual_swaps(self):
+        gen = HardTaskGenerator(seed=3)
+        dfs = gen.generate_clean_prices_multi_asset(["T"], datetime(2024, 1, 1), 60)
+        _, problem = gen.inject_out_of_order_rows(dfs["T"], num_swaps=3)
+        assert problem.endswith("3_swaps")
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+class TestIndependentSolver:
+    def _check_dir(self, out, tasks):
+        for task in tasks:
+            key = json.loads((Path(out) / "answers" / f"{task['id']}_answer.json").read_text())
+            got = solve(task, Path(out) / task["data_file"])
+            for field, want in key.items():
+                if field == "problems_found":
+                    continue
+                assert field in got, (task["id"], field)
+                assert got[field] == pytest.approx(want, abs=1e-4), (task["id"], field, got, want)
+
+    def test_seed42_all_25_and_20_other_seeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks, out = _gen_tasks(42, 25, tmp)
+            self._check_dir(out, tasks)
+        for seed in range(1000, 1020):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen_tasks(seed, 5, tmp)
+                self._check_dir(out, tasks)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

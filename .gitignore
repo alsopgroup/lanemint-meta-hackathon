@@ -39,6 +39,9 @@ output/
 tasks/*.csv
 tasks/*.json
 tasks/answers/
+tasks_hard/*.csv
+tasks_hard/*.json
+tasks_hard/answers/
 
 # Test coverage
 .coverage

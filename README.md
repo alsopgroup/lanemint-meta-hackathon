@@ -42,8 +42,8 @@ graph LR
 
 ### Key Features
 
-- 🎯 **Two difficulty tiers**: Easy (baseline) and Hard (frontier-challenging)
-- 📊 **~25 tasks per tier** with known data quality issues
+- 🎯 **Two difficulty tiers**: Easy (baseline) and Hard (more problems per task, combined)
+- 📊 **25 tasks per tier by default** with known data quality issues
 - ✅ **Deterministic scoring** with detailed per-problem feedback
 - 🧪 **Dry-run mode** for safe testing without API costs
 - 🔧 **Local fine-tuning** targeting open-weights Muse Glimmer (30B)
@@ -133,25 +133,23 @@ python -m src.generate_tasks --tier hard
 ```
 
 This creates:
-- `tasks/tasks.json` - Task definitions and prompts
-- `tasks/task_*.csv` (easy) or `tasks/task_h_*.csv` (hard) - Dirty market data CSV files
-- `tasks/answers/` - Expected answers (hidden from model)
+- Easy tier (default output `tasks/`): `tasks/tasks.json`, `tasks/task_*.csv`, `tasks/answers/`
+- Hard tier (default output `tasks_hard/`, so it does not overwrite the easy set): `tasks_hard/tasks.json`, `tasks_hard/task_h_*.csv`, `tasks_hard/answers/`
 
 **Options**:
 - `--tier {easy,hard}`: Difficulty tier (default: easy)
 - `--seed SEED`: Random seed for reproducibility (default: 42)
 - `--count COUNT`: Number of tasks to generate (default: 25)
-- `--output-dir DIR`: Output directory (default: tasks/)
+- `--output-dir DIR`: Output directory (default: `tasks/` for easy, `tasks_hard/` for hard)
 
 #### Tier Comparison
 
 | Aspect | Easy Tier | Hard Tier |
 |--------|-----------|-----------|
-| **Problem Types** | Duplicates, missing days, bad ticks, 2:1 splits | Multi-asset panels, timezone/DST, unit changes, reverse splits (1:10, 3:1), out-of-order rows, conflicting adj_close |
-| **Prompt Style** | Lists expected problems and cleaning rules | States computation rules only; problems not enumerated |
-| **Analytics** | Simple (mean return, volatility, total return) | Complex (max drawdown, rolling beta, equal-weight portfolio with rebalancing) |
-| **Problem Count** | 2-3 problems per task | 2-4 interacting problems per task |
-| **Target Pass Rate** | ~90%+ for frontier models | ~20-60% for frontier models |
+| **Problem Types** | Duplicates, missing days, bad ticks, 2:1 splits | Misaligned calendars, mixed-timezone intraday bars, unit changes, currency conversion, reverse splits (1-for-3, 1-for-10), out-of-order rows, conflicting `adj_close`, column-order changes |
+| **Prompt Style** | Lists expected problems and cleaning rules | Gives one fixed list of possible issue categories plus general rules that apply whichever are present, then the exact analytic definition; it does not say which issues a file contains |
+| **Analytics** | Mean/sample-std of returns, total return, annualised volatility | Equal-weight portfolio (inner-join alignment, holdings drift, reset every 20 return observations), max drawdown, rolling 20-observation beta, intraday-to-daily volatility |
+| **Problem Count** | 2-3 problems per task | 2-3 problems per task |
 | **Task IDs** | `task_001`, `task_002`, ... | `task_h_1001`, `task_h_1002`, ... |
 
 **Important**: The default seed 42 is reserved for the evaluation set. Use different seeds when generating training data to avoid train/eval overlap:
@@ -291,18 +289,17 @@ Each easy task contains 2-3 problems. Prompts list which problem types may be pr
 
 ### Hard Tier
 
-The hard tier uses general, textbook data-quality problems (no stock-specific issues like delisted tickers, dividends, or stale prices):
+The hard tier uses general, textbook data-quality problems. It does not use delisted stocks/survivorship, ticker renames, dividends, stale or repeated prices, or too-short history.
 
-1. **Multi-asset panels** - 3-6 tickers with misaligned trading calendars and exchange holidays
-2. **Timezone/DST issues** - Intraday timestamps with mixed timezones or DST shifts causing duplicate/missing hours
-3. **Unit changes** - Mid-series switch from dollars to cents (100x price jump)
-4. **Currency mismatches** - One asset quoted in different currency, FX series provided
-5. **Reverse splits** - 1:10 or 3:1 ratios (prices multiply), sometimes with conflicting `adj_close` column
-6. **Out-of-order rows** - Shuffled row pairs requiring sort
-7. **Header/column changes** - Concatenated exports with different column orders mid-file
-8. **Complex analytics** - Max drawdown from peak, rolling 20-day beta vs index, equal-weight portfolio with periodic rebalancing
+The default 25 hard tasks cycle through five task types, five of each:
 
-Hard tasks contain 2-4 interacting problems. Prompts state exact computation rules (return definition, ddof, alignment, how to treat missing values) without enumerating which problems are present, making the correct answer uniquely determined from the rules.
+1. **Multi-asset portfolio** (3 tickers) - US/European calendar misalignment, out-of-order rows, an exact 1-for-3 reverse split; inner-join alignment and an equal-weight portfolio whose holdings drift and reset every 20 return observations
+2. **Max drawdown** - dollars-to-cents unit change, out-of-order rows, and a second header block with reordered columns partway through the file
+3. **Rolling beta** - one asset quoted in EUR with a per-date `fx_rate` column (USD per EUR), an exact 1-for-10 reverse split, and a partly adjusted `adj_close` column that conflicts with `close` (prompts say to use `close`); 20-observation rolling beta against the IDX benchmark
+4. **Intraday timezone/DST** - intraday bars whose timestamps mix UTC and America/New_York offset forms across the March 2024 spring-forward, with one instant repeated in a second textual form; bar prices vary, and the daily close is the last bar per New-York date
+5. **Volatility with column-order change** - exact 1-for-3 reverse split, conflicting `adj_close`, and a reordered second header block
+
+Every hard prompt carries the same fixed list of possible issue categories and the same general rules (parsing, ordering, `close` vs `adj_close`, FX direction, timezone conversion and de-duplication, sustained-shift adjustment, return definition, ddof=1, annualisation, inner-join alignment, rounding), so the prompt does not reveal which issues a given file contains and the answer is determined by the stated rules. An independent solver in `tests/independent_solver.py`, written separately from the reference code, reproduces every key in the test suite.
 
 ---
 
@@ -371,9 +368,9 @@ Market data is never clean in the real world. Duplicate rows, missing trading da
 
 The deterministic scorer enables both evaluation and reinforcement learning, closing the loop from detection to improvement.
 
-### Optional Tooling
+### Development Note
 
-Meta's **Muse Code** (coding agent) can be used as optional tooling for development workflows, but is not required for the benchmark itself.
+Development of this project switched to Meta's Muse Wonder as the coding model in Cursor during the hard-tier work. Earlier work on the repository was done before that switch, so this note does not describe the tooling used for the whole history.
 
 ---
 
