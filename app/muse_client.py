@@ -16,8 +16,14 @@ ALLOWED_TYPES = {"dups", "gaps", "prices", "splits"}
 MAX_FINDINGS = 50
 MAX_TITLE_CHARS = 120
 MAX_EXPLAIN_CHARS = 600
-MAX_CSV_CHARS = 1_000_000
+MAX_CSV_CHARS = 64_000
 MAX_CSV_ROWS = 500
+MAX_CSV_COLS = 20
+DEFAULT_MAX_TOKENS = 4096
+HARD_MAX_TOKENS = 8192
+# Meta API list pricing used only to estimate daily spend for the cap.
+INPUT_USD_PER_TOKEN = 1.25 / 1_000_000
+OUTPUT_USD_PER_TOKEN = 4.25 / 1_000_000
 
 _SYSTEM_PROMPT = """You are a financial data quality analyst. You inspect CSV market data and report data quality problems.
 
@@ -40,6 +46,10 @@ class MuseUpstreamError(RuntimeError):
     """Raised when the upstream Muse call or its parsing fails."""
 
 
+class MuseBadRequest(ValueError):
+    """Raised when the submitted CSV exceeds the hard input caps."""
+
+
 def live_config() -> dict:
     """Public, secret-free configuration for the frontend."""
     api_key = os.getenv("META_API_KEY") or os.getenv("MODEL_API_KEY")
@@ -47,14 +57,29 @@ def live_config() -> dict:
     return {"live": bool(api_key), "mode": "live" if api_key else "simulated", "model": model}
 
 
-def _count_data_rows(csv_text: str) -> int:
+def _validate_csv(csv_text: str) -> tuple[str, int]:
+    """Enforce hard input caps; returns (csv, data_row_count)."""
+    if len(csv_text) > MAX_CSV_CHARS:
+        raise MuseBadRequest(
+            f"CSV is too large (max {MAX_CSV_CHARS} characters)")
     lines = [line for line in csv_text.replace("\r", "").split("\n") if line.strip()]
-    return max(0, len(lines) - 1)
+    if not lines:
+        raise MuseBadRequest("CSV is empty")
+    if len(lines) - 1 > MAX_CSV_ROWS:
+        raise MuseBadRequest(f"CSV has too many rows (max {MAX_CSV_ROWS})")
+    if lines[0].count(",") + 1 > MAX_CSV_COLS:
+        raise MuseBadRequest(f"CSV has too many columns (max {MAX_CSV_COLS})")
+    return "\n".join(lines), len(lines) - 1
 
 
-def _truncate_csv(csv_text: str) -> str:
-    lines = csv_text.replace("\r", "").split("\n")
-    return "\n".join(lines[: MAX_CSV_ROWS + 1])
+def _max_tokens() -> int:
+    raw = os.getenv("META_MAX_TOKENS")
+    if not raw:
+        return DEFAULT_MAX_TOKENS
+    try:
+        return max(256, min(int(raw), HARD_MAX_TOKENS))
+    except ValueError:
+        return DEFAULT_MAX_TOKENS
 
 
 def _parse_findings(content: str, num_rows: int) -> list[dict]:
@@ -83,8 +108,15 @@ def _parse_findings(content: str, num_rows: int) -> list[dict]:
         ftype = str(item.get("type") or item.get("step") or "").strip()
         if ftype not in ALLOWED_TYPES:
             continue
+        raw_rows = item.get("rows")
+        if isinstance(raw_rows, bool):
+            raw_rows = []
+        elif isinstance(raw_rows, (int, str)):
+            raw_rows = [raw_rows]  # scalar row from the model: wrap, then validate below
+        if not isinstance(raw_rows, list):
+            raw_rows = []
         rows: list[int] = []
-        for value in item.get("rows") or []:
+        for value in raw_rows:
             try:
                 row = int(value)
             except (TypeError, ValueError):
@@ -106,31 +138,29 @@ def _parse_findings(content: str, num_rows: int) -> list[dict]:
     return findings
 
 
-def check_csv(filename: str, csv_text: str, model: str | None = None) -> dict:
+def check_csv(filename: str, csv_text: str) -> dict:
     """Call Muse Spark on a CSV and return validated findings.
 
-    Raises MuseNotConfigured when no API key is set so the caller can
-    tell the frontend to use its simulated fallback.
+    The model is pinned server-side (META_MODEL_NAME); callers cannot
+    choose it. Raises MuseNotConfigured when no API key is set so the
+    caller can tell the frontend to use its simulated fallback.
     """
     api_key = os.getenv("META_API_KEY") or os.getenv("MODEL_API_KEY")
     if not api_key:
         raise MuseNotConfigured("META_API_KEY is not set")
     if not csv_text or not csv_text.strip():
-        raise MuseUpstreamError("CSV is empty")
-    if len(csv_text) > MAX_CSV_CHARS:
-        raise MuseUpstreamError("CSV is too large")
+        raise MuseBadRequest("CSV is empty")
 
     base_url = os.getenv("META_BASE_URL", "https://api.meta.ai/v1")
-    model_name = model or os.getenv("META_MODEL_NAME", "muse-spark-1.3")
-    truncated = _truncate_csv(csv_text)
-    num_rows = _count_data_rows(truncated)
+    model_name = os.getenv("META_MODEL_NAME", "muse-spark-1.3")
+    truncated, num_rows = _validate_csv(csv_text)
 
     try:
         from openai import OpenAI
     except ImportError as exc:  # pragma: no cover - dependency guard
         raise MuseUpstreamError("openai package is not installed") from exc
 
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=60.0)
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=30.0)
     started = time.perf_counter()
     try:
         response = client.chat.completions.create(
@@ -146,7 +176,7 @@ def check_csv(filename: str, csv_text: str, model: str | None = None) -> dict:
                 },
             ],
             temperature=0.1,
-            max_tokens=16000,
+            max_tokens=_max_tokens(),
         )
     except Exception as exc:  # upstream/network errors become a clean 502
         raise MuseUpstreamError(f"Muse request failed: {exc}") from exc
@@ -155,8 +185,21 @@ def check_csv(filename: str, csv_text: str, model: str | None = None) -> dict:
     content = ""
     if response.choices:
         content = response.choices[0].message.content or ""
+    findings = _parse_findings(content, num_rows)
+    usage = getattr(response, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if prompt_tokens is None:
+        prompt_tokens = max(1, len(truncated) // 4)
+    if completion_tokens is None:
+        completion_tokens = max(1, len(content) // 4)
+    estimated_cost = (
+        prompt_tokens * INPUT_USD_PER_TOKEN
+        + completion_tokens * OUTPUT_USD_PER_TOKEN
+    )
     return {
-        "findings": _parse_findings(content, num_rows),
+        "findings": findings,
         "latency_ms": latency_ms,
         "model": model_name,
+        "estimated_cost_usd": round(estimated_cost, 6),
     }
