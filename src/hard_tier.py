@@ -19,11 +19,10 @@ import pandas as pd
 NY = ZoneInfo("America/New_York")
 PRICE_COLS = ["open", "high", "low", "close"]
 
-POSSIBLE_ISSUES = """Possible issue categories in this benchmark (a file may contain any \
-subset of these, including none of some): duplicate, missing, bad_price, split, \
-reverse_split, unit_change, out_of_order, timezone, currency, adj_close, \
-column_order, calendar. Report problems_found using these category codes where \
-they apply, each followed by a short detail (for example "unit_change: ...")."""
+POSSIBLE_ISSUES = """Problem categories (fixed list): duplicate, missing, bad_price, \
+split, reverse_split, unit_change, out_of_order, timezone, currency, adj_close, \
+column_order, calendar. A file may contain any subset of these, including none \
+of some."""
 
 GENERAL_RULES = """General consistency rules (apply in this order, whichever apply):
 1. Parsing: the file is CSV. If a row's fields are themselves column names, that
@@ -44,13 +43,14 @@ GENERAL_RULES = """General consistency rules (apply in this order, whichever app
    file order. The daily close for an America/New_York calendar date is the
    close of the last remaining bar on that date.
 6. Sustained price-level shifts (per ticker, on sorted converted closes):
-   compare each close with the previous close. If the ratio is > 50, prices
-   from that row onward switch to cents: divide them by 100. Otherwise, if
-   the ratio is > 1.8, it is a reverse split whose ratio is the nearest
-   integer to that ratio: divide prices from that row onward by that integer.
-   "Sustained" means the next available close divided by the close before the
-   shift is also > 50 (unit change) or > 1.8 (reverse split). Do not round
-   adjusted prices.
+   compare each close with the previous close. "Sustained" means the next
+   available close divided by the close before the shift is also > 1.8; if
+   it is not, make no adjustment for that shift. If the ratio is > 50 and
+   sustained above 50, prices from that row onward switch to cents: divide
+   them by 100. Otherwise, if the ratio is > 1.8 and sustained, it is a
+   reverse split: divide prices from that row onward by whichever of the
+   candidate ratios 3 or 10 is closest to the observed ratio in relative
+   terms (|ratio - candidate| / candidate). Do not round adjusted prices.
 7. Returns are simple returns: r_t = P_t / P_{t-1} - 1, on consecutive
    observations of the aligned series being analysed. Where a standard
    deviation, variance or covariance is used it is the sample statistic
@@ -68,7 +68,9 @@ def _fmt_prompt(analytic: str, fields: str) -> str:
         f"{POSSIBLE_ISSUES}\n\n{GENERAL_RULES}\n\n"
         f"Computation:\n{analytic}\n\n"
         "Return your answer as JSON with fields:\n"
-        "- problems_found: list of category codes with short details\n"
+        "- problems: JSON array of category codes from the fixed list above, "
+        "with exactly one code per issue type present and no others "
+        "(for example [\"unit_change\", \"out_of_order\"])\n"
         f"{fields}"
     )
 
@@ -100,16 +102,25 @@ class HardTaskGenerator:
             dates = dates[:days]
             price = random.uniform(50, 150)
             rows = []
+            prev_close = None
             for date in dates:
                 price = max(0.01, price * (1 + random.gauss(0.0005, 0.02)))
+                close = round(price, 2)
+                if prev_close is not None and close == prev_close:
+                    close = round(prev_close + 0.01, 2)  # never a stale close
+                    price = float(close)
+                open_price = close * random.uniform(0.99, 1.01)
+                high = max(open_price, float(close)) * random.uniform(1.00, 1.02)
+                low = min(open_price, float(close)) * random.uniform(0.98, 1.00)
                 rows.append({
                     "date": date, "ticker": ticker,
-                    "open": round(price * random.uniform(0.99, 1.01), 2),
-                    "high": round(price * random.uniform(1.00, 1.02), 2),
-                    "low": round(price * random.uniform(0.98, 1.00), 2),
-                    "close": round(price, 2),
+                    "open": round(open_price, 2),
+                    "high": round(high, 2),
+                    "low": round(low, 2),
+                    "close": close,
                     "volume": random.randint(100_000, 10_000_000),
                 })
+                prev_close = close
             dfs[ticker] = pd.DataFrame(rows)
         return dfs
 
@@ -131,7 +142,7 @@ class HardTaskGenerator:
 
     def inject_unit_change(self, df, change_point):
         df = df.copy().reset_index(drop=True)
-        df.loc[change_point:, PRICE_COLS] = df.loc[change_point:, PRICE_COLS] * 100
+        df.loc[change_point:, PRICE_COLS] = (df.loc[change_point:, PRICE_COLS] * 100).round(2)
         date_str = df.iloc[change_point]["date"].strftime("%Y-%m-%d")
         return df, f"unit_change_{date_str}_dollars_to_cents"
 
@@ -139,19 +150,23 @@ class HardTaskGenerator:
         """Exact integer reverse split: post-split prices x multiple, volume / multiple."""
         df = df.copy().reset_index(drop=True)
         idx = random.randint(20, len(df) - 20)
-        df.loc[idx:, PRICE_COLS] = df.loc[idx:, PRICE_COLS] * multiple
+        df.loc[idx:, PRICE_COLS] = (df.loc[idx:, PRICE_COLS] * multiple).round(2)
         df.loc[idx:, "volume"] = (df.loc[idx:, "volume"] // multiple).astype(int)
-        if add_adj_close:
-            df["adj_close"] = df["close"].copy()
-            half = idx // 2
-            # Partly adjusted and therefore conflicting: only the first half
-            # of the pre-split history is already on the post-split basis.
-            df.loc[:half, "adj_close"] = df.loc[:half, "close"] * multiple
         date_str = df.iloc[idx]["date"].strftime("%Y-%m-%d")
         problems = [f"reverse_split_{date_str}_1-for-{multiple}"]
         if add_adj_close:
-            problems.append(f"adj_close_conflict_{date_str}")
+            df, p = self.add_adj_close_conflict(df, multiple=multiple)
+            problems.append(p)
         return df, problems
+
+    def add_adj_close_conflict(self, df, multiple=3):
+        """Add a partly-adjusted adj_close that disagrees with close."""
+        df = df.copy().reset_index(drop=True)
+        df["adj_close"] = df["close"].copy()
+        half = len(df) // 2
+        df.loc[:half, "adj_close"] = (df.loc[:half, "close"] * multiple).round(2)
+        date_str = df.iloc[half]["date"].strftime("%Y-%m-%d") if "date" in df.columns else "intraday"
+        return df, f"adj_close_conflict_{date_str}"
 
     def add_currency_columns(self, df, currency, base_fx=1.08):
         """Add currency/fx_rate; fx_rate is USD per 1 unit, same for a given date."""
@@ -166,38 +181,42 @@ class HardTaskGenerator:
         df["fx_rate"] = df["date"].map(rates)
         return df
 
-    def inject_mixed_timezone_intraday(self, df):
+    def inject_mixed_timezone_intraday(self, df, repeat_instant=True):
         """Expand daily rows to intraday bars in mixed UTC / New-York forms.
 
-        Prices vary bar to bar. One instant is repeated in a second textual
-        form (same values); no price is repeated across distinct bars.
+        Bars run 01:00-20:00 New-York time across the spring-forward week, so
+        the 20:00 bar's UTC date is the next calendar day, and the UTC offset
+        changes mid-series. Prices and volumes vary bar to bar. Optionally one
+        instant is repeated in a second textual form (same values).
         """
         rows = []
+        hours = [1, 9, 12, 16, 20]
+        factors = [0.990, 0.995, 1.004, 1.000, 1.002]
         for _, row in df.iterrows():
             day = row["date"]
-            closes = [row["close"] * 0.995, row["close"] * 1.004, row["close"]]
-            for hour, close in zip([9, 12, 16], closes, strict=True):
+            for hour, factor in zip(hours, factors, strict=True):
+                close = round(row["close"] * factor, 2)
                 local = datetime(day.year, day.month, day.day, hour, tzinfo=NY)
-                if (len(rows) // 3) % 2 == 0:
+                if (len(rows) // len(hours)) % 2 == 0:
                     stamp = local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
                 else:
                     stamp = local.isoformat()
                 rows.append({
                     "timestamp": stamp, "ticker": row["ticker"],
                     "open": round(close * 0.999, 2), "high": round(close * 1.001, 2),
-                    "low": round(close * 0.998, 2), "close": round(close, 2),
-                    "volume": int(row["volume"] // 3),
+                    "low": round(close * 0.998, 2), "close": close,
+                    "volume": int(row["volume"] * random.uniform(0.15, 0.35)),
                 })
         out = pd.DataFrame(rows)
-        # Repeat one instant in the other textual form, later in file order.
-        src = out.iloc[10].copy()
-        instant = pd.Timestamp(src["timestamp"])
-        if str(src["timestamp"]).endswith("Z"):
-            src["timestamp"] = instant.tz_convert(NY).isoformat()
-        else:
-            src["timestamp"] = instant.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-        out = pd.concat([out, src.to_frame().T], ignore_index=True)
-        return out, "timezone_dst_mixed_offsets_duplicate_instant"
+        if repeat_instant:
+            src = out.iloc[10].copy()
+            instant = pd.Timestamp(src["timestamp"])
+            if str(src["timestamp"]).endswith("Z"):
+                src["timestamp"] = instant.tz_convert(NY).isoformat()
+            else:
+                src["timestamp"] = instant.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+            out = pd.concat([out, src.to_frame().T], ignore_index=True)
+        return out, "timezone_mixed_offsets_repeated_instant"
 
     def make_column_order_csv(self, df, split_point):
         """Serialise as two concatenated exports with different column orders."""
@@ -223,10 +242,13 @@ class HardTaskGenerator:
             prev, cur = closes[i - 1], closes[i]
             if prev > 0 and cur / prev > 1.8 and i + 1 < len(closes):
                 sustained = closes[i + 1] / prev
-                if cur / prev > 50 and sustained > 50:
+                if sustained <= 1.8:
+                    factor = None
+                elif cur / prev > 50 and sustained > 50:
                     factor = 100.0
                 elif sustained > 1.8:
-                    factor = float(round(cur / prev))
+                    ratio = cur / prev
+                    factor = float(min((3, 10), key=lambda c: abs(ratio - c) / c))
                 else:
                     factor = None
                 if factor and factor != 1.0:
@@ -284,31 +306,80 @@ class HardTaskGenerator:
     def _start(self):
         return datetime(2024, 1, 1) + timedelta(days=random.randint(0, 60))
 
+    _BUNDLES = {
+        "portfolio": [["reverse_split", "out_of_order"], ["currency", "reverse_split"],
+                      ["adj_close", "out_of_order"], ["currency", "adj_close", "out_of_order"],
+                      ["reverse_split", "adj_close"], ["currency", "out_of_order"]],
+        "max_drawdown": [["unit_change", "out_of_order"], ["unit_change", "column_order"],
+                         ["reverse_split", "out_of_order"],
+                         ["reverse_split", "column_order", "adj_close"],
+                         ["out_of_order", "column_order"],
+                         ["unit_change", "out_of_order", "column_order"]],
+        "beta": [["currency", "reverse_split", "adj_close"], ["currency", "out_of_order"],
+                 ["reverse_split", "adj_close", "out_of_order"], ["currency", "adj_close"],
+                 ["reverse_split", "out_of_order"]],
+        "dst": [["timezone", "out_of_order"], ["timezone", "column_order"],
+                ["timezone", "out_of_order", "column_order"]],
+        "volatility": [["reverse_split", "adj_close"], ["reverse_split", "column_order"],
+                       ["unit_change", "out_of_order"], ["unit_change", "column_order"],
+                       ["out_of_order", "column_order"], ["reverse_split", "out_of_order"],
+                       ["adj_close", "column_order"]],
+    }
+
+    def _bundle(self, kind):
+        # Cycle through a seeded shuffle of the bundle deck so a run of tasks
+        # of one type covers the deck instead of possibly repeating one bundle.
+        if not hasattr(self, "_decks"):
+            self._decks = {}
+        if kind not in self._decks:
+            deck = list(self._BUNDLES[kind])
+            random.shuffle(deck)
+            self._decks[kind] = [deck, 0]
+        deck, idx = self._decks[kind]
+        self._decks[kind][1] = idx + 1
+        return list(deck[idx % len(deck)])
+
     def generate_task_multi_asset_alignment(self):
         self.task_id += 1
         tickers = ["AAA_US", "BBB_EU", "CCC_US"]
         dfs = self.generate_clean_prices_multi_asset(tickers, self._start(), random.randint(80, 110))
-        problems = ["calendar_misalignment_US_EU_holidays"]
-        t1 = random.choice(tickers)
-        dfs[t1], p = self.inject_out_of_order_rows(dfs[t1], 3)
-        problems.append(p)
-        t2 = random.choice([t for t in tickers if t != t1])
-        dfs[t2], ps = self.inject_reverse_split(dfs[t2], multiple=3)
-        problems.extend(ps)
+        problems = []
+        date_sets = [set(d["date"]) for d in dfs.values()]
+        if len(set().union(*date_sets)) > len(set.intersection(*date_sets)):
+            problems.append("calendar_misalignment_US_EU_holidays")
+        bundle = self._bundle("portfolio")
+        if "out_of_order" in bundle:
+            t = random.choice(tickers)
+            dfs[t], p = self.inject_out_of_order_rows(dfs[t], 3)
+            problems.append(p)
+        if "reverse_split" in bundle:
+            t = random.choice(tickers)
+            dfs[t], ps = self.inject_reverse_split(dfs[t], multiple=random.choice([3, 10]))
+            problems.extend(ps)
+        if "currency" in bundle:
+            t = random.choice(tickers)
+            dfs[t] = self.add_currency_columns(dfs[t], "EUR")
+            for other in tickers:
+                if other != t:
+                    dfs[other] = self.add_currency_columns(dfs[other], "USD")
+            problems.append(f"currency_mismatch_{t}_EUR")
+        if "adj_close" in bundle:
+            t = random.choice(tickers)
+            dfs[t], p = self.add_adj_close_conflict(dfs[t])
+            problems.append(p)
         combined = pd.concat(dfs.values(), ignore_index=True)
         ret, n_days = self.compute_equal_weight_portfolio_return(dfs)
         expected = {"portfolio_return": round(ret, 6), "num_assets": len(tickers),
                     "num_aligned_days": n_days, "problems_found": sorted(problems)}
-        analytic = """Tickers in the file: AAA_US, BBB_EU, CCC_US (BBB_EU trades on a
-European calendar, the others on a US calendar; that difference is part of
-the data). Build one close-price series per ticker, apply the general rules,
-align them, and compute an equal-weight portfolio return: portfolio value
-starts at 1.0 on the first aligned date with 1/3 of value held in each asset
-(no return is earned on that first date). Holdings then drift with each
-asset's returns. After applying returns on every 20th return observation
-(observations 20, 40, ... counting the first return, i.e. the move into the
-2nd aligned date, as observation 1), reset every holding to one third of the
-then-current total value; rebalancing does not change that day's return.
+        analytic = """Tickers in the file: AAA_US, BBB_EU, CCC_US. Build one
+close-price series per ticker, apply the general rules, align them, and
+compute an equal-weight portfolio return: portfolio value starts at 1.0 on
+the first aligned date with 1/3 of value held in each asset (no return is
+earned on that first date). Holdings then drift with each asset's returns.
+After applying returns on every 20th return observation (observations 20,
+40, ... counting the first return, i.e. the move into the 2nd aligned date,
+as observation 1), reset every holding to one third of the then-current
+total value; rebalancing does not change that day's return.
 portfolio_return = final portfolio value - 1.0."""
         task = {"id": f"task_h_{self.task_id:03d}", "type": "multi_asset_portfolio",
                 "prompt": _fmt_prompt(analytic, "- portfolio_return: (6 decimals)\n"
@@ -323,12 +394,22 @@ portfolio_return = final portfolio value - 1.0."""
         df = self.generate_clean_prices_multi_asset([ticker], self._start(),
                                                     random.randint(100, 140))[ticker]
         problems = []
-        df, p = self.inject_unit_change(df, random.randint(30, len(df) - 30))
-        problems.append(p)
-        df, p = self.inject_out_of_order_rows(df, 4)
-        problems.append(p)
-        payload, p = self.make_column_order_csv(df, random.randint(30, len(df) - 30))
-        problems.append(p)
+        bundle = self._bundle("max_drawdown")
+        if "unit_change" in bundle:
+            df, p = self.inject_unit_change(df, random.randint(30, len(df) - 30))
+            problems.append(p)
+        if "reverse_split" in bundle:
+            df, ps = self.inject_reverse_split(
+                df, multiple=random.choice([3, 10]),
+                add_adj_close="adj_close" in bundle)
+            problems.extend(ps)
+        if "out_of_order" in bundle:
+            df, p = self.inject_out_of_order_rows(df, 4)
+            problems.append(p)
+        payload = df
+        if "column_order" in bundle:
+            payload, p = self.make_column_order_csv(df, random.randint(30, len(df) - 30))
+            problems.append(p)
         clean = self._clean_series(df)
         expected = {"max_drawdown": round(self.compute_max_drawdown(clean["close"]), 6),
                     "num_clean_days": len(clean), "problems_found": sorted(problems)}
@@ -347,13 +428,29 @@ and cleaning."""
         self.task_id += 1
         tickers = ["ACME", "IDX"]
         dfs = self.generate_clean_prices_multi_asset(tickers, self._start(), random.randint(90, 120))
-        asset = self.add_currency_columns(dfs["ACME"], "EUR")
-        bench = self.add_currency_columns(dfs["IDX"], "USD")
-        asset["adj_close"] = asset["close"]
-        asset, ps = self.inject_reverse_split(asset, multiple=10, add_adj_close=True)
-        bench["adj_close"] = bench["close"]
+        asset, bench = dfs["ACME"], dfs["IDX"]
+        problems = []
+        bundle = self._bundle("beta")
+        if "currency" in bundle:
+            asset = self.add_currency_columns(asset, "EUR")
+            bench = self.add_currency_columns(bench, "USD")
+            problems.append("currency_mismatch_ACME_EUR")
+        if "reverse_split" in bundle:
+            asset, ps = self.inject_reverse_split(
+                asset, multiple=random.choice([3, 10]),
+                add_adj_close="adj_close" in bundle)
+            problems.extend(ps)
+        elif "adj_close" in bundle:
+            asset, p = self.add_adj_close_conflict(asset)
+            problems.append(p)
+        if "out_of_order" in bundle:
+            target = random.choice(["asset", "bench"])
+            if target == "asset":
+                asset, p = self.inject_out_of_order_rows(asset, 3)
+            else:
+                bench, p = self.inject_out_of_order_rows(bench, 3)
+            problems.append(p)
         combined = pd.concat([asset, bench], ignore_index=True)
-        problems = ["currency_mismatch_ACME_EUR", *ps]
         clean_a = self._clean_series(asset)
         clean_b = self._clean_series(bench)
         frame = pd.DataFrame({"asset": clean_a.set_index("date")["close"],
@@ -363,8 +460,7 @@ and cleaning."""
         expected = {"mean_beta": round(beta, 6), "num_aligned_days": len(frame),
                     "num_return_days": len(rets), "problems_found": sorted(problems)}
         analytic = """ACME is the asset and IDX is the benchmark. After the general
-rules (note in particular the currency conversion and which price column to
-use), align the two cleaned close series, compute simple daily returns for
+rules, align the two cleaned close series, compute simple daily returns for
 each, and drop the first, undefined return. For each window of 20 consecutive
 return observations, ending at return observations 20, 21, ..., N, compute
 beta = cov(asset returns, benchmark returns, ddof=1) / var(benchmark returns,
@@ -380,10 +476,16 @@ ddof=1). mean_beta is the arithmetic mean of those window betas."""
         # 2024-03-04 is the Monday before the 2024 US spring-forward.
         start = datetime(2024, 3, 4) + timedelta(days=random.randint(0, 3))
         df = self.generate_clean_prices_multi_asset(["INTR"], start, 12)["INTR"]
-        intra, p = self.inject_mixed_timezone_intraday(df)
+        bundle = self._bundle("dst")
+        intra, p = self.inject_mixed_timezone_intraday(df, repeat_instant=True)
         problems = [p]
-        intra, p = self.inject_out_of_order_rows(intra, 4)
-        problems.append(p)
+        if "out_of_order" in bundle:
+            intra, p = self.inject_out_of_order_rows(intra, 4)
+            problems.append(p)
+        payload = intra
+        if "column_order" in bundle:
+            payload, p = self.make_column_order_csv(intra, random.randint(20, len(intra) - 20))
+            problems.append(p)
         daily = self._daily_closes_from_intraday(intra)
         rets = daily.pct_change().dropna()
         expected = {"mean_return": round(float(rets.mean()), 6),
@@ -402,7 +504,7 @@ daily closes."""
                                       "- annualized_volatility: (6 decimals)\n"
                                       "- num_clean_days: integer"),
                 "data_file": f"task_h_{self.task_id:03d}.csv", "expected": expected}
-        return task, intra
+        return task, payload
 
     @staticmethod
     def _daily_closes_from_intraday(intra):
@@ -424,15 +526,31 @@ daily closes."""
             daily[instant.date()] = close
         return pd.Series([daily[d] for d in sorted(daily)], dtype=float)
 
-    def generate_task_volatility_column_order(self):
+    def generate_task_single_asset_volatility(self):
         self.task_id += 1
         ticker = random.choice(["TECH_A", "ENERGY_B", "FINANCE_C"])
         df = self.generate_clean_prices_multi_asset([ticker], self._start(),
                                                     random.randint(90, 120))[ticker]
-        df, ps = self.inject_reverse_split(df, multiple=3, add_adj_close=True)
-        problems = list(ps)
-        payload, p = self.make_column_order_csv(df, random.randint(30, len(df) - 30))
-        problems.append(p)
+        problems = []
+        bundle = self._bundle("volatility")
+        if "unit_change" in bundle:
+            df, p = self.inject_unit_change(df, random.randint(30, len(df) - 30))
+            problems.append(p)
+        if "reverse_split" in bundle:
+            df, ps = self.inject_reverse_split(
+                df, multiple=random.choice([3, 10]),
+                add_adj_close="adj_close" in bundle)
+            problems.extend(ps)
+        elif "adj_close" in bundle:
+            df, p = self.add_adj_close_conflict(df)
+            problems.append(p)
+        if "out_of_order" in bundle:
+            df, p = self.inject_out_of_order_rows(df, 4)
+            problems.append(p)
+        payload = df
+        if "column_order" in bundle:
+            payload, p = self.make_column_order_csv(df, random.randint(30, len(df) - 30))
+            problems.append(p)
         clean = self._clean_series(df)
         rets = clean["close"].pct_change().dropna()
         expected = {"annualized_volatility": round(float(rets.std(ddof=1) * 252 ** 0.5), 6),
@@ -441,7 +559,7 @@ daily closes."""
 simple daily returns between consecutive cleaned closes and report the
 annualised volatility std(daily returns, ddof=1) * sqrt(252).
 num_clean_days is the number of data rows after parsing and cleaning."""
-        task = {"id": f"task_h_{self.task_id:03d}", "type": "volatility_column_order",
+        task = {"id": f"task_h_{self.task_id:03d}", "type": "single_asset_volatility",
                 "prompt": _fmt_prompt(analytic, "- annualized_volatility: (6 decimals)\n"
                                       "- num_clean_days: integer"),
                 "data_file": f"task_h_{self.task_id:03d}.csv", "expected": expected}
@@ -451,7 +569,7 @@ num_clean_days is the number of data rows after parsing and cleaning."""
     def task_generators(self):
         return [self.generate_task_multi_asset_alignment, self.generate_task_max_drawdown,
                 self.generate_task_beta, self.generate_task_dst_intraday,
-                self.generate_task_volatility_column_order]
+                self.generate_task_single_asset_volatility]
 
     def generate_all_tasks(self, output_dir, num_tasks=25):
         output_dir = Path(output_dir)

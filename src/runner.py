@@ -21,7 +21,7 @@ class StubModel:
             'choices': [{
                 'message': {
                     'content': json.dumps({
-                        'problems_found': ['duplicate_row', 'bad_price'],
+                        'problems': ['duplicate', 'bad_price'],
                         'mean_return': 0.001234,
                         'std_return': 0.023456,
                         'total_return': 0.123456,

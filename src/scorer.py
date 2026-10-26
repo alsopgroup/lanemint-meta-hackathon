@@ -1,11 +1,12 @@
 """
 Deterministic scorer for benchmark tasks.
 
-Problem identification is scored by category. Free-text answers are matched
-with synonym patterns; every occurrence is checked for negation in its own
-clause (leading or trailing), uncertainty phrases such as "cannot rule out"
-do not count, and word boundaries prevent e.g. "nonduplicated" matching.
-Answers may also use the category codes directly.
+Problem identification uses structured output: prompts ask for a JSON
+`problems` array whose entries are category codes from a fixed list, and it
+is scored with precision/recall (F1), so listing extra codes is penalised.
+A legacy free-text `problems_found` array is still accepted as a fallback
+and is mapped to categories with the same F1 scoring; that mapping is a
+best-effort synonym/negation heuristic and is not exhaustive.
 """
 
 import json
@@ -16,8 +17,17 @@ _CLAUSE_SEP = ";.,()"
 _NEG_CUES = {
     "no", "not", "none", "nothing", "never", "without", "cannot", "can't",
     "couldn't", "wasn't", "isn't", "aren't", "doesn't", "don't", "won't", "zero",
+    "0", "neither", "nor", "lacks", "lack", "absence", "free",
 }
 _UNCERTAIN = re.compile(r"\b(cannot|can't|can not|could not|couldn't) rule out\b")
+_IDIOM_NEG = re.compile(
+    r"\bfree of\b|\bruled out\b|\babsence of\b|\blacks?\b|\bneither\b")
+_UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
+                  "suspected", "unconfirmed", "maybe", "perhaps"}
+CANONICAL_CATEGORIES = {
+    "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
+    "out_of_order", "timezone", "currency", "adj_close", "column_order", "calendar",
+}
 
 # category -> regex on text with underscores turned into spaces
 _PATTERNS = {
@@ -39,27 +49,64 @@ _PATTERNS = {
 }
 
 
-def _clause(text, start, end):
+def _clause_bounds(text, start, end):
     lo = max(text.rfind(sep, 0, start) for sep in _CLAUSE_SEP) + 1
+    for dash in (" - ", " — "):
+        idx = text.rfind(dash, 0, start)
+        if idx != -1:
+            lo = max(lo, idx + len(dash))
     stops = [text.find(sep, end) for sep in _CLAUSE_SEP]
     stops = [s for s in stops if s != -1]
+    for dash in (" - ", " — "):
+        idx = text.find(dash, end)
+        if idx != -1:
+            stops.append(idx)
     hi = min(stops) if stops else len(text)
+    return lo, hi
+
+
+def _clause(text, start, end):
+    lo, hi = _clause_bounds(text, start, end)
     return text[lo:hi]
 
 
 def _occurrence_positive(text, match):
     clause = _clause(text, match.start(), match.end())
-    if _UNCERTAIN.search(clause):
+    if _UNCERTAIN.search(clause) or _IDIOM_NEG.search(clause):
+        # "besides/except" re-asserts what follows it: "no issues besides a duplicate"
+        if not re.search(r"\b(besides|except)\b", clause):
+            return False
+    if text[match.end():match.end() + 5].startswith("-free"):
         return False
+    lo, _hi = _clause_bounds(text, match.start(), match.end())
+    m_lo, m_hi = match.start() - lo, match.end() - lo
+    # an exception marker between a leading negation and the match re-asserts it
+    exception_at = None
+    exc = re.search(r"\b(besides|except)\b", clause[:m_lo])
+    if exc:
+        exception_at = exc.end()
     cues = [(m.group(0), m.start(), m.end())
             for m in re.finditer(r"\b\w+(?:'t)?\b", clause)]
-    clause_lo = max(text.rfind(sep, 0, match.start()) for sep in _CLAUSE_SEP) + 1
-    m_lo, m_hi = match.start() - clause_lo, match.end() - clause_lo
     for word, s, e in cues:
+        if word in _UNCERTAIN_ADJ and e <= m_lo:
+            return False
         if word in _NEG_CUES or word.endswith("n't"):
-            if e <= m_lo or s >= m_hi:  # leading or trailing negation
+            if e <= m_lo:
+                if exception_at is not None and e <= exception_at:
+                    continue
+                return False
+            if s >= m_hi:  # trailing negation
                 return False
     return True
+
+
+def _canonical(found):
+    found = set(found)
+    if "reverse_split" in found:
+        found.discard("split")
+    if "unit_change" in found:
+        found.discard("bad_price")
+    return found
 
 
 def categories_for_text(text):
@@ -71,11 +118,26 @@ def categories_for_text(text):
             if _occurrence_positive(norm, match):
                 found.add(category)
                 break
-    if "unit_change" in found:
-        found.add("bad_price")
-    if "reverse_split" in found:
-        found.add("split")
-    return found
+    return _canonical(found)
+
+
+def categories_for_items(items):
+    """Categories from a problems list.
+
+    An entry that starts with a canonical code (``code`` or ``code: detail``)
+    is a structured assertion of exactly that code; anything else falls back
+    to free-text matching.
+    """
+    found = set()
+    for item in items or []:
+        text = str(item).strip().lower()
+        m = re.match(r"^([a-z_]+)\s*(?::|$)", text)
+        code = m.group(1).replace(" ", "_") if m else None
+        if code in CANONICAL_CATEGORIES:
+            found.add(code)
+        else:
+            found |= categories_for_text(text)
+    return _canonical(found)
 
 
 class TaskScorer:
@@ -107,26 +169,32 @@ class TaskScorer:
         return abs(actual - expected) < tolerance
 
     def score_problems_found(self, actual, expected) -> tuple[float, str]:
-        if not actual and not expected:
-            return 1.0, "No problems to identify"
+        """Score category identification with precision/recall (F1).
+
+        Extra categories lower precision, so listing every possible code
+        scores poorly on both tiers.
+        """
+        expected_issues = categories_for_items(expected)
+        if not expected_issues:
+            return (1.0, "No problems to identify") if not categories_for_items(actual) \
+                else (0.0, "False positives: problems reported where none expected")
         if not actual:
             return 0.0, "No problems identified"
-        found_issues = set()
-        for item in actual:
-            found_issues |= categories_for_text(item)
-        expected_issues = set()
-        for item in expected:
-            expected_issues |= categories_for_text(item)
+        found_issues = categories_for_items(actual)
+        tp = len(found_issues & expected_issues)
+        if tp == 0:
+            score = 0.0
+        else:
+            precision = tp / len(found_issues)
+            recall = tp / len(expected_issues)
+            score = 2 * precision * recall / (precision + recall)
         if found_issues == expected_issues:
             return 1.0, "All issue types correctly identified"
-        missing = expected_issues - found_issues
-        extra = found_issues - expected_issues
-        score = len(found_issues & expected_issues) / max(len(expected_issues), 1)
         feedback = []
-        if missing:
-            feedback.append(f"Missed: {sorted(missing)}")
-        if extra:
-            feedback.append(f"False positives: {sorted(extra)}")
+        if expected_issues - found_issues:
+            feedback.append(f"Missed: {sorted(expected_issues - found_issues)}")
+        if found_issues - expected_issues:
+            feedback.append(f"False positives: {sorted(found_issues - expected_issues)}")
         return score, "; ".join(feedback) if feedback else "Partial match"
 
     def score_task(self, task_id: str, response: str) -> dict:
@@ -137,8 +205,9 @@ class TaskScorer:
                     'feedback': parsed['error']}
         scores, feedback = {}, []
         if 'problems_found' in expected:
+            actual_problems = parsed.get('problems', parsed.get('problems_found', []))
             prob_score, prob_feedback = self.score_problems_found(
-                parsed.get('problems_found', []), expected['problems_found'])
+                actual_problems, expected['problems_found'])
             scores['problems'] = prob_score
             if prob_score < 1.0:
                 feedback.append(f"Problems: {prob_feedback}")
@@ -175,7 +244,9 @@ class TaskScorer:
         overall = sum(scores.values()) / len(scores) if scores else 0.0
         if not scores:
             feedback.append("No scoreable fields found")
-        return {'task_id': task_id, 'passed': overall >= 0.8,
+        # Correct numbers with junk/empty problem identification must not pass.
+        problems_ok = scores.get('problems', 1.0) >= 0.5
+        return {'task_id': task_id, 'passed': overall >= 0.8 and problems_ok,
                 'score': round(overall, 3), 'component_scores': scores,
                 'feedback': '; '.join(feedback) if feedback else 'All checks passed'}
 

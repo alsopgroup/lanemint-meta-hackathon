@@ -53,7 +53,7 @@ class TestHardTaskGenerator:
         assert len(tasks) == 25
         types = [t["type"] for t in tasks]
         for expected_type in ["multi_asset_portfolio", "max_drawdown", "rolling_beta",
-                              "dst_intraday", "volatility_column_order"]:
+                              "dst_intraday", "single_asset_volatility"]:
             assert types.count(expected_type) == 5
         all_problems = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,6 +66,90 @@ class TestHardTaskGenerator:
         for marker in ["calendar", "out_of_order", "reverse_split", "unit_change",
                        "currency", "adj_close", "timezone", "column_order"]:
             assert marker in joined, marker
+
+    def test_problem_sets_vary_within_type(self):
+        from collections import defaultdict
+        seen = defaultdict(set)
+        for seed in range(30):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen_tasks(seed, 25, tmp)
+                for t in tasks:
+                    key = json.loads((out / "answers" / f"{t['id']}_answer.json").read_text())
+                    from src.scorer import categories_for_items
+                    seen[t["type"]].add(frozenset(categories_for_items(key["problems_found"])))
+        for task_type, sets in seen.items():
+            assert len(sets) >= 3, (task_type, sets)
+
+    def test_keys_match_data_across_seeds(self):
+        from src.scorer import categories_for_items
+        from tests.independent_solver import read_csv_any
+        for seed in range(12):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen_tasks(seed, 25, tmp)
+                for t in tasks:
+                    key = json.loads((out / "answers" / f"{t['id']}_answer.json").read_text())
+                    cats = categories_for_items(key["problems_found"])
+                    raw = (out / t["data_file"]).read_text()
+                    frame = read_csv_any(out / t["data_file"])
+                    if "calendar" in cats:
+                        per = [set(g["date"]) for _, g in frame.groupby("ticker")]
+                        assert len(set().union(*per)) > len(set.intersection(*per))
+                    if "column_order" in cats:
+                        headers = [ln for ln in raw.splitlines()
+                                   if set(ln.split(",")) <=
+                                   {"date", "timestamp", "ticker", "open", "high", "low",
+                                    "close", "adj_close", "volume", "currency", "fx_rate"}
+                                   and ("date" in ln or "timestamp" in ln)]
+                        assert len(headers) >= 2
+                    if "currency" in cats:
+                        assert set(frame["currency"]) - {"USD"}
+                    if "adj_close" in cats:
+                        sub = frame[frame["adj_close"].astype(str) != ""]
+                        assert (sub["adj_close"].astype(float)
+                                != sub["close"].astype(float)).any()
+                    if "timezone" in cats:
+                        stamps = frame["timestamp"].astype(str)
+                        assert stamps.str.endswith("Z").any() and (
+                            stamps.str.contains("+", regex=False).any()
+                            or stamps.str.contains("-", regex=False).any())
+                    if "out_of_order" in cats:
+                        col = "timestamp" if "timestamp" in frame.columns else "date"
+                        for _, g in frame.groupby("ticker"):
+                            vals = list(g[col])
+                            if vals != sorted(vals):
+                                break
+                        else:
+                            raise AssertionError(f"out_of_order key but data sorted: {t['id']}")
+
+    def test_no_stale_closes_seeds_1_to_200(self):
+        from tests.independent_solver import read_csv_any
+        for seed in range(1, 201):
+            gen = HardTaskGenerator(seed=seed)
+            dfs = gen.generate_clean_prices_multi_asset(
+                ["A_US", "B_EU", "C"], datetime(2024, 1, 1), 60)
+            for df in dfs.values():
+                closes = df["close"].tolist()
+                assert all(a != b for a, b in zip(closes, closes[1:], strict=False)), seed
+            if seed % 40 == 0:  # spot-check injected task data too
+                with tempfile.TemporaryDirectory() as tmp:
+                    tasks, out = _gen_tasks(seed, 25, tmp)
+                    for t in tasks:
+                        frame = read_csv_any(out / t["data_file"])
+                        if "date" not in frame.columns:
+                            continue
+                        for _, g in frame.groupby("ticker"):
+                            g = g.sort_values("date")
+                            closes = [float(c) for c in g["close"]]
+                            assert all(a != b for a, b in
+                                       zip(closes, closes[1:], strict=False)), (seed, t["id"])
+
+    def test_ohlc_consistent(self):
+        for seed in range(20):
+            gen = HardTaskGenerator(seed=seed)
+            dfs = gen.generate_clean_prices_multi_asset(["T"], datetime(2024, 1, 1), 60)
+            df = dfs["T"]
+            assert (df["low"] <= df["open"]).all() and (df["low"] <= df["close"]).all()
+            assert (df["high"] >= df["open"]).all() and (df["high"] >= df["close"]).all()
 
     def test_prompts_state_rules_not_problems(self):
         gen = HardTaskGenerator(seed=7)

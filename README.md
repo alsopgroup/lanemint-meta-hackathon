@@ -289,17 +289,36 @@ Each easy task contains 2-3 problems. Prompts list which problem types may be pr
 
 ### Hard Tier
 
-The hard tier uses general, textbook data-quality problems. It does not use delisted stocks/survivorship, ticker renames, dividends, stale or repeated prices, or too-short history.
+The hard tier uses general, textbook data-quality problems. It does not use delisted stocks/survivorship, ticker renames, dividends, stale or repeated prices, or too-short history. Consecutive closes for a ticker are never identical, and OHLC bars are internally consistent (`low ≤ open, close ≤ high`).
 
-The default 25 hard tasks cycle through five task types, five of each:
+The default 25 hard tasks cycle through five task types, five of each. For every task, a bundle of 2–3 problems is drawn (seeded) from those compatible with that task's analytic — plus calendar misalignment for portfolio tasks only when the tickers' date sets really differ — so the problem set is not fixed by task type:
 
-1. **Multi-asset portfolio** (3 tickers) - US/European calendar misalignment, out-of-order rows, an exact 1-for-3 reverse split; inner-join alignment and an equal-weight portfolio whose holdings drift and reset every 20 return observations
-2. **Max drawdown** - dollars-to-cents unit change, out-of-order rows, and a second header block with reordered columns partway through the file
-3. **Rolling beta** - one asset quoted in EUR with a per-date `fx_rate` column (USD per EUR), an exact 1-for-10 reverse split, and a partly adjusted `adj_close` column that conflicts with `close` (prompts say to use `close`); 20-observation rolling beta against the IDX benchmark
-4. **Intraday timezone/DST** - intraday bars whose timestamps mix UTC and America/New_York offset forms across the March 2024 spring-forward, with one instant repeated in a second textual form; bar prices vary, and the daily close is the last bar per New-York date
-5. **Volatility with column-order change** - exact 1-for-3 reverse split, conflicting `adj_close`, and a reordered second header block
+1. **Multi-asset portfolio** (3 tickers) - equal-weight portfolio with inner-join alignment, holdings drifting and resetting every 20 return observations. Compatible problems: US/European calendar misalignment (only labelled when the tickers' date sets really differ), out-of-order rows, a reverse split, EUR quotation with a per-date `fx_rate` column (USD per EUR), conflicting `adj_close`
+2. **Max drawdown** - maximum drawdown from the running peak. Compatible problems: dollars-to-cents unit change, reverse split, out-of-order rows, conflicting `adj_close`, a second header block with reordered columns partway through the file
+3. **Rolling beta** - mean of rolling 20-observation betas against the IDX benchmark. Compatible problems: EUR/`fx_rate` currency conversion, reverse split, conflicting `adj_close`, out-of-order rows
+4. **Intraday timezone/DST** - bars at 01:00–20:00 New-York time across the March 2024 spring-forward, timestamps mixing UTC and offset forms (the 20:00 bar's UTC date is the next day), one instant repeated in a second textual form; the daily close is the last bar per New-York date. Compatible extra problems: out-of-order rows, reordered second header block
+5. **Single-asset volatility** - annualised volatility. Compatible problems: unit change, reverse split, conflicting `adj_close`, out-of-order rows, reordered second header block
 
-Every hard prompt carries the same fixed list of possible issue categories and the same general rules (parsing, ordering, `close` vs `adj_close`, FX direction, timezone conversion and de-duplication, sustained-shift adjustment, return definition, ddof=1, annualisation, inner-join alignment, rounding), so the prompt does not reveal which issues a given file contains and the answer is determined by the stated rules. An independent solver in `tests/independent_solver.py`, written separately from the reference code, reproduces every key in the test suite.
+Reverse splits multiply prices by exactly 3 or exactly 10; the prompts state that an observed sustained jump is snapped to whichever of the candidate ratios {3, 10} is relatively closest. Scaled values are rounded to 2 decimals, so no float artefacts mark the changed rows.
+
+Every hard prompt carries the same fixed list of possible issue categories and the same general rules (parsing, ordering, `close` vs `adj_close`, FX direction, timezone conversion and de-duplication, sustained-shift adjustment with the {3, 10} candidate set, return definition, ddof=1, annualisation, inner-join alignment, rounding), so the prompt does not reveal which issues a given file contains and the answer is determined by the stated rules. An independent solver in `tests/independent_solver.py`, written separately from the reference code, reproduces every key in the test suite.
+
+### Problem identification scoring
+
+Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. A task cannot pass on numbers alone: its problem-identification component must also reach 0.5.
+
+### Generating and scoring the hard tier
+
+```bash
+# Generate the hard set (writes tasks_hard/, leaving the easy tasks/ set intact)
+python -m src.generate_tasks --tier hard
+
+# Run it (dry-run shown; drop --dry-run with API credentials configured)
+python -m src.runner --tasks-dir tasks_hard --output-dir output/hard --dry-run
+
+# Score it (second argument points the scorer at the hard answers)
+python -m src.scorer output/hard/results.json tasks_hard/answers
+```
 
 ---
 

@@ -43,7 +43,10 @@ def clean_close_series(frame):
         if closes[i - 1] > 0:
             ratio = closes[i] / closes[i - 1]
             if ratio > 1.8 and i + 1 < len(closes) and closes[i + 1] / closes[i - 1] > 1.8:
-                divisor = 100.0 if ratio > 50 else float(round(ratio))
+                if ratio > 50:
+                    divisor = 100.0
+                else:
+                    divisor = float(min((3, 10), key=lambda c: abs(ratio - c) / c))
                 if divisor != 1.0:
                     closes = closes[:i] + [c / divisor for c in closes[i:]]
         i += 1
@@ -82,7 +85,7 @@ def solve(task, csv_path):
         return {"max_drawdown": round(float(((closes - peak) / peak).min()), 6),
                 "num_clean_days": len(closes)}
 
-    if kind == "volatility_column_order":
+    if kind == "single_asset_volatility":
         closes = clean_close_series(frame)
         rets = closes.pct_change().dropna()
         return {"annualized_volatility": round(float(rets.std(ddof=1) * 252 ** 0.5), 6),

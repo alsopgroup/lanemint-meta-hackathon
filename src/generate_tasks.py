@@ -41,25 +41,26 @@ class TaskGenerator:
 
         # Generate OHLC with proper relationships: low <= open,close <= high
         rows = []
+        prev_close = None
         for date, close in zip(dates, prices, strict=False):
-            # Generate high and low around the close price
+            close_r = round(close, 2)
+            if prev_close is not None and close_r == prev_close:
+                close_r = round(prev_close + 0.01, 2)  # never a stale close
             high_mult = random.uniform(1.00, 1.03)
             low_mult = random.uniform(0.97, 1.00)
-            high = close * high_mult
-            low = close * low_mult
-
-            # Open is between low and high
+            high = max(close, close_r) * high_mult
+            low = min(close, close_r) * low_mult
             open_price = random.uniform(low, high)
-
             rows.append({
                 'date': date,
                 'ticker': ticker,
                 'open': round(open_price, 2),
-                'high': round(high, 2),
-                'low': round(low, 2),
-                'close': round(close, 2),
+                'high': round(max(high, close_r), 2),
+                'low': round(min(low, close_r), 2),
+                'close': close_r,
                 'volume': random.randint(1000000, 10000000)
             })
+            prev_close = close_r
 
         return pd.DataFrame(rows)
 
@@ -156,7 +157,7 @@ Your task:
 3. Calculate the mean and sample standard deviation (ddof=1) of daily returns
 
 Return your answer as JSON with fields:
-- problems_found: list of issues you identified (be specific about dates/types)
+- problems: JSON array containing only the category codes that apply, from [duplicate, missing, bad_price, split] (for example ["duplicate"]); list each code at most once and include no others
 - mean_return: mean daily return (6 decimal places)
 - std_return: sample standard deviation (ddof=1) of daily returns (6 decimal places)""",
             'data_file': f'task_{self.task_id:03d}.csv',
@@ -223,7 +224,7 @@ Your task:
 3. Report the final cleaned price
 
 Return your answer as JSON with fields:
-- problems_found: list of issues (be specific about dates/types)
+- problems: JSON array containing only the category codes that apply, from [duplicate, missing, bad_price, split] (for example ["duplicate"]); list each code at most once and include no others
 - total_return: (final_price - initial_price) / initial_price (6 decimals)
 - final_price: the last valid close price (2 decimals)""",
             'data_file': f'task_{self.task_id:03d}.csv',
@@ -276,7 +277,7 @@ Your task:
 3. Count the number of valid trading days after cleaning
 
 Return your answer as JSON with fields:
-- problems_found: list of specific issues found
+- problems: JSON array containing only the category codes that apply, from [duplicate, missing, bad_price, split] (for example ["duplicate"]); list each code at most once and include no others
 - annualized_volatility: volatility measure (6 decimals)
 - num_clean_days: number of valid rows after cleaning""",
             'data_file': f'task_{self.task_id:03d}.csv',

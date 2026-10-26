@@ -152,13 +152,13 @@ NEGATION_CASES = [
     ('This is not a split issue', set()), ('no evidence of any duplicate rows', set()),
     ('checked for duplicates but found none', set()), ('nothing missing', set()),
     ("wasn't a split", set()),
-    ('no split detected; 1-for-3 reverse split found on 2024-02-16', {'split'}),
+    ('no split detected; 1-for-3 reverse split found on 2024-02-16', {'reverse_split'}),
     ('duplicate row on 2024-01-15 (not a missing day)', {'duplicate'}),
     ('missing day 2024-01-20, no duplicate', {'missing'}),
     ('known issue: 2024-01-15 duplicate', {'duplicate'}),
     ('cannot rule out a 3:1 reverse split', set()),
     ('prices badly scaled after 2024-03-04', {'bad_price'}),
-    ('jumped 100x: unit change to cents', {'bad_price'}),
+    ('jumped 100x: unit change to cents', {'unit_change'}),
     ('timestamp gap of 3 days', {'missing'}), ('nonduplicated', set()),
     ('zero-volume bar, no gap', set()), ('NO DUPLICATES', set()),
 ]
@@ -168,7 +168,7 @@ class TestNegationPhrases:
     @pytest.mark.parametrize(('phrase', 'want'), NEGATION_CASES)
     def test_phrase(self, phrase, want):
         from src.scorer import categories_for_text
-        got = categories_for_text(phrase) & {'duplicate', 'missing', 'bad_price', 'split'}
+        got = categories_for_text(phrase)
         assert got == want
 
     def test_hard_categories(self):
@@ -177,6 +177,80 @@ class TestNegationPhrases:
         assert 'out_of_order' in categories_for_text('rows out of chronological order')
         assert 'reverse_split' in categories_for_text('1-for-3 reverse split')
         assert 'out_of_order' not in categories_for_text('no out of order issues')
+
+
+NEW_PHRASES_POSITIVE = [
+    ('out_of_order: rows are not sorted by date', 'out_of_order'),
+    ('adj_close: adj_close does not match close after the split', 'adj_close'),
+    ('currency: ACME prices are in EUR not USD', 'currency'),
+    ('column_order: columns are not in the original order', 'column_order'),
+]
+NEW_PHRASES_NEGATIVE = [
+    'There are 0 duplicate rows', 'free of duplicates', 'duplicate-free',
+    'lacks duplicates', 'absence of missing days', 'unit change ruled out',
+    'possible split (unconfirmed)', 'neither duplicates nor gaps',
+]
+
+
+class TestNewNegationPhrases:
+    @pytest.mark.parametrize(('phrase', 'category'), NEW_PHRASES_POSITIVE)
+    def test_structured_positive(self, phrase, category):
+        from src.scorer import categories_for_items
+        assert category in categories_for_items([phrase])
+
+    @pytest.mark.parametrize('phrase', NEW_PHRASES_NEGATIVE)
+    def test_negative(self, phrase):
+        from src.scorer import categories_for_text
+        assert categories_for_text(phrase) == set()
+
+    def test_besides_and_instead(self):
+        from src.scorer import categories_for_text
+        assert 'duplicate' in categories_for_text('No issues besides a duplicate instant')
+        got = categories_for_text('no reverse split - prices are in cents instead')
+        assert 'unit_change' in got and 'split' not in got and 'reverse_split' not in got
+
+
+class TestStructuredF1:
+    ALL_CODES = ['duplicate', 'missing', 'bad_price', 'split', 'reverse_split',
+                 'unit_change', 'out_of_order', 'timezone', 'currency', 'adj_close',
+                 'column_order', 'calendar']
+
+    def test_pasting_full_list_fails_hard(self):
+        scorer = TaskScorer(Path('tasks/answers'))
+        score, _ = scorer.score_problems_found(self.ALL_CODES, ['unit_change_x', 'out_of_order_y'])
+        assert score < 0.5
+
+    def test_pasting_full_list_fails_easy(self):
+        scorer = TaskScorer(Path('tasks/answers'))
+        score, _ = scorer.score_problems_found(self.ALL_CODES, ['duplicate_row_x'])
+        assert score < 0.5
+
+    def test_exact_codes_score_one(self):
+        scorer = TaskScorer(Path('tasks/answers'))
+        score, _ = scorer.score_problems_found(
+            ['unit_change', 'out_of_order'], ['unit_change_x', 'out_of_order_y'])
+        assert score == 1.0
+
+    def test_free_text_fallback_also_penalised(self):
+        scorer = TaskScorer(Path('tasks/answers'))
+        score, _ = scorer.score_problems_found(
+            ['duplicate rows, missing days, bad spike, split, unit change, '
+             'out of order rows, timezone issue, currency issue'],
+            ['duplicate_row_x'])
+        assert score < 0.5
+
+    def test_dst_junk_does_not_pass(self, tmp_path):
+        import json as _json
+        answer = {'mean_return': 0.001, 'std_return': 0.02, 'annualized_volatility': 0.3,
+                  'num_clean_days': 12, 'problems_found': ['timezone_x', 'out_of_order_y']}
+        (tmp_path / 'task_h_1001_answer.json').write_text(_json.dumps(answer))
+        scorer = TaskScorer(tmp_path)
+        for bad_problems in (['junk'], []):
+            result = scorer.score_task('task_h_1001', _json.dumps(
+                {**{k: v for k, v in answer.items() if k != 'problems_found'},
+                 'problems': bad_problems}))
+            assert result['passed'] is False
+            assert result['component_scores']['problems'] == 0.0
 
 
 class TestHardNumericScoring:
