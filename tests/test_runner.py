@@ -40,6 +40,36 @@ def test_hard_tier_defaults_to_32000(monkeypatch):
     assert fake.kwargs['max_tokens'] == 32000
 
 
+def test_frontier_tier_defaults_to_32000(monkeypatch):
+    runner, fake = _runner_with_fake(monkeypatch)
+    runner.run_task({'id': 'task_f_2001', 'type': 'frontier_rolling_risk',
+                     'prompt': 'p'}, 'data')
+    assert fake.kwargs['max_tokens'] == 32000
+
+
+def test_tier_flag_selects_tasks_dir(monkeypatch, tmp_path):
+    import sys
+
+    from src import runner as runner_mod
+    seen = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_all_tasks(self, tasks_dir, output_dir, limit=None):
+            seen['tasks_dir'] = tasks_dir
+            return []
+
+    monkeypatch.setattr(runner_mod, 'TaskRunner', FakeRunner)
+    monkeypatch.setattr(sys, 'argv', ['runner', '--tier', 'frontier',
+                                      '--output-dir', str(tmp_path)])
+    (tmp_path.parent / 'tasks_frontier').mkdir(exist_ok=True)
+    monkeypatch.chdir(tmp_path.parent)
+    assert runner_mod.main() == 0
+    assert seen['tasks_dir'] == Path('tasks_frontier')
+
+
 def test_easy_tier_defaults_to_16000(monkeypatch):
     runner, fake = _runner_with_fake(monkeypatch)
     runner.run_task({'id': 'task_003', 'type': 'return_calculation', 'prompt': 'p'}, 'data')

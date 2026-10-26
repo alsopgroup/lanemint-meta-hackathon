@@ -54,9 +54,10 @@ class TaskRunner:
             model_name: Model name (default from META_MODEL_NAME env var)
             dry_run: If True, use stub model instead of real API
             max_tokens: Output token cap override. When unset, the
-                META_MAX_TOKENS env var wins; otherwise hard-tier tasks
-                (task_h_* ids) default to 32000 and easy-tier tasks to
-                16000, because reasoning tokens count against the cap.
+                META_MAX_TOKENS env var wins; otherwise hard- and
+                frontier-tier tasks (task_h_* / task_f_* ids) default to
+                32000 and easy-tier tasks to 16000, because reasoning
+                tokens count against the cap.
         """
         load_dotenv()
 
@@ -100,7 +101,8 @@ class TaskRunner:
         env = os.getenv('META_MAX_TOKENS')
         if env:
             return int(env)
-        return 32000 if str(task.get('id', '')).startswith('task_h_') else 16000
+        return 32000 if str(task.get('id', '')).startswith(('task_h_', 'task_f_')) \
+            else 16000
 
     def run_task(self, task: dict, data: str) -> dict:
         """Run a single task."""
@@ -196,8 +198,15 @@ def main():
     parser.add_argument(
         '--tasks-dir',
         type=Path,
-        default=Path('tasks'),
-        help='Directory containing tasks (default: tasks/)'
+        default=None,
+        help='Directory containing tasks (default: tasks/, or the --tier default)'
+    )
+    parser.add_argument(
+        '--tier',
+        choices=['easy', 'hard', 'frontier'],
+        default=None,
+        help='Task tier; sets the default tasks directory (tasks/, tasks_hard/, '
+             'tasks_frontier/) when --tasks-dir is not given'
     )
     parser.add_argument(
         '--output-dir',
@@ -228,10 +237,15 @@ def main():
         type=int,
         default=None,
         help='Output token cap (overrides META_MAX_TOKENS; default 32000 for '
-             'hard-tier tasks, 16000 for easy-tier tasks)'
+             'hard- and frontier-tier tasks, 16000 for easy-tier tasks)'
     )
 
     args = parser.parse_args()
+
+    if args.tasks_dir is None:
+        args.tasks_dir = {'hard': Path('tasks_hard'),
+                          'frontier': Path('tasks_frontier')}.get(
+                              args.tier, Path('tasks'))
 
     if not args.tasks_dir.exists():
         print(f"Error: Tasks directory not found: {args.tasks_dir}")
