@@ -5,7 +5,7 @@
 
 > A synthetic benchmark for evaluating language models on financial data quality tasks
 
-![LaneMint x Llama, built for the Meta AI Developer Hackathon](docs/assets/banner.png)
+![LaneMint x Meta: synthetic market-data benchmark built with Meta's Muse models](docs/assets/banner.png)
 
 Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [LaneMint](https://lanemint.com).
 
@@ -22,14 +22,17 @@ graph LR
     A[Generate Tasks] --> B[Run Model]
     B --> C[Score Results]
     A --> D[Prepare Fine-tuning Data]
-    D --> E[Fine-tune Model]
+    D --> E[Fine-tune Model Locally]
     E --> B
+    C --> F[Deterministic Reward]
+    F --> E
     
     style A fill:#e1f5ff
     style B fill:#fff4e1
     style C fill:#e8f5e9
     style D fill:#f3e5f5
     style E fill:#fce4ec
+    style F fill:#fff3e0
 ```
 
 ### Key Features
@@ -37,8 +40,8 @@ graph LR
 - 🎯 **~25 synthetic tasks** with known data quality issues
 - ✅ **Deterministic scoring** with detailed per-problem feedback
 - 🧪 **Dry-run mode** for safe testing without API costs
-- 🔧 **Fine-tuning pipeline** with train/validation split
-- 💰 **Cost estimation** before running paid operations
+- 🔧 **Local fine-tuning** targeting open-weights Muse Glimmer (30B)
+- 🎁 **Scorer as reward** for GRPO-based reinforcement learning
 - 🔓 **Zero external dependencies** on proprietary data or code
 
 ---
@@ -93,10 +96,10 @@ Edit `.env` and set your Meta API credentials (do not commit this file):
 ```bash
 META_API_KEY=your_api_key_here
 META_BASE_URL=https://api.meta.ai/v1
-META_MODEL_NAME=llama-3.1-8b
+META_MODEL_NAME=muse-spark-1.3
 ```
 
-**Note**: `META_BASE_URL` is a placeholder. Confirm the actual API endpoint from the hackathon's official documentation before running any real API calls.
+The API is OpenAI-compatible. Available models: `muse-spark-1.3` (default), `muse-spark-1.2`, `muse-spark-1.1`.
 
 ---
 
@@ -137,46 +140,53 @@ Shows pass/fail for each task with detailed feedback.
 
 ### 4. Prepare Fine-Tuning Data
 
-Split tasks into training and validation sets:
+Split tasks into training and validation sets for local fine-tuning:
 
 ```bash
 python -m src.finetune_prep
 ```
 
 Creates:
-- `finetune_data/train.jsonl` - Training examples (80%)
+- `finetune_data/train.jsonl` - SFT training examples (80%)
 - `finetune_data/validation.jsonl` - Validation examples (20%)
 - `finetune_data/validation_task_ids.json` - Held-out task IDs
 
-### 5. Estimate Fine-Tuning Cost
+The JSONL format is compatible with TRL (Hugging Face) and Axolotl for QLoRA fine-tuning.
 
-Check cost before running (always use dry-run first):
+### 5. Fine-Tune Locally (Planned)
+
+Fine-tune **Muse Glimmer** (30B dense, Apache 2.0) locally using the prepared data:
+
+**Target model**: `meta-models/Muse-Glimmer-30B` (Hugging Face) or `meta-models/Muse-Glimmer-30B-GGUF`
+
+**Approaches**:
+- **Supervised Fine-Tuning (SFT)**: Use `train.jsonl` with TRL's `SFTTrainer` or Axolotl for QLoRA
+- **GRPO (Group Relative Policy Optimization)**: Use `src/scorer.py` as a deterministic reward function with TRL's `GRPOTrainer` or Meta's TitanRL data-analyst recipe
 
 ```bash
+# Estimate data size and check format (dry-run, no training)
 python -m src.finetune --dry-run
+
+# For actual fine-tuning, see TRL or Axolotl documentation
+# Optional: install fine-tuning dependencies
+# pip install -e ".[finetune]"
 ```
 
-### 6. Launch Fine-Tuning (Requires Approval)
+**Note**: Fine-tuning requires GPU resources. The scorer provides deterministic rewards for reinforcement learning approaches.
 
-⚠️ **This uses hackathon credits** - requires explicit approval:
-
-```bash
-python -m src.finetune --run
-```
-
-### Running Real Model Evaluation
+### 6. Running Real Model Evaluation
 
 Once you have Meta API access configured:
 
 ```bash
-# Run baseline (before fine-tuning)
+# Run baseline with Muse Spark
 python -m src.runner --output-dir output/baseline
 
 # Score baseline
 python -m src.scorer output/baseline/results.json
 
-# After fine-tuning completes, update META_MODEL_NAME in .env
-# to your fine-tuned model, then:
+# After local fine-tuning, point to your fine-tuned model endpoint
+# Update META_BASE_URL and META_MODEL_NAME in .env, then:
 python -m src.runner --output-dir output/finetuned
 
 # Score fine-tuned results
@@ -195,10 +205,10 @@ python -m src.scorer output/finetuned/results.json
 ├── src/
 │   ├── __init__.py
 │   ├── generate_tasks.py         # Task and data generator
-│   ├── scorer.py                 # Deterministic scoring engine
+│   ├── scorer.py                 # Deterministic scoring engine (also usable as reward function)
 │   ├── runner.py                 # Model runner with dry-run mode
-│   ├── finetune_prep.py          # Fine-tuning data preparation
-│   └── finetune.py               # Fine-tuning job launcher
+│   ├── finetune_prep.py          # Fine-tuning data preparation (SFT/GRPO)
+│   └── finetune.py               # Fine-tuning configuration and validation
 ├── tests/
 │   ├── __init__.py
 │   └── test_scorer.py            # Unit tests for scorer
@@ -272,26 +282,28 @@ Edit scoring logic in `src/scorer.py`:
 
 ---
 
-## Cost Estimate
+## Hackathon: Build for Your World
 
-Per full benchmark run with ~25 tasks:
+**Track**: Build for Your World  
+**Event**: Meta AI Developer Hackathon  
+**Dates**: October 26 - November 4, 2026
 
-- **Baseline run**: ~$0.50 (inference on 25 tasks)
-- **Fine-tuning**: ~$2-5 (training tokens + validation)
-- **Fine-tuned run**: ~$0.50 (inference on 25 tasks)
+### Why Market Data Quality?
 
-**Total estimated cost**: ~$3-6 per full cycle (well within $150 budget)
+Market data is never clean in the real world. Duplicate rows, missing trading days, bad price ticks, and unadjusted stock splits corrupt backtests and portfolio analytics. Manual cleaning is brittle and expensive.
 
-*Note: Actual costs depend on final model size, token counts, and Meta's pricing. Always run `--dry-run` first to see estimates.*
+### Our Approach
 
----
+1. **Synthetic benchmark**: Generate realistic market data with known quality issues
+2. **Test Muse Spark**: Evaluate Meta's Muse models on data quality detection
+3. **Deterministic scoring**: Validate responses with precise, reproducible grading
+4. **Local fine-tuning**: Use the same scorer as a reward function for fine-tuning Muse Glimmer (30B, open-weights) with GRPO
 
-## Hackathon
+The deterministic scorer enables both evaluation and reinforcement learning, closing the loop from detection to improvement.
 
-**Meta AI Developer Hackathon**  
-📅 October 26 - November 4, 2026  
-💰 $150 in Meta API credits  
-🎯 Goal: Demonstrate measurable improvement in data quality task performance through fine-tuning
+### Optional Tooling
+
+Meta's **Muse Code** (coding agent) can be used as optional tooling for development workflows, but is not required for the benchmark itself.
 
 ---
 
