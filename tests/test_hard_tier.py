@@ -2,7 +2,7 @@
 
 import json
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -295,6 +295,148 @@ class TestFinalCsvScans:
                 for t in tasks:
                     frame = pd.read_csv(Path(tmp) / t["data_file"])
                     _assert_no_stale(frame)
+
+
+def _ny_instants(stamps):
+    out = []
+    for s in stamps:
+        ts = pd.Timestamp(s)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        out.append(ts.tz_convert("America/New_York"))
+    return out
+
+
+def _sorted_closes(frame):
+    """Per-ticker closes sorted by date/instant, exact duplicates dropped."""
+    series = {}
+    for ticker, g in frame.groupby("ticker"):
+        if "timestamp" in frame.columns:
+            pairs = sorted(zip(_ny_instants(g["timestamp"].astype(str)),
+                               g["close"], strict=True), key=lambda p: p[0])
+            seen, closes = set(), []
+            for instant, close in pairs:
+                if instant not in seen:
+                    seen.add(instant)
+                    closes.append(float(close))
+            series[ticker] = closes
+        else:
+            g = g.assign(_k=pd.to_datetime(g["date"])).sort_values("_k")
+            g = g.drop_duplicates(subset=["date"], keep="first")
+            series[ticker] = [float(c) for c in g["close"]]
+    return series
+
+
+def _sustained_jump_ratios(closes):
+    """Jump ratios at points where the new level is sustained (rule 6)."""
+    ratios = []
+    for i in range(1, len(closes) - 1):
+        if closes[i - 1] > 0:
+            ratio = closes[i] / closes[i - 1]
+            if ratio > 1.8 and closes[i + 1] / closes[i - 1] > 1.8:
+                ratios.append(ratio)
+    return ratios
+
+
+def _bars_per_ny_day(frame):
+    per_day = {}
+    for instant in _ny_instants(frame["timestamp"].astype(str)):
+        per_day.setdefault(instant.date(), set()).add(instant)
+    return sorted(len(v) for v in per_day.values())
+
+
+def _has_missing_weekday(gen, ticker, dates):
+    """A weekday inside the ticker's own range is absent (holidays excluded)."""
+    days = {d.date() for d in pd.to_datetime(dates)}
+    day = min(days) + timedelta(days=1)
+    while day < max(days):
+        if day.weekday() < 5 and day not in days:
+            if ticker.endswith("_EU"):
+                holiday = gen._is_eu_holiday(day)
+            elif ticker.endswith("_US"):
+                holiday = gen._is_us_holiday(day)
+            else:
+                holiday = False
+            if not holiday:
+                return True
+        day += timedelta(days=1)
+    return False
+
+
+class TestKeyDetectability:
+    """Every category in a key must be detectable in the final CSV."""
+
+    def test_every_key_category_detectable_seeds_1_to_200(self):
+        from src.scorer import categories_for_items
+        from tests.independent_solver import read_csv_any
+        calendar_gen = HardTaskGenerator(seed=0)
+        for seed in range(1, 201):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen_tasks(seed, 5, tmp)
+                for t in tasks:
+                    key = json.loads(
+                        (out / "answers" / f"{t['id']}_answer.json").read_text())
+                    cats = categories_for_items(key["problems_found"])
+                    frame = read_csv_any(out / t["data_file"])
+                    where = (seed, t["id"], sorted(cats))
+                    intraday = "timestamp" in frame.columns
+                    if "duplicate" in cats:
+                        cols = ["ticker", "timestamp" if intraday else "date"]
+                        assert frame.duplicated(subset=cols).any(), where
+                    if "missing" in cats:
+                        if intraday:
+                            # the missing bar really is absent: one New-York
+                            # date has 4 distinct bar instants, the rest 5
+                            assert _bars_per_ny_day(frame)[0] == 4, where
+                        else:
+                            assert any(
+                                _has_missing_weekday(calendar_gen, ticker, g["date"])
+                                for ticker, g in frame.groupby("ticker")), where
+                    ratios = [r for closes in _sorted_closes(frame).values()
+                              for r in _sustained_jump_ratios(closes)]
+                    if "unit_change" in cats:
+                        assert any(r > 50 for r in ratios), where
+                    if "reverse_split" in cats:
+                        assert any(1.8 < r <= 50 for r in ratios), where
+                    for r in ratios:
+                        # ~100x is a unit change; ~300x would mean a unit
+                        # change and a reverse split share one row, and any
+                        # sustained jump must be declared in the key
+                        assert r <= 150, (where, r)
+                        assert "unit_change" in cats if r > 50 \
+                            else "reverse_split" in cats, (where, r)
+
+    def test_known_collision_cases(self):
+        from src.scorer import categories_for_items
+        from tests.independent_solver import read_csv_any
+        # Unit change and reverse split landed on the same row (~300x jump
+        # labelled as both, readable as a unit change only).
+        for seed in (54, 138):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen_tasks(seed, 25, tmp)
+                t = next(t for t in tasks if t["id"] == "task_h_1020")
+                key = json.loads(
+                    (out / "answers" / "task_h_1020_answer.json").read_text())
+                cats = categories_for_items(key["problems_found"])
+                assert {"unit_change", "reverse_split"} <= cats
+                frame = read_csv_any(out / t["data_file"])
+                ratios = [r for closes in _sorted_closes(frame).values()
+                          for r in _sustained_jump_ratios(closes)]
+                assert any(r > 50 for r in ratios), seed
+                assert any(1.8 < r <= 50 for r in ratios), seed
+                assert all(r <= 150 for r in ratios), seed
+        # The DST missing bar deleted the original of the repeated instant,
+        # whose second-format copy restored it (nothing actually missing).
+        for seed in (91, 98, 117):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen_tasks(seed, 25, tmp)
+                t = next(t for t in tasks if t["id"] == "task_h_1004")
+                key = json.loads(
+                    (out / "answers" / "task_h_1004_answer.json").read_text())
+                cats = categories_for_items(key["problems_found"])
+                assert "missing" in cats
+                frame = read_csv_any(out / t["data_file"])
+                assert _bars_per_ny_day(frame)[0] == 4, seed
 
 
 class TestIndependentSolver:

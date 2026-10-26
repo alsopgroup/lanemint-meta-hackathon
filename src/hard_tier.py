@@ -155,9 +155,11 @@ class HardTaskGenerator:
                         ignore_index=True)
         return out, f"duplicate_row_{self._row_label(df, idx)}"
 
-    def inject_missing_row(self, df):
+    def inject_missing_row(self, df, exclude_indices=()):
         df = df.copy().reset_index(drop=True)
         idx = random.randint(5, len(df) - 5)
+        while idx in exclude_indices:
+            idx = random.randint(5, len(df) - 5)
         label = self._row_label(df, idx)
         out = pd.concat([df.iloc[:idx], df.iloc[idx + 1:]], ignore_index=True)
         kind = "day" if "date" in df.columns else "bar"
@@ -204,10 +206,18 @@ class HardTaskGenerator:
         df.loc[change_point:, PRICE_COLS] = (df.loc[change_point:, PRICE_COLS] * 100).round(2)
         return df, f"unit_change_{self._row_label(df, change_point)}_dollars_to_cents"
 
-    def inject_reverse_split(self, df, multiple=3, add_adj_close=False):
-        """Exact integer reverse split: post-split prices x multiple, volume / multiple."""
+    def inject_reverse_split(self, df, multiple=3, add_adj_close=False, avoid_idx=None):
+        """Exact integer reverse split: post-split prices x multiple, volume / multiple.
+
+        When ``avoid_idx`` is given (a unit-change row on the same series),
+        the split row is kept well away from it: on the same row the two
+        would combine into a single ~300x jump that reads as a unit change
+        only, leaving the reverse split undetectable.
+        """
         df = df.copy().reset_index(drop=True)
         idx = random.randint(20, len(df) - 20)
+        while avoid_idx is not None and abs(idx - avoid_idx) <= 5:
+            idx = random.randint(20, len(df) - 20)
         df.loc[idx:, PRICE_COLS] = (df.loc[idx:, PRICE_COLS] * multiple).round(2)
         df.loc[idx:, "volume"] = (df.loc[idx:, "volume"] // multiple).astype(int)
         date_str = self._row_label(df, idx)
@@ -407,12 +417,15 @@ class HardTaskGenerator:
         if "missing" in bundle:
             df, p = self.inject_missing_row(df)
             problems.append(p)
+        unit_idx = None
         if "unit_change" in bundle:
-            df, p = self.inject_unit_change(df, random.randint(30, len(df) - 30))
+            unit_idx = random.randint(30, len(df) - 30)
+            df, p = self.inject_unit_change(df, unit_idx)
             problems.append(p)
         if "reverse_split" in bundle:
             df, ps = self.inject_reverse_split(
-                df, multiple=random.choice([3, 10]), add_adj_close="adj_close" in bundle)
+                df, multiple=random.choice([3, 10]),
+                add_adj_close="adj_close" in bundle, avoid_idx=unit_idx)
             problems.extend(ps)
         elif "adj_close" in bundle:
             df, p = self.add_adj_close_conflict(df)
@@ -455,14 +468,17 @@ class HardTaskGenerator:
             problems.append(f"currency_mismatch_{t}_EUR")
         # Price-level shifts must be injected before any row shuffling, so a
         # swapped row can never land on the wrong side of a split.
+        unit_ticker, unit_idx = None, None
         if "unit_change" in bundle:
-            t = random.choice(tickers)
-            dfs[t], p = self.inject_unit_change(
-                dfs[t], random.randint(30, len(dfs[t]) - 30))
+            unit_ticker = random.choice(tickers)
+            unit_idx = random.randint(30, len(dfs[unit_ticker]) - 30)
+            dfs[unit_ticker], p = self.inject_unit_change(dfs[unit_ticker], unit_idx)
             problems.append(p)
         if "reverse_split" in bundle:
             t = random.choice(tickers)
-            dfs[t], ps = self.inject_reverse_split(dfs[t], multiple=random.choice([3, 10]))
+            dfs[t], ps = self.inject_reverse_split(
+                dfs[t], multiple=random.choice([3, 10]),
+                avoid_idx=unit_idx if t == unit_ticker else None)
             problems.extend(ps)
         if "adj_close" in bundle:
             t = random.choice(tickers)
@@ -543,13 +559,15 @@ and cleaning."""
             bench, p = self.inject_missing_row(bench)
             problems.append(p)
         # Shifts before shuffling.
+        unit_idx = None
         if "unit_change" in bundle:
-            asset, p = self.inject_unit_change(asset, random.randint(30, len(asset) - 30))
+            unit_idx = random.randint(30, len(asset) - 30)
+            asset, p = self.inject_unit_change(asset, unit_idx)
             problems.append(p)
         if "reverse_split" in bundle:
             asset, ps = self.inject_reverse_split(
                 asset, multiple=random.choice([3, 10]),
-                add_adj_close="adj_close" in bundle)
+                add_adj_close="adj_close" in bundle, avoid_idx=unit_idx)
             problems.extend(ps)
         elif "adj_close" in bundle:
             asset, p = self.add_adj_close_conflict(asset)
@@ -595,11 +613,18 @@ ddof=1). mean_beta is the arithmetic mean of those window betas."""
         bundle = self._bundle("dst")
         intra, p = self.inject_mixed_timezone_intraday(df, repeat_instant=True)
         problems = [p]
+        # The repeated instant exists twice (two textual forms of one bar);
+        # deleting either copy would leave the bar present, so the missing
+        # pick must never land on it. Captured now because a duplicate-row
+        # insertion below can shift row positions.
+        repeated_instant = pd.Timestamp(intra.iloc[10]["timestamp"])
         if "duplicate" in bundle:
             intra, p = self.inject_duplicate_row(intra)
             problems.append(p)
         if "missing" in bundle:
-            intra, p = self.inject_missing_row(intra)
+            repeated_rows = [i for i, stamp in enumerate(intra["timestamp"])
+                             if pd.Timestamp(stamp) == repeated_instant]
+            intra, p = self.inject_missing_row(intra, exclude_indices=repeated_rows)
             problems.append(p)
         if "currency" in bundle:
             rate, rates = 1.08, {}
@@ -615,12 +640,15 @@ ddof=1). mean_beta is the arithmetic mean of those window betas."""
                                 for s in intra["timestamp"]]
             problems.append("currency_mismatch_INTR_EUR")
         # Shifts before shuffling.
+        unit_idx = None
         if "unit_change" in bundle:
-            intra, p = self.inject_unit_change(intra, random.randint(20, len(intra) - 20))
+            unit_idx = random.randint(20, len(intra) - 20)
+            intra, p = self.inject_unit_change(intra, unit_idx)
             problems.append(p)
         if "reverse_split" in bundle:
             intra, ps = self.inject_reverse_split(
-                intra, multiple=random.choice([3, 10]), add_adj_close="adj_close" in bundle)
+                intra, multiple=random.choice([3, 10]),
+                add_adj_close="adj_close" in bundle, avoid_idx=unit_idx)
             problems.extend(ps)
         elif "adj_close" in bundle:
             intra, p = self.add_adj_close_conflict(intra)

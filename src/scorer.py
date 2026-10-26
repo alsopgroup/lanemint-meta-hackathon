@@ -26,7 +26,7 @@ _UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
                   "suspected", "unconfirmed", "maybe", "perhaps", "unlikely"}
 _CODE_NEGATED = re.compile(
     r"^\s*(none\b|not\b|no\b|0\b|zero\b|absent\b|ruled out\b|not present\b|"
-    r"not detected\b|not found\b|no issues?\b)")
+    r"not detected\b|not found\b|no issues?\b|nothing\b|n/?a\b)")
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
     "out_of_order", "timezone", "currency", "adj_close", "column_order", "calendar",
@@ -43,7 +43,7 @@ _PATTERNS = {
     "out_of_order": r"\bout of (?:chronological )?order\b|\bchronological order\b"
                     r"|\bunsorted\b|\bout of sequence\b|\brow order\b",
     "timezone": r"\btime ?zones?\b|\btimezone\b|\bdst\b|\bdaylight\b|\bmixed offsets?\b"
-                r"|\bduplicate (?:instant|timestamp|hour)\b",
+                r"|\btimestamps? mix\w*\b|\bduplicate (?:instant|timestamp|hour)\b",
     "currency": r"\bcurrency\b|\bcurrencies\b|\bfx\b|\bforeign exchange\b"
                 r"|\bquoted in (?:eur|euros|usd|dollars)\b",
     "adj_close": r"\badj close\b|\badjusted close\b",
@@ -149,10 +149,10 @@ def categories_for_items(items):
     found = set()
     for item in items or []:
         text = str(item).strip().lower()
-        m = re.match(r"^([a-z_]+)\s*(?::|$)", text)
+        m = re.match(r"^([a-z_]+)\s*(?::|—|–|$)", text)
         code = m.group(1).replace(" ", "_") if m else None
         if code in CANONICAL_CATEGORIES:
-            detail = text[m.end():] if ":" in text else ""
+            detail = text[m.end():]
             if not _CODE_NEGATED.match(detail):
                 found.add(code)
         else:

@@ -218,6 +218,13 @@ class TestNewNegationPhrases:
         got = categories_for_text('not a duplicate but a missing day')
         assert 'missing' in got and 'duplicate' not in got
 
+    def test_code_na_nothing_and_emdash_negatives(self):
+        from src.scorer import categories_for_items, categories_for_text
+        assert categories_for_items(['duplicate: n/a']) == set()
+        assert categories_for_items(['missing: nothing missing']) == set()
+        assert categories_for_items(['missing — none']) == set()
+        assert categories_for_text('timestamps mix utc and offsets') == {'timezone'}
+
 
 class TestStructuredF1:
     ALL_CODES = ['duplicate', 'missing', 'bad_price', 'split', 'reverse_split',
