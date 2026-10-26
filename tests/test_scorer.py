@@ -9,6 +9,73 @@ import pytest
 from src.scorer import TaskScorer
 
 
+class TestKeyStrings:
+    """Answer-key strings must map to categories without negation parsing."""
+
+    def test_bad_price_key_string_keeps_its_code(self):
+        from src.scorer import categories_for_items, categories_for_key_items
+        key = ['bad_price_2024-07-09_0.1']
+        assert categories_for_key_items(key) == {'bad_price'}
+        # the perfect-answer path: the real key strings as the response
+        assert categories_for_items(key) == {'bad_price'}
+        scorer = TaskScorer(Path('tasks/answers'))
+        score, _ = scorer.score_problems_found(['bad_price'], key)
+        assert score == 1.0
+        score, _ = scorer.score_problems_found(key, key)
+        assert score == 1.0
+
+    def test_zero_counts_negate_but_decimals_do_not(self):
+        from src.scorer import categories_for_items, categories_for_text
+        # explicit none/0 counts in a model answer mean "not detected"
+        assert categories_for_text('There are 0 duplicate rows') == set()
+        assert categories_for_text('0 duplicates found') == set()
+        assert categories_for_items(['missing: 0']) == set()
+        assert categories_for_items(['missing: 0 days']) == set()
+        assert categories_for_items(['duplicate_rows: none']) == set()
+        # decimals are not zero counts, and key strings keep their codes
+        assert categories_for_text('0.1x bad price spike') == {'bad_price'}
+        from src.scorer import categories_for_key_items
+        assert categories_for_key_items(['bad_price_2024-07-09_0.1']) == {'bad_price'}
+        assert categories_for_key_items(['bad_price_2024-07-09_10.0']) == {'bad_price'}
+        assert categories_for_key_items(['stock_split_2024-07-09_2.0']) == {'split'}
+
+    def test_every_key_scores_perfectly_seeds_1_to_200_both_tiers(self):
+        import json
+        import tempfile
+
+        from src.generate_tasks import TaskGenerator
+        from src.hard_tier import HardTaskGenerator
+        scorer = TaskScorer(Path('tasks/answers'))
+        for seed in range(1, 201):
+            for gen in (HardTaskGenerator(seed=seed), TaskGenerator(seed=seed)):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tasks = gen.generate_all_tasks(Path(tmp), num_tasks=5)
+                    for t in tasks:
+                        key = json.loads((Path(tmp) / 'answers'
+                                          / f"{t['id']}_answer.json").read_text())
+                        strings = key['problems_found']
+                        score, fb = scorer.score_problems_found(strings, strings)
+                        assert score == 1.0, (seed, t['id'], strings, fb)
+
+    def test_seed42_named_easy_tasks_score_perfectly(self):
+        import json
+        import tempfile
+
+        from src.generate_tasks import TaskGenerator
+        scorer = TaskScorer(Path('tasks/answers'))
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = TaskGenerator(seed=42).generate_all_tasks(Path(tmp), num_tasks=25)
+            by_id = {t['id']: t for t in tasks}
+            for task_id in ('task_013', 'task_018', 'task_023'):
+                key = json.loads((Path(tmp) / 'answers'
+                                  / f"{task_id}_answer.json").read_text())
+                assert 'bad_price' in str(key['problems_found']), task_id
+                score, fb = scorer.score_problems_found(
+                    key['problems_found'], key['problems_found'])
+                assert score == 1.0, (task_id, fb)
+                assert by_id[task_id]['id'] == task_id
+
+
 class TestTaskScorer:
     """Test suite for TaskScorer."""
 
@@ -186,7 +253,7 @@ NEW_PHRASES_POSITIVE = [
     ('column_order: columns are not in the original order', 'column_order'),
 ]
 NEW_PHRASES_NEGATIVE = [
-    'There are 0 duplicate rows', 'free of duplicates', 'duplicate-free',
+    'free of duplicates', 'duplicate-free',
     'lacks duplicates', 'absence of missing days', 'unit change ruled out',
     'possible split (unconfirmed)', 'neither duplicates nor gaps',
 ]
@@ -214,7 +281,6 @@ class TestNewNegationPhrases:
         from src.scorer import categories_for_items, categories_for_text
         assert 'split' not in categories_for_items(['split: none detected'])
         assert 'reverse_split' not in categories_for_items(['reverse_split: not present'])
-        assert 'missing' not in categories_for_items(['missing: 0 days'])
         got = categories_for_text('not a duplicate but a missing day')
         assert 'missing' in got and 'duplicate' not in got
 
@@ -224,6 +290,31 @@ class TestNewNegationPhrases:
         assert categories_for_items(['missing: nothing missing']) == set()
         assert categories_for_items(['missing — none']) == set()
         assert categories_for_text('timestamps mix utc and offsets') == {'timezone'}
+
+
+class TestZeroCountVsDecimals:
+    """Explicit none/0 counts negate; decimals (0.1, 0.5) never do."""
+
+    @pytest.mark.parametrize(('phrase', 'want'), [
+        ('bad_price: 0.1x spike on 2024-07-09', {'bad_price'}),
+        ('bad_price: 0.10x', {'bad_price'}),
+        ('split: 0.5 ratio on 2024-06-03', {'split'}),
+        ('split_2024-06-03: 0.5 ratio', {'split'}),
+        ('bad_price_2024-07-09: 0.1x', {'bad_price'}),
+        ('missing: 0.5% of days', {'missing'}),
+    ])
+    def test_decimals_still_detect(self, phrase, want):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == want
+
+    @pytest.mark.parametrize('phrase', [
+        'duplicate_rows: none', 'missing: 0', '0 duplicates found',
+        'duplicate: 0', 'duplicates: 0', 'missing days: 0', 'split - none',
+        'There are 0 duplicate rows',
+    ])
+    def test_zero_counts_do_not_detect(self, phrase):
+        from src.scorer import categories_for_items
+        assert categories_for_items([phrase]) == set()
 
 
 class TestSplitRatioMapping:

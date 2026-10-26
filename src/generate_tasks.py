@@ -13,6 +13,12 @@ from pathlib import Path
 
 import pandas as pd
 
+_CODE_DEFINITIONS = """Problem code definitions (report a code only when its definition is met):
+- duplicate: a row has the same ticker and the same date as an earlier row.
+- missing: a weekday inside the ticker's date range has no row.
+- bad_price: a single close deviates by more than 50% from both the previous and the next close and then reverts (a one-day spike, not a sustained level change).
+- split: a sustained drop to about half the previous close (ratio 0.4-0.6) that holds, from an unadjusted 2-for-1 split."""
+
 
 class TaskGenerator:
     """Generates synthetic market data tasks with known data quality issues."""
@@ -68,16 +74,27 @@ class TaskGenerator:
     def dedupe_stale_closes(df: pd.DataFrame) -> pd.DataFrame:
         """After all injection, nudge closes repeating the previous distinct date.
 
-        Split rounding can collapse distinct closes into ties; rows sharing
-        the same date (intended duplicates) are exempt.
+        Split rounding can collapse distinct closes into ties. A nudge is
+        shared by every row identical to the first row of the same date,
+        so it can never split an intended duplicate pair either.
         """
         df = df.copy().reset_index(drop=True)
         prev_close, prev_date = None, None
+        final_by_date = {}
         for idx in range(len(df)):
             date = df.loc[idx, 'date']
-            close = round(float(df.loc[idx, 'close']), 2)
-            if prev_close is not None and date != prev_date and close == prev_close:
-                close = round(prev_close + 0.01, 2)
+            original = round(float(df.loc[idx, 'close']), 2)
+            if date in final_by_date:
+                # Only copies identical to the first row share its
+                # (possibly nudged) close; differing rows are untouched.
+                first_original, first_final = final_by_date[date]
+                close = first_final if original == first_original else original
+            else:
+                close = original
+                if prev_close is not None and date != prev_date and close == prev_close:
+                    close = round(prev_close + 0.01, 2)
+                final_by_date[date] = (original, close)
+            if close != original:
                 df.loc[idx, 'close'] = close
                 df.loc[idx, 'high'] = max(float(df.loc[idx, 'high']), close)
                 df.loc[idx, 'low'] = min(float(df.loc[idx, 'low']), close)
@@ -93,15 +110,41 @@ class TaskGenerator:
         return df, f"duplicate_row_{date_str}"
 
     def inject_missing_day(self, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-        """Remove a day to create a gap."""
+        """Remove a day to create a gap.
+
+        Never removes one copy of a duplicated date (that would leave the
+        date present while destroying the duplicate) or a bad-tick row
+        (that would erase the labelled bad price).
+        """
+        duplicated = df['date'].duplicated(keep=False)
+        closes = df['close'].astype(float).tolist()
+
+        def _is_spike(i: int) -> bool:
+            if i <= 0 or i >= len(closes) - 1:
+                return False
+            prev, cur, nxt = closes[i - 1], closes[i], closes[i + 1]
+            return prev > 0 and nxt > 0 and \
+                (cur / prev < 0.5 or cur / prev > 1.5) and \
+                (cur / nxt < 0.5 or cur / nxt > 1.5)
+
         idx = random.randint(10, len(df) - 10)
+        while duplicated.iloc[idx] or _is_spike(idx):
+            idx = random.randint(10, len(df) - 10)
         removed_date = df.iloc[idx]['date'].strftime('%Y-%m-%d')
         df = pd.concat([df.iloc[:idx], df.iloc[idx+1:]], ignore_index=True)
         return df, f"missing_day_{removed_date}"
 
     def inject_bad_price(self, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-        """Inject an obviously incorrect price (>50% single-day move)."""
+        """Inject an obviously incorrect price (>50% single-day move).
+
+        Never placed on a duplicated date: if the spike sat on the second
+        copy, duplicate removal (keep first) would delete it while the key
+        still labels bad_price.
+        """
+        duplicated = df['date'].duplicated(keep=False)
         idx = random.randint(5, len(df) - 5)
+        while duplicated.iloc[idx]:
+            idx = random.randint(5, len(df) - 5)
         bad_multiplier = random.choice([0.1, 10.0])  # 90% drop or 10x jump
         df.loc[idx, 'close'] = round(df.loc[idx, 'close'] * bad_multiplier, 2)
         # Adjust OHLC to remain consistent
@@ -172,6 +215,8 @@ Cleaning rules:
    BOTH the previous close AND the next close (use a 3-day window to identify outliers)
 4. After cleaning, calculate daily returns as: (close_t - close_t-1) / close_t-1
 
+{_CODE_DEFINITIONS}
+
 Your task:
 1. Identify and describe any data quality problems
 2. Clean the data using the rules above
@@ -240,6 +285,8 @@ Cleaning rules:
    Then adjust all prices BEFORE the split by dividing by 2 (normalize to post-split basis).
 4. Calculate total return as: (final_close - initial_close) / initial_close
 
+{_CODE_DEFINITIONS}
+
 Your task:
 1. Identify and fix any data quality problems
 2. Calculate the total return from first to last valid price
@@ -293,6 +340,8 @@ Cleaning rules:
 1. Remove duplicate rows (keep first occurrence): a row is a duplicate if it has the same ticker and the same date as an earlier row
 2. Note any missing trading days but proceed with available data
 3. Calculate daily returns, then annualized volatility as: std(daily_returns, ddof=1) * sqrt(252)
+
+{_CODE_DEFINITIONS}
 
 Your task:
 1. Identify and fix data quality problems

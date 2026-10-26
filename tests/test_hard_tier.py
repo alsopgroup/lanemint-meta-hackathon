@@ -156,10 +156,11 @@ class TestHardTaskGenerator:
         for maker in gen.task_generators():
             task, _ = maker()
             prompt = task["prompt"]
-            # fixed possible-issues list and general rules are present
-            assert "may contain any" in prompt or "any\nsubset" in prompt or "subset" in prompt
+            # fixed category definitions and general rules are present
+            assert "Problem category definitions (fixed list" in prompt
+            assert "report a code only when its definition is met" in prompt
             assert "ddof=1" in prompt
-            assert "same ticker and the same date/timestamp" in " ".join(prompt.split())
+            assert "an identical timestamp string" in " ".join(prompt.split())
             assert "inner join" in prompt
             assert "America/New_York" in prompt
             assert "adj_close" in prompt

@@ -17,7 +17,7 @@ _CLAUSE_SEP = ";.,()"
 _NEG_CUES = {
     "no", "not", "none", "nothing", "never", "without", "cannot", "can't",
     "couldn't", "wasn't", "isn't", "aren't", "doesn't", "don't", "won't", "zero",
-    "0", "neither", "nor", "lacks", "lack", "absence", "free",
+    "neither", "nor", "lacks", "lack", "absence", "free",
 }
 _UNCERTAIN = re.compile(r"\b(cannot|can't|can not|could not|couldn't) rule out\b")
 _IDIOM_NEG = re.compile(
@@ -25,7 +25,7 @@ _IDIOM_NEG = re.compile(
 _UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
                   "suspected", "unconfirmed", "maybe", "perhaps", "unlikely"}
 _CODE_NEGATED = re.compile(
-    r"^\s*(none\b|not\b|no\b|0\b|zero\b|absent\b|ruled out\b|not present\b|"
+    r"^\s*(none\b|not\b|no\b|0(?!\.?\d)|zero\b|absent\b|ruled out\b|not present\b|"
     r"not detected\b|not found\b|no issues?\b|nothing\b|n/?a\b)")
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
@@ -87,6 +87,13 @@ def _occurrence_positive(text, match):
                            segment[m.end():]):
         return False
     clause = _clause(text, match.start(), match.end())
+    # An explicit count of 0 immediately before the keyword ("0 duplicates
+    # found", "there are 0 duplicate rows") means not detected. Decimals
+    # such as 0.1 do not match: the 0 must be a standalone token.
+    lo_bound, _ = _clause_bounds(text, match.start(), match.end())
+    if re.search(r"(?:^|\s)0(?!\.?\d)\s+(?:\w+\s+)?$",
+                 text[lo_bound:match.start()]):
+        return False
     if _UNCERTAIN.search(clause) or _IDIOM_NEG.search(clause):
         # "besides/except" re-asserts what follows it: "no issues besides a duplicate"
         if not re.search(r"\b(besides|except)\b", clause):
@@ -100,8 +107,11 @@ def _occurrence_positive(text, match):
     exc = re.search(r"\b(besides|except)\b", clause[:m_lo])
     if exc:
         exception_at = exc.end()
+    # Numeric tokens (e.g. the 0.1 in a bad-price label or a date) are
+    # never negation cues; only words can negate.
     cues = [(m.group(0), m.start(), m.end())
-            for m in re.finditer(r"\b\w+(?:'t)?\b", clause)]
+            for m in re.finditer(r"\b\w+(?:'t)?\b", clause)
+            if not any(ch.isdigit() for ch in m.group(0))]
     for word, s, e in cues:
         if word in _UNCERTAIN_ADJ and e <= m_lo:
             return False
@@ -139,6 +149,32 @@ def categories_for_text(text):
     return _canonical(found, norm)
 
 
+_CODES_BY_LENGTH = sorted(CANONICAL_CATEGORIES, key=len, reverse=True)
+
+
+def categories_for_key_items(items):
+    """Categories from answer-key problem strings.
+
+    Key strings are machine-generated labels such as
+    ``bad_price_2024-07-09_0.1`` or ``calendar_misalignment_US_EU_holidays``.
+    They are parsed by code prefix only: no negation or free-text
+    heuristics apply, so numeric suffixes can never suppress a category.
+    """
+    found = set()
+    for item in items or []:
+        text = str(item).strip().lower()
+        if text.startswith("stock_split"):
+            found.add("split")
+            continue
+        for code in _CODES_BY_LENGTH:
+            if text == code or text.startswith((code + "_", code + ":", code + " ")):
+                found.add(code)
+                break
+        else:
+            found |= categories_for_items([item])
+    return _canonical(found)
+
+
 def categories_for_items(items):
     """Categories from a problems list.
 
@@ -149,12 +185,34 @@ def categories_for_items(items):
     found = set()
     for item in items or []:
         text = str(item).strip().lower()
+        # Explicit non-detections with a code-like head, including plural
+        # or wordy heads and dash separators ("duplicates: 0",
+        # "missing days: 0", "split - none"). Decimals never negate.
+        neg = re.match(
+            r"^([a-z_]+)(?:\s+[a-z]+)?\s*(?::|—|–|-)\s*"
+            r"(?:none|zero|no|not|nothing|n/?a|0(?!\.?\d))\b", text)
+        if neg:
+            head = neg.group(1)
+            if head in CANONICAL_CATEGORIES or \
+                    (head.endswith("s") and head[:-1] in CANONICAL_CATEGORIES):
+                continue
         m = re.match(r"^([a-z_]+)\s*(?::|—|–|$)", text)
         code = m.group(1).replace(" ", "_") if m else None
         if code in CANONICAL_CATEGORIES:
             detail = text[m.end():]
             if not _CODE_NEGATED.match(detail):
                 found.add(code)
+            continue
+        # A verbatim key string (``bad_price_2024-07-09_0.1``) is an
+        # assertion of its leading code, suffix and all; an explicit
+        # none/0 count after a separator (``duplicate_rows: none``) is not.
+        key_code = next((c for c in _CODES_BY_LENGTH
+                         if text.startswith(c + "_")), None)
+        if key_code is not None:
+            rest = text[len(key_code):]
+            if not re.search(r"[:\-—–]\s*(none|0(?!\.?\d)|zero|no|not|nothing|n/?a)\b",
+                             rest):
+                found.add(key_code)
         else:
             found |= categories_for_text(text)
     return _canonical(found)
@@ -194,7 +252,7 @@ class TaskScorer:
         Extra categories lower precision, so listing every possible code
         scores poorly on both tiers.
         """
-        expected_issues = categories_for_items(expected)
+        expected_issues = categories_for_key_items(expected)
         if not expected_issues:
             return (1.0, "No problems to identify") if not categories_for_items(actual) \
                 else (0.0, "False positives: problems reported where none expected")

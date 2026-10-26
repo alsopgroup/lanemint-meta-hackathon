@@ -42,7 +42,8 @@ class TaskRunner:
         base_url: str | None = None,
         api_key: str | None = None,
         model_name: str | None = None,
-        dry_run: bool = False
+        dry_run: bool = False,
+        max_tokens: int | None = None
     ):
         """
         Initialize runner.
@@ -52,9 +53,14 @@ class TaskRunner:
             api_key: API key (default from META_API_KEY env var)
             model_name: Model name (default from META_MODEL_NAME env var)
             dry_run: If True, use stub model instead of real API
+            max_tokens: Output token cap override. When unset, the
+                META_MAX_TOKENS env var wins; otherwise hard-tier tasks
+                (task_h_* ids) default to 32000 and easy-tier tasks to
+                16000, because reasoning tokens count against the cap.
         """
         load_dotenv()
 
+        self.max_tokens = max_tokens
         self.dry_run = dry_run
         self.base_url = base_url or os.getenv('META_BASE_URL', 'https://api.meta.ai/v1')
         self.api_key = api_key or os.getenv('META_API_KEY') or os.getenv('MODEL_API_KEY', '')
@@ -87,6 +93,15 @@ class TaskRunner:
         with open(data_path) as f:
             return f.read()
 
+    def _max_tokens_for(self, task: dict) -> int:
+        """Token cap for one task: explicit arg, then env, then tier default."""
+        if self.max_tokens is not None:
+            return self.max_tokens
+        env = os.getenv('META_MAX_TOKENS')
+        if env:
+            return int(env)
+        return 32000 if str(task.get('id', '')).startswith('task_h_') else 16000
+
     def run_task(self, task: dict, data: str) -> dict:
         """Run a single task."""
         messages = [
@@ -110,9 +125,10 @@ class TaskRunner:
                 model=self.model_name,
                 messages=messages,
                 temperature=0.1,
-                # muse-spark-1.3 is a reasoning model: reasoning tokens count against
-                # max_tokens, so 1000 left no room for the answer (empty content).
-                max_tokens=int(os.getenv('META_MAX_TOKENS', '16000')),
+                # muse-spark-1.3 is a reasoning model: reasoning tokens count
+                # against max_tokens, so a low cap leaves no room for the
+                # answer (empty content). Hard-tier tasks default to 32000.
+                max_tokens=self._max_tokens_for(task),
                 **extra
             )
 
@@ -207,6 +223,13 @@ def main():
         '--model',
         help='Model name (overrides META_MODEL_NAME env var)'
     )
+    parser.add_argument(
+        '--max-tokens',
+        type=int,
+        default=None,
+        help='Output token cap (overrides META_MAX_TOKENS; default 32000 for '
+             'hard-tier tasks, 16000 for easy-tier tasks)'
+    )
 
     args = parser.parse_args()
 
@@ -218,7 +241,8 @@ def main():
     runner = TaskRunner(
         base_url=args.base_url,
         model_name=args.model,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        max_tokens=args.max_tokens
     )
 
     results = runner.run_all_tasks(

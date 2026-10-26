@@ -45,9 +45,9 @@ class FineTunePrep:
         Stored keys use ``problems_found`` with descriptive strings; prompts
         ask for a JSON ``problems`` array of category codes.
         """
-        from src.scorer import categories_for_items
+        from src.scorer import categories_for_key_items
         answer = {k: v for k, v in expected.items() if k != 'problems_found'}
-        answer = {'problems': sorted(categories_for_items(expected.get('problems_found', []))),
+        answer = {'problems': sorted(categories_for_key_items(expected.get('problems_found', []))),
                   **answer}
         return answer
 

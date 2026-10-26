@@ -19,10 +19,19 @@ import pandas as pd
 NY = ZoneInfo("America/New_York")
 PRICE_COLS = ["open", "high", "low", "close"]
 
-POSSIBLE_ISSUES = """Problem categories (fixed list): duplicate, missing, bad_price, \
-split, reverse_split, unit_change, out_of_order, timezone, currency, adj_close, \
-column_order, calendar. A file may contain any subset of these, including none \
-of some."""
+POSSIBLE_ISSUES = """Problem category definitions (fixed list; report a code only when its definition is met):
+- duplicate: a row has the same ticker and the same date (daily data), or the same ticker and an identical timestamp string (intraday data), as an earlier row. The same instant written in a different timestamp form is not a duplicate (see timezone).
+- missing: a ticker has no row for a trading day inside its own date range (a weekday that is not a holiday in that ticker's market); intraday, a bar instant is absent from its New-York date, so that date has fewer bars than the others. A date missing from one ticker but present in another is calendar, not missing, when each ticker is complete on its own calendar.
+- bad_price: a single close deviates by more than 50% from both the previous and the next close and then reverts; a one-day spike, not a sustained level shift.
+- split: a sustained drop to about half the previous close (ratio 0.4-0.6) that holds, from a 2-for-1 forward split.
+- reverse_split: a sustained jump to about 3x or about 10x the previous close that holds, from a 1-for-3 or 1-for-10 reverse split.
+- unit_change: a sustained jump to about 100x the previous close that holds, because prices switch from dollars to cents.
+- out_of_order: within a ticker, rows are not in ascending order of date (daily data) or of instant (intraday data, after converting timestamps to America/New_York). A repeated instant placed next to its first occurrence is not out of order.
+- timezone: timestamp strings use more than one UTC-offset form (for example Z and -05:00), or the same instant appears in two different textual forms, so timestamps must be converted to America/New_York to obtain true instants and dates.
+- currency: a currency column shows prices quoted in a currency other than USD, with an fx_rate column giving US dollars per one unit of that currency.
+- adj_close: an adj_close column is present and its values disagree with close for at least some rows.
+- column_order: a second header row appears partway through the file, and the columns after it are in a different order than before it.
+- calendar: the tickers in the file trade on different sets of dates (for example because of US and European holidays) even though every ticker is complete on its own calendar, so aligning the tickers keeps only the dates they share."""
 
 GENERAL_RULES = """General consistency rules (apply in this order, whichever apply):
 1. Parsing: the file is CSV. If a row's fields are themselves column names, that
@@ -30,9 +39,11 @@ GENERAL_RULES = """General consistency rules (apply in this order, whichever app
    any later header row. Map every data row by its current header names.
 2. Ordering: sort records ascending by ticker (if present), then by date or
    timestamp. Sorting is stable. A row is a duplicate if it has the same
-   ticker and the same date/timestamp as an earlier row; drop every such
-   duplicate row, keeping the first occurrence, whether or not the other
-   fields match.
+   ticker and the same date (daily data), or the same ticker and an
+   identical timestamp string (intraday data), as an earlier row; drop
+   every such duplicate row, keeping the first occurrence, whether or not
+   the other fields match. The same instant in a different timestamp form
+   is not a duplicate; rule 5 covers it.
 3. Price field: always use the "close" column after the adjustments below.
    Ignore any "adj_close" column entirely; it may be partly adjusted and can
    disagree with "close".
@@ -172,8 +183,9 @@ class HardTaskGenerator:
         """Nudge closes (by +0.01) that repeat the previous distinct date/instant.
 
         Runs after injection, so split/unit/intraday scaling cannot leave
-        identical consecutive closes. Rows sharing the same date/instant
-        (intended duplicates) are exempt.
+        identical consecutive closes. A nudge is shared by every row that
+        is identical to the first row of the same date/instant, so it can
+        never split an intended duplicate pair either.
         """
         df = df.copy()
         if "close" not in df.columns:
@@ -189,12 +201,23 @@ class HardTaskGenerator:
                 keys = list(group[order_col])
             order = sorted(range(len(group)), key=lambda i: keys[i])
             prev_close, prev_key = None, None
+            final_by_key = {}
             for pos in order:
                 idx = group.index[pos]
                 key = keys[pos]
-                close = round(float(df.loc[idx, "close"]), 2)
-                if prev_close is not None and key != prev_key and close == prev_close:
-                    close = round(prev_close + 0.01, 2)
+                original = round(float(df.loc[idx, "close"]), 2)
+                if key in final_by_key:
+                    # Only copies identical to the first row share its
+                    # (possibly nudged) close; differing rows are untouched.
+                    first_original, first_final = final_by_key[key]
+                    close = first_final if original == first_original else original
+                else:
+                    close = original
+                    if prev_close is not None and key != prev_key \
+                            and close == prev_close:
+                        close = round(prev_close + 0.01, 2)
+                    final_by_key[key] = (original, close)
+                if close != original:
                     df.loc[idx, "close"] = close
                     if "high" in df.columns:
                         df.loc[idx, "high"] = max(float(df.loc[idx, "high"]), close)
@@ -285,7 +308,12 @@ class HardTaskGenerator:
                 src["timestamp"] = instant.tz_convert(NY).isoformat()
             else:
                 src["timestamp"] = instant.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-            out = pd.concat([out, src.to_frame().T], ignore_index=True)
+            # Insert the second form immediately after its first occurrence
+            # so the file stays in instant order: the pair is a timezone
+            # artefact (same instant, different text), not a duplicate row
+            # and not an out-of-order row.
+            out = pd.concat([out.iloc[:11], src.to_frame().T, out.iloc[11:]],
+                            ignore_index=True)
         for col in [*PRICE_COLS, "volume"]:
             out[col] = pd.to_numeric(out[col])
         return out, "timezone_mixed_offsets_repeated_instant"

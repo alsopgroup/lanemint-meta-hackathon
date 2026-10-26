@@ -104,9 +104,10 @@ META_API_KEY=your_api_key_here
 META_BASE_URL=https://api.meta.ai/v1
 META_MODEL_NAME=muse-spark-1.3
 
-# Optional: muse-spark-1.3 is a reasoning model
-# Reasoning tokens count against max_tokens; increase if answers are truncated
-META_MAX_TOKENS=16000
+# Optional: output token cap. Leave unset to use the runner defaults
+# (16000 for easy-tier tasks, 32000 for hard-tier tasks); setting this
+# overrides both tiers, so do not set it to 16000 for hard-tier runs.
+# META_MAX_TOKENS=32000
 
 # Optional: control reasoning effort (if supported by model)
 # META_REASONING_EFFORT=medium
@@ -114,7 +115,7 @@ META_MAX_TOKENS=16000
 
 The API is OpenAI-compatible. Available models: `muse-spark-1.3` (default), `muse-spark-1.2`, `muse-spark-1.1`.
 
-**Note**: `META_MAX_TOKENS` defaults to 16000. Muse Spark 1.3 is a reasoning model where reasoning tokens count against the limit, so a higher value prevents truncated answers.
+**Note**: the runner's token cap defaults to 32000 for hard-tier tasks (`task_h_*`) and 16000 for easy-tier tasks; `--max-tokens` or `META_MAX_TOKENS` overrides it. Muse Spark 1.3 is a reasoning model where reasoning tokens count against the limit, so a higher value prevents truncated answers.
 
 ---
 
@@ -147,7 +148,7 @@ This creates:
 | Aspect | Easy Tier | Hard Tier |
 |--------|-----------|-----------|
 | **Problem Types** | Duplicates, missing days, bad ticks, 2:1 splits | Misaligned calendars, mixed-timezone intraday bars, unit changes, currency conversion, reverse splits (1-for-3, 1-for-10), out-of-order rows, conflicting `adj_close`, column-order changes |
-| **Prompt Style** | Lists expected problems and cleaning rules | Gives one fixed list of possible issue categories plus general rules that apply whichever are present, then the exact analytic definition; it does not say which issues a file contains |
+| **Prompt Style** | Lists expected problems, cleaning rules, and a one-line definition of each problem code | Gives one fixed list of problem codes, each with a one-line definition, plus general rules that apply whichever are present, then the exact analytic definition; it does not say which issues a file contains |
 | **Analytics** | Mean/sample-std of returns, total return, annualised volatility | Equal-weight portfolio (inner-join alignment, holdings drift, reset every 20 return observations), max drawdown, rolling 20-observation beta, intraday-to-daily volatility |
 | **Problem Count** | 2-3 problems per task | 1-4 problems per task (drawn per task) |
 | **Task IDs** | `task_001`, `task_002`, ... | `task_h_1001`, `task_h_1002`, ... |
@@ -301,11 +302,11 @@ The default 25 hard tasks cycle through five task types, five of each. For every
 
 Reverse splits multiply prices by exactly 3 or exactly 10; the prompts state that an observed sustained jump is snapped to whichever of the candidate ratios {3, 10} is relatively closest. Scaled values are rounded to 2 decimals, so no float artefacts mark the changed rows.
 
-Every hard prompt carries the same fixed list of possible issue categories and the same general rules (parsing, ordering, `close` vs `adj_close`, FX direction, timezone conversion and de-duplication, sustained-shift adjustment with the {3, 10} candidate set, return definition, ddof=1, annualisation, inner-join alignment, rounding), so the prompt does not reveal which issues a given file contains and the answer is determined by the stated rules. An independent solver in `tests/independent_solver.py`, written separately from the reference code, reproduces every key in the test suite.
+Every hard prompt carries the same fixed list of problem codes, each with a precise one-line definition (for example, `calendar` is when tickers trade on different date sets although each is complete on its own calendar, while `missing` is a gap inside one ticker's own calendar; a repeated intraday instant in a different textual form, placed next to its first occurrence, is `timezone`, not `duplicate` or `out_of_order`), and the same general rules (parsing, ordering, `close` vs `adj_close`, FX direction, timezone conversion and de-duplication, sustained-shift adjustment with the {3, 10} candidate set, return definition, ddof=1, annualisation, inner-join alignment, rounding), so the prompt does not reveal which issues a given file contains and the answer is determined by the stated rules. The easy prompts likewise define each of their four codes. An independent solver in `tests/independent_solver.py`, written separately from the reference code, reproduces every numeric key in the test suite, and a rule-based detector in `tests/category_detector.py`, written from the prompt definitions alone, reproduces every key's problem set exactly across seeds 1-200 on both tiers.
 
 ### Problem identification scoring
 
-Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. Passing a task requires the problem set to be identified exactly (F1 = 1.0) in addition to the numeric threshold, so a partial category set fails even with correct numbers. A fixed guess still passes occasionally by luck: as a guessing baseline (not a model result), always answering with the most common category set for the task type, with otherwise-correct numbers, passes about 10% of hard-tier tasks across seeds 1–200. On the easy tier the same fixed guess passes about 57%, because the easy prompts name the problems to look for.
+Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. Answer-key problem strings are parsed by code prefix only, without negation heuristics, so a key entry such as `bad_price_2024-07-09_0.1` always yields its `bad_price` code (decimals such as 0.1 never act as negations; an explicit "none" or a count of 0 in a model answer still means not detected). Passing a task requires the problem set to be identified exactly (F1 = 1.0) in addition to the numeric threshold, so a partial category set fails even with correct numbers. A fixed guess still passes occasionally by luck: as a guessing baseline (not a model result), always answering with the most common category set for the task type, with otherwise-correct numbers, passes about 10% of hard-tier tasks across seeds 1–200. On the easy tier the same fixed guess passes about 61%, because the easy prompts name the problems to look for.
 
 > **Format change:** the easy tier previously asked for a free-text `problems_found` list and now asks for the `problems` code array. Easy-tier results produced with the earlier prompts are therefore not directly comparable and need re-running under the current prompts (old responses are still scored through the free-text fallback).
 
@@ -391,7 +392,7 @@ The deterministic scorer enables both evaluation and reinforcement learning, clo
 
 ### Development Note
 
-Development of this project switched to Meta's Muse Wonder as the coding model in Cursor during the hard-tier work. Earlier work on the repository was done before that switch, so this note does not describe the tooling used for the whole history.
+The initial scaffold (repo structure, data generator, runner, and the easy tier) was built with Grok as the Cursor coding model, carrying over the workflow from our existing tooling so we could start immediately. Once the Muse Wonder coding model was available in Cursor, we switched to it for all development from the hard tier onward, so the benchmark is built, run, and fine-tuned on Meta's stack end to end.
 
 ---
 
