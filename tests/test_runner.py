@@ -1,5 +1,7 @@
 """Runner token-cap defaults: hard tier 32000, easy tier 16000."""
 
+from pathlib import Path
+
 from src.runner import TaskRunner
 
 
@@ -49,6 +51,23 @@ def test_env_overrides_tier_default(monkeypatch):
     monkeypatch.setenv('META_MAX_TOKENS', '20000')
     runner.run_task({'id': 'task_h_1003', 'type': 'rolling_beta', 'prompt': 'p'}, 'data')
     assert fake.kwargs['max_tokens'] == 20000
+
+
+def test_env_example_leaves_token_defaults_untouched(monkeypatch):
+    """Loading .env.example (cp .env.example .env) must not re-impose 16000."""
+    from dotenv import dotenv_values
+    env_file = Path(__file__).resolve().parent.parent / '.env.example'
+    values = dotenv_values(env_file)
+    assert values.get('META_MAX_TOKENS') is None, \
+        '.env.example must not set META_MAX_TOKENS (it would override the tier defaults)'
+    runner, fake = _runner_with_fake(monkeypatch)
+    for key, value in values.items():
+        if value is not None:
+            monkeypatch.setenv(key, value)
+    runner.run_task({'id': 'task_h_1003', 'type': 'rolling_beta', 'prompt': 'p'}, 'data')
+    assert fake.kwargs['max_tokens'] == 32000
+    runner.run_task({'id': 'task_003', 'type': 'return_calculation', 'prompt': 'p'}, 'data')
+    assert fake.kwargs['max_tokens'] == 16000
 
 
 def test_explicit_max_tokens_wins(monkeypatch):

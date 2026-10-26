@@ -400,6 +400,28 @@ class TestCleaningRegressions:
             assert original_count - 4 <= len(cleaned) <= original_count, \
                 f"Seed {seed}: row count {len(cleaned)} out of range for original {original_count}"
 
+    def test_bad_tick_never_lands_on_duplicated_date(self):
+        """A spike on the second duplicate copy would be deduped away.
+
+        Regression: with the duplicate injected first, the bad-price tick
+        must not be placed on either copy of the duplicated date, so the
+        labelled bad_price survives duplicate removal (keep first).
+        """
+        for seed in range(1, 201):
+            generator = TaskGenerator(seed=seed)
+            df = generator.generate_clean_prices('TEST', pd.Timestamp('2024-01-01'), 80)
+            df, _dup = generator.inject_duplicate_row(df)
+            df, bad = generator.inject_bad_price(df)
+            bad_date = bad.split('_')[2]
+            rows_on_date = (df['date'] == pd.Timestamp(bad_date)).sum()
+            assert rows_on_date == 1, (seed, bad)
+            kept = df.drop_duplicates(subset=['date'], keep='first')
+            closes = [float(c) for c in kept['close']]
+            spike = any(
+                (c / p < 0.5 or c / p > 1.5) and (c / n < 0.5 or c / n > 1.5)
+                for p, c, n in zip(closes, closes[1:], closes[2:], strict=False))
+            assert spike, (seed, bad)
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

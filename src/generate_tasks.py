@@ -135,8 +135,16 @@ class TaskGenerator:
         return df, f"missing_day_{removed_date}"
 
     def inject_bad_price(self, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-        """Inject an obviously incorrect price (>50% single-day move)."""
+        """Inject an obviously incorrect price (>50% single-day move).
+
+        Never placed on a duplicated date: if the spike sat on the second
+        copy, duplicate removal (keep first) would delete it while the key
+        still labels bad_price.
+        """
+        duplicated = df['date'].duplicated(keep=False)
         idx = random.randint(5, len(df) - 5)
+        while duplicated.iloc[idx]:
+            idx = random.randint(5, len(df) - 5)
         bad_multiplier = random.choice([0.1, 10.0])  # 90% drop or 10x jump
         df.loc[idx, 'close'] = round(df.loc[idx, 'close'] * bad_multiplier, 2)
         # Adjust OHLC to remain consistent

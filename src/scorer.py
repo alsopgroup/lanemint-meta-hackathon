@@ -25,7 +25,7 @@ _IDIOM_NEG = re.compile(
 _UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
                   "suspected", "unconfirmed", "maybe", "perhaps", "unlikely"}
 _CODE_NEGATED = re.compile(
-    r"^\s*(none\b|not\b|no\b|zero\b|absent\b|ruled out\b|not present\b|"
+    r"^\s*(none\b|not\b|no\b|0\b|zero\b|absent\b|ruled out\b|not present\b|"
     r"not detected\b|not found\b|no issues?\b|nothing\b|n/?a\b)")
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
@@ -87,6 +87,12 @@ def _occurrence_positive(text, match):
                            segment[m.end():]):
         return False
     clause = _clause(text, match.start(), match.end())
+    # An explicit count of 0 immediately before the keyword ("0 duplicates
+    # found", "there are 0 duplicate rows") means not detected. Decimals
+    # such as 0.1 do not match: the 0 must be a standalone token.
+    lo_bound, _ = _clause_bounds(text, match.start(), match.end())
+    if re.search(r"(?:^|\s)0\s+(?:\w+\s+)?$", text[lo_bound:match.start()]):
+        return False
     if _UNCERTAIN.search(clause) or _IDIOM_NEG.search(clause):
         # "besides/except" re-asserts what follows it: "no issues besides a duplicate"
         if not re.search(r"\b(besides|except)\b", clause):
@@ -186,11 +192,14 @@ def categories_for_items(items):
                 found.add(code)
             continue
         # A verbatim key string (``bad_price_2024-07-09_0.1``) is an
-        # assertion of its leading code, suffix and all.
+        # assertion of its leading code, suffix and all; an explicit
+        # none/0 count after a separator (``duplicate_rows: none``) is not.
         key_code = next((c for c in _CODES_BY_LENGTH
                          if text.startswith(c + "_")), None)
         if key_code is not None:
-            found.add(key_code)
+            rest = text[len(key_code):]
+            if not re.search(r"[:\-—–]\s*(none|0|zero|no|not|nothing|n/?a)\b", rest):
+                found.add(key_code)
         else:
             found |= categories_for_text(text)
     return _canonical(found)

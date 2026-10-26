@@ -24,12 +24,20 @@ class TestKeyStrings:
         score, _ = scorer.score_problems_found(key, key)
         assert score == 1.0
 
-    def test_numeric_tokens_never_negate_free_text(self):
+    def test_zero_counts_negate_but_decimals_do_not(self):
         from src.scorer import categories_for_items, categories_for_text
-        # only words negate now; numbers (including decimals) never do
-        assert categories_for_text('There are 0 duplicate rows') == {'duplicate'}
-        assert categories_for_items(['missing: 0 days']) == {'missing'}
+        # explicit none/0 counts in a model answer mean "not detected"
+        assert categories_for_text('There are 0 duplicate rows') == set()
+        assert categories_for_text('0 duplicates found') == set()
+        assert categories_for_items(['missing: 0']) == set()
+        assert categories_for_items(['missing: 0 days']) == set()
+        assert categories_for_items(['duplicate_rows: none']) == set()
+        # decimals are not zero counts, and key strings keep their codes
         assert categories_for_text('0.1x bad price spike') == {'bad_price'}
+        from src.scorer import categories_for_key_items
+        assert categories_for_key_items(['bad_price_2024-07-09_0.1']) == {'bad_price'}
+        assert categories_for_key_items(['bad_price_2024-07-09_10.0']) == {'bad_price'}
+        assert categories_for_key_items(['stock_split_2024-07-09_2.0']) == {'split'}
 
     def test_every_key_scores_perfectly_seeds_1_to_200_both_tiers(self):
         import json

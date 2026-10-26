@@ -104,10 +104,10 @@ META_API_KEY=your_api_key_here
 META_BASE_URL=https://api.meta.ai/v1
 META_MODEL_NAME=muse-spark-1.3
 
-# Optional: muse-spark-1.3 is a reasoning model
-# Reasoning tokens count against max_tokens; increase if answers are truncated
-# (defaults: 32000 for hard-tier tasks, 16000 for easy-tier tasks)
-META_MAX_TOKENS=16000
+# Optional: output token cap. Leave unset to use the runner defaults
+# (16000 for easy-tier tasks, 32000 for hard-tier tasks); setting this
+# overrides both tiers, so do not set it to 16000 for hard-tier runs.
+# META_MAX_TOKENS=32000
 
 # Optional: control reasoning effort (if supported by model)
 # META_REASONING_EFFORT=medium
@@ -306,7 +306,7 @@ Every hard prompt carries the same fixed list of problem codes, each with a prec
 
 ### Problem identification scoring
 
-Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. Answer-key problem strings are parsed by code prefix only, without negation heuristics, so a key entry such as `bad_price_2024-07-09_0.1` always yields its `bad_price` code (numeric tokens never act as negations anywhere in the scorer). Passing a task requires the problem set to be identified exactly (F1 = 1.0) in addition to the numeric threshold, so a partial category set fails even with correct numbers. A fixed guess still passes occasionally by luck: as a guessing baseline (not a model result), always answering with the most common category set for the task type, with otherwise-correct numbers, passes about 10% of hard-tier tasks across seeds 1–200. On the easy tier the same fixed guess passes about 57%, because the easy prompts name the problems to look for.
+Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. Answer-key problem strings are parsed by code prefix only, without negation heuristics, so a key entry such as `bad_price_2024-07-09_0.1` always yields its `bad_price` code (decimals such as 0.1 never act as negations; an explicit "none" or a count of 0 in a model answer still means not detected). Passing a task requires the problem set to be identified exactly (F1 = 1.0) in addition to the numeric threshold, so a partial category set fails even with correct numbers. A fixed guess still passes occasionally by luck: as a guessing baseline (not a model result), always answering with the most common category set for the task type, with otherwise-correct numbers, passes about 10% of hard-tier tasks across seeds 1–200. On the easy tier the same fixed guess passes about 61%, because the easy prompts name the problems to look for.
 
 > **Format change:** the easy tier previously asked for a free-text `problems_found` list and now asks for the `problems` code array. Easy-tier results produced with the earlier prompts are therefore not directly comparable and need re-running under the current prompts (old responses are still scored through the free-text fallback).
 
