@@ -392,7 +392,7 @@ The deterministic scorer enables both evaluation and reinforcement learning, clo
 
 ### Development Note
 
-Development of this project switched to Meta's Muse Wonder as the coding model in Cursor during the hard-tier work. Earlier work on the repository was done before that switch, so this note does not describe the tooling used for the whole history.
+The initial scaffold (repo structure, data generator, runner, and the easy tier) was built with Grok as the Cursor coding model, carrying over the workflow from our existing tooling so we could start immediately. Once the Muse Wonder coding model was available in Cursor, we switched to it for all development from the hard tier onward, so the benchmark is built, run, and fine-tuned on Meta's stack end to end.
 
 ---
 
