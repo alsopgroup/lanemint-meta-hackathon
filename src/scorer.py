@@ -6,7 +6,11 @@ Problem identification uses structured output: prompts ask for a JSON
 is scored with precision/recall (F1), so listing extra codes is penalised.
 A legacy free-text `problems_found` array is still accepted as a fallback
 and is mapped to categories with the same F1 scoring; that mapping is a
-best-effort synonym/negation heuristic and is not exhaustive.
+best-effort synonym/negation heuristic and is not exhaustive. Note: when
+a split code is followed by a colon, the ratio after the colon decides
+the category ("split: 1:2" is a reverse split, "split: 2:1" a split),
+and a bare A:B ratio is only read as a share ratio when it cannot be a
+clock time (see categories_for_text).
 """
 
 import json
@@ -61,7 +65,8 @@ _PATTERNS = {
     "out_of_order": r"\bout of (?:chronological )?order\b|\bchronological order\b"
                     r"|\bunsorted\b|\bout of sequence\b|\brow order\b",
     "timezone": r"\btime ?zones?\b|\btimezone\b|\bdst\b|\bdaylight\b|\bmixed offsets?\b"
-                r"|\btimestamps? mix\w*\b|\bduplicate (?:instant|timestamp|hour)\b",
+                r"|\bmixed\b[^.;]{0,40}\boffsets?\b|\btimestamps? mix\w*\b"
+                r"|\bduplicate (?:instant|timestamp|hour)\b",
     "currency": r"\bcurrency\b|\bcurrencies\b|\bfx\b|\bforeign exchange\b"
                 r"|\bquoted in (?:eur|euros|usd|dollars)\b",
     "adj_close": r"\badj close\b|\badjusted close\b",
@@ -149,9 +154,14 @@ def _canonical(found, text=""):
         found.discard("split")
     if "unit_change" in found:
         found.discard("bad_price")
-    if "timezone" in found and "duplicate" in found and \
-            any(w in text for w in ("instant", "timestamp", "hour")):
-        found.discard("duplicate")
+    if "timezone" in found and "duplicate" in found:
+        if re.search(r"\bduplicate (?:instant|timestamp|hour)\s+\d{4}-\d{2}-\d{2}",
+                     text):
+            # A duplicated row at a named timestamp is a duplicate; only a
+            # generic repeated instant (no concrete time) is timezone-only.
+            found.discard("timezone")
+        elif any(w in text for w in ("instant", "timestamp", "hour")):
+            found.discard("duplicate")
     return found
 
 
@@ -167,13 +177,28 @@ def categories_for_text(text):
     # Split ratios are read numerically, per the prompt convention
     # "A:B (or A-for-B) = A new shares for B old shares": A>B is a
     # forward split, A<B a reverse split (so 1:0.5 is a forward split).
+    # A bare A:B is only read as a ratio when it cannot be a clock time:
+    # an A-for-B form always counts; a colon form counts when "split" or
+    # "ratio" appears in the same clause, or when B is not exactly two
+    # digits (3:1, 10:1, 1:0.5 count; 09:30 does not). Colon ratios of
+    # 50:1 or more are unit scales, not share splits.
     for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*(?::|-for-)\s*(\d+(?:\.\d+)?)\b",
                              norm):
         new_shares, old_shares = float(match.group(1)), float(match.group(2))
-        if old_shares > 0 and _occurrence_positive(norm, match):
-            if new_shares / old_shares > 1:
+        if old_shares <= 0:
+            continue
+        quotient = new_shares / old_shares
+        if "-for-" not in match.group(0):
+            clause = _clause(norm, match.start(), match.end())
+            two_digit_b = re.fullmatch(r"\d{2}", match.group(2)) is not None
+            if two_digit_b and not re.search(r"\bsplits?\b|\bratios?\b", clause):
+                continue  # a clock time, not a ratio
+            if not 0.02 < quotient < 50:
+                continue  # a unit scale (e.g. 100:1 to cents), not a split
+        if _occurrence_positive(norm, match):
+            if quotient > 1:
                 found.add("split")
-            elif new_shares / old_shares < 1:
+            elif quotient < 1:
                 found.add("reverse_split")
     return _canonical(found, norm)
 
@@ -228,7 +253,8 @@ def categories_for_items(items):
 
     An entry that starts with a canonical code (``code`` or ``code: detail``)
     is a structured assertion of exactly that code; anything else falls back
-    to free-text matching.
+    to free-text matching. Exception: ``split: <ratio>`` reads the ratio
+    after the colon, so ``split: 1:2`` asserts ``reverse_split``.
     """
     found = set()
     for item in items or []:
@@ -246,6 +272,15 @@ def categories_for_items(items):
         if code in CANONICAL_CATEGORIES:
             detail = text[m.end():]
             if not _is_nothing_detail(detail):
+                if code == "split":
+                    # "split: <ratio>" reads the ratio after the colon:
+                    # a ratio below 1 is a reverse split, not a split.
+                    ratio = re.search(
+                        r"(\d+(?:\.\d+)?)\s*(?::|-for-)\s*(\d+(?:\.\d+)?)", detail)
+                    if ratio and float(ratio.group(2)) > 0 and \
+                            float(ratio.group(1)) / float(ratio.group(2)) < 1:
+                        found.add("reverse_split")
+                        continue
                 found.add(code)
             continue
         # A verbatim key string (``bad_price_2024-07-09_0.1``) is an
