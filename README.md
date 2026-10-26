@@ -5,8 +5,7 @@
 
 > A synthetic benchmark for evaluating language models on financial data quality tasks
 
-<!-- ![Banner](docs/assets/banner.png) -->
-<!-- Placeholder for banner image - add docs/assets/banner.png when ready -->
+![LaneMint x Llama, built for the Meta AI Developer Hackathon](docs/assets/banner.png)
 
 Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [LaneMint](https://lanemint.com).
 
