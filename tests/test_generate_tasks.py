@@ -295,6 +295,102 @@ class TestCleaningRegressions:
             f"expected between {expected_min} and {expected_max} " \
             f"(original {original_clean_count}, missing {rows_lost_to_missing})"
 
+    def test_bad_tick_before_split_01x(self):
+        """
+        Regression: 0.1x bad tick before split should not be mistaken for split.
+        Split should still be found at the correct date.
+        """
+        generator = TaskGenerator(seed=123)
+        df = generator.generate_clean_prices('TEST', pd.Timestamp('2024-01-01'), 60)
+
+        # Inject split first (so we know where it is)
+        df, split_info = generator.inject_stock_split(df)
+        split_date = split_info.split('_')[2]
+
+        # Now inject a 0.1x bad tick BEFORE the split
+        # (manually to ensure it's before the split)
+        split_idx = df[df['date'] == pd.Timestamp(split_date)].index[0]
+        bad_tick_idx = split_idx - 10  # Place it 10 days before split
+
+        original_close = df.loc[bad_tick_idx, 'close']
+        df.loc[bad_tick_idx, 'close'] = original_close * 0.1
+        df.loc[bad_tick_idx, 'high'] = df.loc[bad_tick_idx, 'close']
+
+        # Clean it
+        cleaned = generator._clean_data(df.copy(), has_split=True)
+
+        # Verify no extreme jumps after cleaning
+        cleaned['pct_change'] = cleaned['close'].pct_change().abs()
+        max_jump = cleaned['pct_change'].max()
+        assert max_jump < 0.4, \
+            f"Found {max_jump:.1%} jump after cleaning, expected < 40%"
+
+        # Verify bad tick was removed (should have one less row than original minus split adjustment)
+        # Original had the bad tick, cleaned should not
+        assert len(cleaned) < len(df), "Bad tick was not removed"
+
+    def test_bad_tick_before_split_10x(self):
+        """
+        Regression: 10x bad tick before split should not interfere with split detection.
+        """
+        generator = TaskGenerator(seed=456)
+        df = generator.generate_clean_prices('TEST', pd.Timestamp('2024-01-01'), 60)
+
+        # Inject split first
+        df, split_info = generator.inject_stock_split(df)
+        split_date = split_info.split('_')[2]
+
+        # Inject a 10x bad tick BEFORE the split
+        split_idx = df[df['date'] == pd.Timestamp(split_date)].index[0]
+        bad_tick_idx = split_idx - 15
+
+        original_close = df.loc[bad_tick_idx, 'close']
+        df.loc[bad_tick_idx, 'close'] = original_close * 10.0
+        df.loc[bad_tick_idx, 'high'] = df.loc[bad_tick_idx, 'close']
+
+        # Clean it
+        cleaned = generator._clean_data(df.copy(), has_split=True)
+
+        # Verify no extreme jumps
+        cleaned['pct_change'] = cleaned['close'].pct_change().abs()
+        max_jump = cleaned['pct_change'].max()
+        assert max_jump < 0.4, \
+            f"Found {max_jump:.1%} jump after cleaning, expected < 40%"
+
+        # Verify bad tick was removed
+        assert len(cleaned) < len(df), "Bad tick was not removed"
+
+    def test_all_problems_across_seeds(self):
+        """
+        Regression: test all 4 problems combined across 50 seeds.
+        Verify no >40% jumps and reasonable row counts.
+        """
+        for seed in range(50):
+            generator = TaskGenerator(seed=seed)
+            df = generator.generate_clean_prices('TEST', pd.Timestamp('2024-01-01'), 60)
+            original_count = len(df)
+
+            # Inject all 4 problems
+            df, _p1 = generator.inject_duplicate_row(df)
+            df, _p2 = generator.inject_missing_day(df)
+            df, _p3 = generator.inject_bad_price(df)
+            df, _p4 = generator.inject_stock_split(df)
+
+            # Clean
+            cleaned = generator._clean_data(df.copy(), has_split=True)
+
+            # Check no extreme jumps
+            cleaned['pct_change'] = cleaned['close'].pct_change().abs()
+            max_jump = cleaned['pct_change'].max()
+            assert max_jump < 0.4, \
+                f"Seed {seed}: found {max_jump:.1%} jump, expected < 40%"
+
+            # Check row count is reasonable
+            # Should be roughly original - 1 (missing) - 1 (bad tick) = original - 2
+            # Allow some tolerance
+            assert original_count - 4 <= len(cleaned) <= original_count, \
+                f"Seed {seed}: row count {len(cleaned)} out of range for original {original_count}"
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

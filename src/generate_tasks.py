@@ -212,8 +212,9 @@ Cleaning rules:
 1. Remove duplicate rows (keep first occurrence)
 2. Remove bad price ticks: a tick is bad if its close is >50% different from
    BOTH the previous and next close (identifies spike outliers)
-3. If you detect a 2-for-1 split (prices roughly halve, ~50% drop that stays),
-   adjust all prices BEFORE the split by dividing by 2 (normalize to post-split basis)
+3. Detect 2-for-1 splits: look for a sustained ~50% drop (ratio between 0.4-0.6)
+   that holds for at least 2 days (not a one-day spike). Exclude bad ticks.
+   Then adjust all prices BEFORE the split by dividing by 2 (normalize to post-split basis).
 4. Calculate total return as: (final_close - initial_close) / initial_close
 
 Your task:
@@ -304,17 +305,50 @@ Return your answer as JSON with fields:
 
         # 2. Adjust for stock split FIRST (before filtering bad prices)
         if has_split:
-            # Detect split: find where price roughly halves (ratio ~0.5)
-            df['ratio'] = df['close'] / df['close'].shift(1)
-            split_indices = df[df['ratio'] < 0.6].index.tolist()
+            # Two-pass approach: identify bad ticks first, then detect splits ignoring bad ticks
+
+            # Pass 1: Identify bad ticks (but don't remove yet)
+            df['prev_close'] = df['close'].shift(1)
+            df['next_close'] = df['close'].shift(-1)
+            df['dev_from_prev'] = ((df['close'] - df['prev_close']) / df['prev_close']).abs()
+            df['dev_from_next'] = ((df['close'] - df['next_close']) / df['next_close']).abs()
+            df['is_bad_tick'] = (
+                (df['dev_from_prev'] > 0.5) &
+                (df['dev_from_next'] > 0.5) &
+                df['prev_close'].notna() &
+                df['next_close'].notna()
+            )
+
+            # Pass 2: Detect splits, computing ratios as if bad ticks were removed
+            # Create a "clean" close series with bad ticks masked
+            df['close_clean'] = df['close'].copy()
+            df.loc[df['is_bad_tick'], 'close_clean'] = None
+            df['close_clean_filled'] = df['close_clean'].ffill()  # Forward fill to skip bad ticks
+
+            # Compute ratio using clean closes
+            df['ratio_clean'] = df['close_clean_filled'] / df['close_clean_filled'].shift(1)
+
+            # Also check if the move is sustained (next clean close also shows ~50% of pre-split)
+            df['close_clean_2before'] = df['close_clean_filled'].shift(2)
+            df['next_clean_close'] = df['close_clean'].shift(-1).bfill()  # Look ahead
+            df['ratio_spanning'] = df['next_clean_close'] / df['close_clean_2before']
+
+            # Split candidate: ratio between 0.4-0.6 AND sustained
+            # Must be on a non-bad-tick row to be a proper split marker
+            df['is_split_candidate'] = (
+                (~df['is_bad_tick']) &
+                (df['ratio_clean'] >= 0.4) &
+                (df['ratio_clean'] <= 0.6) &
+                (df['ratio_spanning'] >= 0.4) &
+                (df['ratio_spanning'] <= 0.6)
+            )
+
+            split_indices = df[df['is_split_candidate']].index.tolist()
 
             if len(split_indices) > 0:
-                # Use the first detected split
                 split_pos = split_indices[0]
 
                 # Adjust all prices BEFORE the split by dividing by 2
-                # (to match post-split basis)
-                # Use iloc for safe position-based indexing
                 if split_pos > 0:
                     df.loc[df.index < split_pos, ['open', 'high', 'low', 'close']] /= 2.0
                     df.loc[df.index < split_pos, ['open', 'high', 'low', 'close']] = df.loc[
@@ -323,7 +357,10 @@ Return your answer as JSON with fields:
                     # Volume adjustment: multiply pre-split volume by 2
                     df.loc[df.index < split_pos, 'volume'] *= 2
 
-            df = df.drop(columns=['ratio'])
+            df = df.drop(columns=['prev_close', 'next_close', 'dev_from_prev', 'dev_from_next',
+                                  'is_bad_tick', 'close_clean', 'close_clean_filled', 'ratio_clean',
+                                  'close_clean_2before', 'next_clean_close', 'ratio_spanning',
+                                  'is_split_candidate'])
             df = df.reset_index(drop=True)
 
         # 3. Remove bad price ticks AFTER split adjustment
