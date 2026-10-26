@@ -138,21 +138,127 @@ class TestCli:
         assert all(t["id"].startswith("task_f_") for t in tasks)
 
 
+def _score_makers_default(seed, count):
+    """Generate ``count`` tasks at shipped defaults and score the solver."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        (out / "answers").mkdir()
+        gen = FrontierTaskGenerator(seed=seed)  # shipped default settings
+        gens = gen.task_generators()
+        scorer = TaskScorer(out / "answers")
+        results = []
+        for i in range(count):
+            task, payload = gens[i % len(gens)]()
+            (out / "answers" / f"{task['id']}_answer.json").write_text(
+                json.dumps(task["expected"]))
+            data = out / "data.csv"
+            data.write_text(payload)
+            got = solve(task, data)
+            results.append((task, scorer.score_task(
+                task["id"], json.dumps(got))))
+    return results
+
+
 class TestIndependentSolver:
-    def test_solver_scores_100_percent_seeds_1_to_200(self):
-        for seed in range(1, 201):
+    def test_solver_scores_100_percent_seeds_1_to_400_default_settings(self):
+        # Shipped default settings and the full default task count (25).
+        for seed in range(1, 401):
+            for task, result in _score_makers_default(seed, 25):
+                assert result["passed"] and result["score"] == 1.0, \
+                    (seed, task["id"], result["feedback"])
+
+    @pytest.mark.parametrize(("seed", "count"), [(184, 3), (334, 7)])
+    def test_injector_collision_regressions(self, seed, count):
+        # Seed 184: a missing day deleted one copy of a duplicate.
+        # Seed 334: a bad price sat on the second copy of a duplicate.
+        for task, result in _score_makers_default(seed, count):
+            assert result["passed"] and result["score"] == 1.0, \
+                (seed, task["id"], result["feedback"])
+
+
+class TestNoRepeatedPrices:
+    """No repeated consecutive closes after cleaning, and consistent OHLC."""
+
+    def test_cleaned_series_have_no_repeats_and_bars_are_consistent(self):
+        from tests.frontier_solver import cleaned_frame, read_blocks
+        for seed in range(1, 9):
+            gen = FrontierTaskGenerator(seed=seed)  # shipped defaults
+            gens = gen.task_generators()
+            with tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp) / "data.csv"
+                for i in range(25):
+                    task, payload = gens[i % len(gens)]()
+                    data.write_text(payload)
+                    frame = cleaned_frame(task, data)
+                    for col in frame.columns:
+                        vals = frame[col].dropna().tolist()
+                        assert all(a != b for a, b in
+                                   zip(vals, vals[1:], strict=False)), \
+                            (seed, task["id"], col, "repeated close")
+                    for block in read_blocks(data).values():
+                        if "open" not in block.columns:
+                            continue  # the split table has no bars
+                        assert (block["low"] <= block["open"]).all()
+                        assert (block["low"] <= block["close"]).all()
+                        assert (block["high"] >= block["open"]).all()
+                        assert (block["high"] >= block["close"]).all()
+
+    def test_f3_unadjusted_prices_stay_above_five_dollars(self):
+        from tests.frontier_solver import _bad_mask, read_blocks
+        for seed in range(1, 21):
+            gen = FrontierTaskGenerator(seed=seed)
+            task, payload = gen.generate_task_factor_exposure()
+            with tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp) / "data.csv"
+                data.write_text(payload)
+                prices = read_blocks(data)["PRICES"]
+                ast = prices[prices["ticker"] == "AST"].sort_values("date")
+                closes = [float(c) for c in ast["close"]]
+                bad = _bad_mask(closes)
+                genuine = [c for c, b in zip(closes, bad, strict=True) if not b]
+                assert min(genuine) >= 4.5, (seed, min(genuine))
+
+
+class TestCoreFieldRequired:
+    """Correct codes with constant numbers must pass 0% (core is required)."""
+
+    CORE = ("mean_betas", "reconciled_total_return", "beta_market",
+            "beta_sector", "final_return")
+
+    def _core_values(self, expected):
+        vals = []
+        for field in self.CORE:
+            if field in expected:
+                v = expected[field]
+                vals.extend(v.values() if isinstance(v, dict) else [v])
+        return vals
+
+    @pytest.mark.parametrize("constant", [0.0, 1.0, 0.123456])
+    def test_constant_numbers_pass_zero(self, constant):
+        checked = 0
+        for seed in range(1, 21):
             with tempfile.TemporaryDirectory() as tmp:
                 tasks, out = _gen(seed, SMALL, 4, tmp)
-                for task, result in _score_all(tasks, out):
-                    assert result["passed"] and result["score"] == 1.0, \
-                        (seed, task["id"], result["feedback"])
-
-    def test_solver_default_settings_seed42(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tasks, out = _gen(42, None, 8, tmp)
-            for task, result in _score_all(tasks, out):
-                assert result["passed"] and result["score"] == 1.0, \
-                    (task["id"], result["feedback"])
+                scorer = TaskScorer(out / "answers")
+                for task in tasks:
+                    key = json.loads((out / "answers" /
+                                      f"{task['id']}_answer.json").read_text())
+                    # A constant that happens to equal the true core value
+                    # is a correct answer for that field, not gaming.
+                    if any(abs(constant - v) <= 1e-4
+                           for v in self._core_values(key)):
+                        continue
+                    got = solve(task, out / task["data_file"])
+                    for field, value in list(got.items()):
+                        if isinstance(value, float):
+                            got[field] = constant
+                        elif isinstance(value, dict):
+                            got[field] = dict.fromkeys(value, constant)
+                    result = scorer.score_task(task["id"], json.dumps(got))
+                    assert not result["passed"], \
+                        (seed, task["id"], constant, result["score"])
+                    checked += 1
+        assert checked > 0
 
 
 class TestScorerFrontierFields:
@@ -199,7 +305,7 @@ class TestGuessBaselines:
 
     def test_frontier_guess_baselines(self):
         by_type = defaultdict(list)
-        for seed in range(1, 121):
+        for seed in range(1, 201):
             gen = FrontierTaskGenerator(seed=seed, settings=SMALL)
             for maker in gen.task_generators():
                 task, _ = maker()
@@ -213,5 +319,20 @@ class TestGuessBaselines:
             paste += sum(1 for s in sets if s == frozenset(
                 categories_for_items(CODES_13)))
             total += len(sets)
-        assert fixed / total <= 0.15
+        assert fixed / total <= 0.12
         assert paste == 0
+
+
+class TestPromptSizeScript:
+    def test_prompt_size_script_reports_max_per_family(self, tmp_path):
+        import subprocess
+        import sys
+        tasks, out = _gen(42, SMALL, 4, tmp_path)
+        repo = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [sys.executable, str(repo / "scripts" / "prompt_sizes.py"),
+             "--tasks-dir", str(out)],
+            capture_output=True, text=True, cwd=repo, check=True)
+        for task_type in FIELDS:
+            assert task_type in proc.stdout
+        assert "overall max_chars" in proc.stdout

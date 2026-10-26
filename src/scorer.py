@@ -452,7 +452,21 @@ class TaskScorer:
         # per-type guess matches only a small minority of tasks (measured
         # in tests/test_scorer.py::TestGuessBaselines).
         problems_ok = scores.get('problems', 1.0) >= 1.0
-        result = {'task_id': task_id, 'passed': overall >= 0.8 and problems_ok,
+        # Frontier families have a required core numeric output: the
+        # headline computation must be right, not just the codes and
+        # secondary fields (codes plus secondary fields alone could
+        # otherwise reach 0.8 with the core value guessed as 0.0).
+        core_ok = True
+        for field in ('reconciled_total_return', 'final_return',
+                      'beta_market', 'beta_sector'):
+            if field in expected and scores.get(field, 0.0) < 1.0:
+                core_ok = False
+        if 'mean_betas' in expected:
+            core_ok = core_ok and all(
+                scores.get(f'mean_betas.{k}', 0.0) >= 1.0
+                for k in expected['mean_betas'])
+        result = {'task_id': task_id,
+                  'passed': overall >= 0.8 and problems_ok and core_ok,
                   'score': round(overall, 3), 'component_scores': scores,
                   'feedback': '; '.join(feedback) if feedback else 'All checks passed'}
         # Frontier F4 checkpoint score: partial progress along the pipeline

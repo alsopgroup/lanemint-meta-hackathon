@@ -85,6 +85,46 @@ def _frames(block):
     return frames
 
 
+def cleaned_frame(task, csv_path):
+    """The cleaned, adjusted, aligned close frame a task's math uses.
+
+    F1/F4: cleaned closes aligned on the inner join. F2: trusted series
+    aligned. F3: split-adjusted AST with MKT/SEC, aligned. Tests scan
+    this frame for repeated consecutive closes.
+    """
+    kind = task["type"]
+    blocks = read_blocks(csv_path)
+    if kind in ("frontier_rolling_risk", "frontier_portfolio_pipeline"):
+        block = blocks[""] if "" in blocks else blocks["PRICES"]
+        return _aligned(_frames(block))
+    if kind == "frontier_vendor_reconciliation":
+        a_frames, b_frames = _frames(blocks["VENDOR_A"]), _frames(blocks["VENDOR_B"])
+        trusted = {}
+        for ticker in sorted(set(a_frames) | set(b_frames)):
+            a = clean(a_frames[ticker]) if ticker in a_frames \
+                else pd.Series(dtype=float)
+            b = clean(b_frames[ticker].assign(
+                close=b_frames[ticker]["close"] / 100.0)) \
+                if ticker in b_frames else pd.Series(dtype=float)
+            union = sorted(set(a.index) | set(b.index))
+            trusted[ticker] = pd.Series(
+                [a[d] if d in a.index else b[d] for d in union],
+                index=union, dtype=float)
+        return pd.DataFrame(trusted).sort_index().dropna()
+    if kind == "frontier_factor_exposure":
+        frames = _frames(blocks["PRICES"])
+        ast = clean(frames["AST"])
+        for _, row in blocks["SPLIT_TABLE"].iterrows():
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)-for-(\d+(?:\.\d+)?)",
+                             str(row["ratio"]))
+            ast.loc[ast.index < str(row["date"])] = \
+                ast.loc[ast.index < str(row["date"])] * \
+                (float(m.group(2)) / float(m.group(1)))
+        return pd.DataFrame({"AST": ast, "MKT": clean(frames["MKT"]),
+                             "SEC": clean(frames["SEC"])}).sort_index().dropna()
+    raise ValueError(f"unknown frontier task type {kind}")
+
+
 def solve(task, csv_path):
     kind = task["type"]
     prompt = task.get("prompt", "")
@@ -97,21 +137,19 @@ def solve(task, csv_path):
         assets = sorted(t for t in prices.columns if t != "IDX")
         window = int(re.search(r"window of\s+(\d+)", prompt).group(1))
         rets = prices.pct_change().dropna()
-        betas, best = {}, None
-        for asset in assets:
-            vals = []
-            for end in range(window, len(rets) + 1):
-                w = rets.iloc[end - window:end]
-                vals.append(w[asset].cov(w["IDX"]) / w["IDX"].var(ddof=1))
-                corr = float(w[asset].corr(w["IDX"]))
-                if best is None or corr > best[0]:
-                    best = (corr, asset, str(rets.index[end - 1]))
-            betas[asset] = round(float(np.mean(vals)), 6)
+        cov = rets.rolling(window).cov(rets["IDX"])
+        var = rets["IDX"].rolling(window).var(ddof=1)
+        betas = {a: round(float((cov[a] / var).mean()), 6) for a in assets}
+        # First maximum in (window-end date, asset order) order is the
+        # prompt's tie break: earliest date, then asset ticker order.
+        corr = rets.rolling(window).corr(rets["IDX"])[assets].dropna()
+        pos = int(np.argmax(corr.to_numpy()))
+        wi, ai = np.unravel_index(pos, corr.shape)
         ew = rets[assets].mean(axis=1)
         return {"problems": sorted(problems), "mean_betas": betas,
-                "peak_correlation": round(best[0], 6),
-                "peak_correlation_asset": best[1],
-                "peak_correlation_date": best[2],
+                "peak_correlation": round(float(corr.to_numpy()[wi, ai]), 6),
+                "peak_correlation_asset": assets[ai],
+                "peak_correlation_date": str(corr.index[wi]),
                 "final_window_volatility": round(
                     float(ew.iloc[-window:].std(ddof=1) * np.sqrt(252)), 6),
                 "num_assets": len(assets), "num_aligned_days": len(prices)}

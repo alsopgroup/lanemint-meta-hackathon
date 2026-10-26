@@ -103,17 +103,18 @@ def _closes(start: float, rets) -> list[float]:
 
 
 def _frame(ticker: str, dates, closes) -> pd.DataFrame:
-    rows = []
+    cols = {"date": [], "ticker": [], "open": [], "high": [], "low": [],
+            "close": [], "volume": []}
     for date, close in zip(dates, closes, strict=True):
-        rows.append({
-            "date": date.strftime("%Y-%m-%d"), "ticker": ticker,
-            "open": round(close * random.uniform(0.995, 1.005), 2),
-            "high": round(close * random.uniform(1.0, 1.01), 2),
-            "low": round(close * random.uniform(0.99, 1.0), 2),
-            "close": float(close),
-            "volume": random.randint(100_000, 10_000_000),
-        })
-    return pd.DataFrame(rows)
+        open_ = round(close * random.uniform(0.995, 1.005), 2)
+        cols["date"].append(date.strftime("%Y-%m-%d"))
+        cols["ticker"].append(ticker)
+        cols["open"].append(open_)
+        cols["high"].append(round(max(open_, close) * random.uniform(1.0, 1.01), 2))
+        cols["low"].append(round(min(open_, close) * random.uniform(0.99, 1.0), 2))
+        cols["close"].append(float(close))
+        cols["volume"].append(random.randint(100_000, 10_000_000))
+    return pd.DataFrame(cols)
 
 
 # ---------------------------------------------------------------- reference
@@ -175,40 +176,64 @@ class FrontierTaskGenerator:
         return list(deck[idx % len(deck)])
 
     @staticmethod
-    def _inject(df: pd.DataFrame, kind: str):
-        df = df.copy().reset_index(drop=True)
-        if kind == "duplicate":
+    def _pick_idx(df: pd.DataFrame, avoid_dates: set):
+        """Random row index whose date is not reserved by another injector."""
+        for _ in range(200):
             idx = random.randint(5, len(df) - 5)
+            if str(df.iloc[idx]["date"]) not in avoid_dates:
+                return idx
+        raise RuntimeError("no unreserved row available for injection")
+
+    @classmethod
+    def _inject(cls, df: pd.DataFrame, kind: str, avoid_dates=frozenset()):
+        """Inject one issue on a date no other injector has used.
+
+        Sharing a date between injectors destroys detectability (a
+        missing day deleting one copy of a duplicate, a bad tick sitting
+        on the copy that keep-first dedupe drops), so every injector
+        reserves its date and later injectors avoid all reserved dates.
+        Returns (frame, problem_string, reserved_date).
+        """
+        df = df.copy().reset_index(drop=True)
+        idx = cls._pick_idx(df, set(avoid_dates))
+        date = str(df.iloc[idx]["date"])
+        if kind == "duplicate":
             out = pd.concat([df.iloc[:idx + 1], df.iloc[idx:idx + 1],
                              df.iloc[idx + 1:]], ignore_index=True)
-            return out, f"duplicate_row_{df.iloc[idx]['date']}"
+            return out, f"duplicate_row_{date}", date
         if kind == "missing":
-            idx = random.randint(5, len(df) - 5)
-            label = df.iloc[idx]["date"]
             return pd.concat([df.iloc[:idx], df.iloc[idx + 1:]],
-                             ignore_index=True), f"missing_day_{label}"
+                             ignore_index=True), f"missing_day_{date}", date
         if kind == "bad_price":
-            idx = random.randint(5, len(df) - 5)
             mult = random.choice([0.1, 10.0])
             df.loc[idx, "close"] = round(float(df.loc[idx, "close"]) * mult, 2)
             df.loc[idx, "high"] = max(float(df.loc[idx, "high"]),
                                       float(df.loc[idx, "close"]))
             df.loc[idx, "low"] = min(float(df.loc[idx, "low"]),
                                      float(df.loc[idx, "close"]))
-            return df, f"bad_price_{df.iloc[idx]['date']}_{mult}"
+            return df, f"bad_price_{date}_{mult}", date
         raise ValueError(kind)
 
     def _apply_extras(self, frames: dict[str, pd.DataFrame], extras: list[str],
-                      tickers: list[str]):
-        """Apply bundle extras to random tickers; returns problem strings."""
-        problems, working = [], {t: f.copy() for t, f in frames.items()}
+                      tickers: list[str], used: dict | None = None):
+        """Apply bundle extras to random tickers; returns (frames, problems, used).
+
+        ``used`` maps ticker -> dates already reserved by other injectors
+        (for example a shared missing day or split dates); it is updated
+        in place so family-specific injectors can keep avoiding them.
+        """
+        problems = []
+        working = {t: f.copy() for t, f in frames.items()}
+        used = {t: set(dates) for t, dates in (used or {}).items()}
         for kind in extras:
             ticker = random.choice(tickers)
             if kind == "out_of_order":
                 continue  # applied on the combined frame at the end
-            working[ticker], p = self._inject(working[ticker], kind)
+            working[ticker], p, date = self._inject(
+                working[ticker], kind, used.get(ticker, set()))
+            used.setdefault(ticker, set()).add(date)
             problems.append(p)
-        return working, problems
+        return working, problems, used
 
     @staticmethod
     def _shuffle(frames: dict[str, pd.DataFrame], extras: list[str]):
@@ -224,6 +249,43 @@ class FrontierTaskGenerator:
                     combined.loc[i], combined.loc[j] = b, a
             return combined, ["out_of_order_rows_3_swaps"]
         return combined, []
+
+    # ------------------------------------------------- no repeated closes
+    @staticmethod
+    def _first_repeat(frame: pd.DataFrame):
+        """First (column, date) equal to the previous non-null value, or None."""
+        for col in frame.columns:
+            series = frame[col].dropna()
+            vals, dates = series.tolist(), series.index.tolist()
+            for i in range(1, len(vals)):
+                if vals[i] == vals[i - 1]:
+                    return col, str(dates[i])
+        return None
+
+    @staticmethod
+    def _nudge_close(df: pd.DataFrame, date, amount: float = 0.01):
+        """Raise every row on ``date`` (duplicate copies included) by amount."""
+        mask = df["date"].astype(str) == str(date)
+        df.loc[mask, "close"] = (df.loc[mask, "close"].astype(float)
+                                 + amount).round(2)
+        df.loc[mask, "high"] = [max(float(h), float(c)) for h, c in
+                                zip(df.loc[mask, "high"], df.loc[mask, "close"],
+                                    strict=True)]
+
+    def _fix_repeats(self, provider, nudger):
+        """Nudge later closes until provider()'s series have no repeats.
+
+        Cleaning (dedupe, bad-tick removal, alignment, split adjustment)
+        can join two equal closes even when raw neighbours differ, so the
+        guarantee is enforced on the cleaned/aligned series themselves,
+        not on raw neighbours.
+        """
+        for _ in range(1000):
+            hit = self._first_repeat(provider())
+            if hit is None:
+                return
+            nudger(*hit)
+        raise RuntimeError("could not eliminate repeated closes")
 
     # ------------------------------------------------------------------- F1
     def generate_task_rolling_risk(self):
@@ -241,24 +303,29 @@ class FrontierTaskGenerator:
             frames[asset] = _frame(asset, dates, _closes(
                 random.uniform(40, 180), [0.0] + rets))
         extras = self._deck("f1_extras", _EXTRAS_DECK)
-        frames, problems = self._apply_extras(frames, extras, assets + ["IDX"])
+        frames, problems, _used = self._apply_extras(frames, extras, assets + ["IDX"])
+        self._fix_repeats(
+            lambda: pd.DataFrame({t: clean_series(f) for t, f in frames.items()}),
+            lambda t, d: self._nudge_close(frames[t], d))
+        self._fix_repeats(lambda: aligned_prices(frames),
+                          lambda t, d: self._nudge_close(frames[t], d))
         combined, more = self._shuffle(frames, extras)
         problems += more
 
         prices = aligned_prices(frames)
         rets = prices.pct_change().dropna()
-        betas, best = {}, None
-        for asset in assets:
-            vals = []
-            for end in range(window, len(rets) + 1):
-                w = rets.iloc[end - window:end]
-                var = w["IDX"].var(ddof=1)
-                vals.append(w[asset].cov(w["IDX"]) / var if var > 0 else 0.0)
-                corr = w[asset].corr(w["IDX"])
-                cand = (float(corr), str(rets.index[end - 1]), asset)
-                if best is None or cand[0] > best[0]:
-                    best = cand
-            betas[asset] = round(float(np.mean(vals)), 6)
+        cov = rets.rolling(window).cov(rets["IDX"])
+        var = rets["IDX"].rolling(window).var(ddof=1)
+        beta_frame = cov.div(var, axis=0)
+        betas = {a: round(float(beta_frame[a].mean()), 6) for a in assets}
+        # Peak correlation: first maximum in (window-end date, asset order)
+        # order, matching the prompt's tie break (earliest date, then the
+        # asset order as listed).
+        corr_frame = rets.rolling(window).corr(rets["IDX"])[assets].dropna()
+        pos = int(np.argmax(corr_frame.to_numpy()))
+        wi, ai = np.unravel_index(pos, corr_frame.shape)
+        best = (float(corr_frame.to_numpy()[wi, ai]), str(corr_frame.index[wi]),
+                assets[ai])
         ew = rets[assets].mean(axis=1)
         expected = {
             "mean_betas": betas,
@@ -310,13 +377,14 @@ equal-weight portfolio returns."""
             base[ticker] = _frame(ticker, dates, _closes(
                 random.uniform(40, 180), [0.0] + rets))
         extras = self._deck("f2_extras", _EXTRAS_DECK)
-        problems = []
+        problems, used = [], {}
         if "missing" in extras:
             # Missing means neither vendor reports the date: delete it
             # from the shared base before the two blocks diverge.
             t = random.choice(tickers)
-            base[t], p = self._inject(base[t], "missing")
+            base[t], p, mdate = self._inject(base[t], "missing")
             problems.append(p)
+            used[t] = {mdate}
         # Vendor A gaps that Vendor B fills (not missing, not conflicts).
         # Dropped before any injection, so a gap can never delete an
         # injected bad tick or one copy of a duplicate pair.
@@ -326,18 +394,21 @@ equal-weight portfolio returns."""
             gap_dates = random.sample(candidates[10:-10], 3)
             a_frames[ticker] = a_frames[ticker][
                 ~a_frames[ticker]["date"].isin(gap_dates)].reset_index(drop=True)
-        a_frames, more = self._apply_extras(
+        a_frames, more, used = self._apply_extras(
             a_frames,
-            [e for e in extras if e not in ("out_of_order", "missing")], tickers)
+            [e for e in extras if e not in ("out_of_order", "missing")],
+            tickers, used)
         problems += more
         b_frames = {}
         for ticker in tickers:
             b = base[ticker].copy()
-            b["close"] = (b["close"] * 100).round(2)
+            b[["open", "high", "low", "close"]] = (
+                b[["open", "high", "low", "close"]] * 100).round(2)
             b_frames[ticker] = b
-        # Conflicts: change Vendor B closes on dates Vendor A still reports.
-        conflict_dates = []
-        for _ in range(n_conf):
+        # Conflicts: change Vendor B closes on dates Vendor A still
+        # reports. The count varies per task around the settings value.
+        n_conf_task = random.randint(max(4, n_conf - 6), n_conf + 6)
+        for _ in range(n_conf_task):
             ticker = random.choice(tickers)
             date = random.choice(a_frames[ticker]["date"].tolist())
             mask = (b_frames[ticker]["date"] == date)
@@ -345,30 +416,49 @@ equal-weight portfolio returns."""
                 factor = random.choice([0.93, 1.06, 1.11, 0.88])
                 b_frames[ticker].loc[mask, "close"] = (
                     b_frames[ticker].loc[mask, "close"] * factor).round(2)
-                conflict_dates.append(date)
+                b_frames[ticker].loc[mask, "high"] = [
+                    max(float(h), float(c)) for h, c in zip(
+                        b_frames[ticker].loc[mask, "high"],
+                        b_frames[ticker].loc[mask, "close"], strict=True)]
+                b_frames[ticker].loc[mask, "low"] = [
+                    min(float(lo), float(c)) for lo, c in zip(
+                        b_frames[ticker].loc[mask, "low"],
+                        b_frames[ticker].loc[mask, "close"], strict=True)]
+
+        def _trusted_and_conflicts():
+            trusted, conflicts = {}, []
+            for ticker in tickers:
+                a = clean_series(a_frames[ticker])
+                b = clean_series(b_frames[ticker].assign(
+                    close=b_frames[ticker]["close"] / 100.0))
+                dates_all = sorted(set(a.index) | set(b.index))
+                trusted[ticker] = pd.Series(
+                    [a[d] if d in a.index else b[d] for d in dates_all],
+                    index=dates_all, dtype=float)
+                for d in sorted(set(a.index) & set(b.index)):
+                    if abs(float(a[d]) - float(b[d])) > 0.01:
+                        conflicts.append((d, ticker))
+            return trusted, conflicts
+
+        def _nudge_trusted(ticker, date):
+            a = clean_series(a_frames[ticker])
+            if date in a.index:  # trusted value comes from Vendor A
+                self._nudge_close(a_frames[ticker], date, 0.01)
+            else:  # from Vendor B: +1 stored cent = +$0.01 after conversion
+                self._nudge_close(b_frames[ticker], date, 1.0)
+
+        self._fix_repeats(
+            lambda: pd.DataFrame(_trusted_and_conflicts()[0]), _nudge_trusted)
+        self._fix_repeats(
+            lambda: pd.DataFrame(_trusted_and_conflicts()[0]
+                                 ).sort_index().dropna(), _nudge_trusted)
         a_combined, more = self._shuffle(a_frames, extras)
         problems += more
         b_combined = pd.concat(b_frames.values(), ignore_index=True)
         payload = "VENDOR_A\n" + a_combined.to_csv(index=False) + \
             "VENDOR_B\n" + b_combined.to_csv(index=False)
 
-        trusted_frames = {}
-        for ticker in tickers:
-            a = clean_series(a_frames[ticker])
-            b = clean_series(b_frames[ticker].assign(
-                close=b_frames[ticker]["close"] / 100.0))
-            dates_all = sorted(set(a.index) | set(b.index))
-            trusted_frames[ticker] = pd.Series(
-                [a[d] if d in a.index else b[d] for d in dates_all],
-                index=dates_all, dtype=float)
-        conflicts = []
-        for ticker in tickers:
-            a = clean_series(a_frames[ticker])
-            b = clean_series(b_frames[ticker].assign(
-                close=b_frames[ticker]["close"] / 100.0))
-            for d in sorted(set(a.index) & set(b.index)):
-                if abs(float(a[d]) - float(b[d])) > 0.01:
-                    conflicts.append((d, ticker))
+        trusted_frames, conflicts = _trusted_and_conflicts()
         aligned = pd.DataFrame(trusted_frames).sort_index().dropna()
         rel = aligned.iloc[-1] / aligned.iloc[0]
         problems = [f"source_conflict_{len(conflicts)}_pairs"] + problems \
@@ -384,7 +474,7 @@ equal-weight portfolio returns."""
                   "second with a line VENDOR_B. Each block then has header "
                   "date,ticker,open,high,low,close,volume and one row per "
                   f"ticker and date. Tickers: {', '.join(tickers)}. Vendor A "
-                  "quotes close in dollars. Vendor B quotes close in cents "
+                  "quotes prices in dollars. Vendor B quotes prices in cents "
                   "(divide Vendor B closes by 100 before any comparison or use).")
         analytic = """Clean each vendor block separately with the general rules
 (duplicates and bad ticks are judged within a block), converting Vendor B
@@ -426,41 +516,86 @@ minus 1."""
             "SEC": _frame("SEC", dates, _closes(random.uniform(60, 110), [0.0] + sec)),
         }
         extras = self._deck("f3_extras", _EXTRAS_DECK)
-        frames, problems = self._apply_extras(
+        frames, problems, used = self._apply_extras(
             frames, [e for e in extras if e not in ("out_of_order", "bad_price")],
             ["AST"])
         # Explicit split-table events; raw AST prices are un-adjusted.
-        # Picks are chosen before the bad tick is injected, and the bad
-        # tick is kept away from split dates: un-adjusting rescales its
-        # neighbours, and a spike next to a split boundary could stop
-        # deviating from both of them.
+        # Picks avoid every date another injector used, are chosen before
+        # the bad tick is injected, and the bad tick is kept away from
+        # split dates: un-adjusting rescales its neighbours, and a spike
+        # next to a split boundary could stop deviating from both of them.
         raw = frames["AST"].copy().reset_index(drop=True)
-        picks = sorted(random.sample(range(40, len(raw) - 40), n_actions))
-        while any(b - a < 30 for a, b in zip(picks, picks[1:], strict=False)):
-            picks = sorted(random.sample(range(40, len(raw) - 40), n_actions))
-        if "bad_price" in extras:
-            idx = random.randint(5, len(raw) - 5)
-            while any(abs(idx - pos) <= 1 for pos in picks):
-                idx = random.randint(5, len(raw) - 5)
-            mult = random.choice([0.1, 10.0])
-            raw.loc[idx, "close"] = round(float(raw.loc[idx, "close"]) * mult, 2)
-            problems.append(f"bad_price_{raw.loc[idx, 'date']}_{mult}")
+        reserved = used.get("AST", set())
+
+        def _pick_positions():
+            for _ in range(200):
+                cand = sorted(random.sample(range(40, len(raw) - 40), n_actions))
+                if all(str(raw.iloc[p]["date"]) not in reserved for p in cand) \
+                        and all(b - a >= 30 for a, b in
+                                zip(cand, cand[1:], strict=False)):
+                    return cand
+            raise RuntimeError("no split positions available")
+
+        picks = _pick_positions()
         events = []
+        reverse_used = False
         for pos in picks:
-            a, b = random.choice([(2, 1), (3, 1), (1, 3), (1, 10)])
+            # At most one reverse split per task: stacked reverse splits
+            # would push early unadjusted closes below $1, where 2-dp
+            # rounding causes huge relative steps.
+            choices = [(2, 1), (3, 1)] if reverse_used else \
+                [(2, 1), (3, 1), (1, 3), (1, 10)]
+            a, b = random.choice(choices)
+            reverse_used = reverse_used or a < b
             events.append((str(raw.iloc[pos]["date"]), a, b))
+        price_cols = ["open", "high", "low", "close"]
+        for (d, a, b), pos in zip(events, picks, strict=True):
             problems.append(
-                f"{'split' if a > b else 'reverse_split'}_{raw.iloc[pos]['date']}_{a}-for-{b}")
-            raw.loc[:pos - 1, "close"] = (
-                raw.loc[:pos - 1, "close"] * (a / b)).round(2)
+                f"{'split' if a > b else 'reverse_split'}_{d}_{a}-for-{b}")
+            raw.loc[:pos - 1, price_cols] = (
+                raw.loc[:pos - 1, price_cols] * (a / b)).round(2)
+        # Keep unadjusted closes above about $5: scaling the whole AST
+        # series by one factor leaves every return (and the regression)
+        # unchanged, but avoids sub-dollar rounding steps.
+        floor_min = float(raw["close"].min())
+        if floor_min < 5.0:
+            factor = 6.0 / floor_min
+            raw[price_cols] = (raw[price_cols] * factor).round(2)
         prev, prev_date = None, None
         for i in range(len(raw)):  # never stale after un-adjusting
             close = float(raw.loc[i, "close"])
             if prev is not None and raw.loc[i, "date"] != prev_date \
                     and close == prev:
                 raw.loc[i, "close"] = round(prev + 0.01, 2)
+                raw.loc[i, "high"] = max(float(raw.loc[i, "high"]),
+                                         float(raw.loc[i, "close"]))
             prev, prev_date = float(raw.loc[i, "close"]), raw.loc[i, "date"]
+        if "bad_price" in extras:
+            # Injected on the final unadjusted series (away from split
+            # dates and every reserved date), so it deviates from both
+            # final neighbours exactly as the definition requires.
+            avoid = reserved | {d for d, _, _ in events} | {
+                str(raw.iloc[p + dp]["date"]) for p in picks for dp in (-1, 1)}
+            raw, p, _d = self._inject(raw, "bad_price", avoid)
+            problems.append(p)
         frames["AST"] = raw
+
+        def _adjusted_aligned(drop: bool):
+            closes = clean_series(frames["AST"])
+            for d, a, b in events:
+                closes.loc[closes.index < d] = \
+                    closes.loc[closes.index < d] * (b / a)
+            frame = pd.DataFrame({"AST": closes,
+                                  "MKT": clean_series(frames["MKT"]),
+                                  "SEC": clean_series(frames["SEC"])}
+                                 ).sort_index()
+            return frame.dropna() if drop else frame
+
+        # No repeated closes in the cleaned, adjusted (and aligned) series.
+        self._fix_repeats(lambda: _adjusted_aligned(False),
+                          lambda t, d: self._nudge_close(frames[t], d))
+        self._fix_repeats(lambda: _adjusted_aligned(True),
+                          lambda t, d: self._nudge_close(frames[t], d))
         combined, more = self._shuffle(frames, extras)
         problems += more
         split_csv = "date,ticker,ratio\n" + "\n".join(
@@ -471,13 +606,7 @@ minus 1."""
         # Apply the split table exactly as the prompt states: back-adjust
         # every cleaned AST close before each event date by B/A
         # (cumulative over events).
-        closes = clean_series(raw.copy())
-        for d, a, b in events:
-            closes.loc[closes.index < d] = closes.loc[closes.index < d] * (b / a)
-        aligned = pd.DataFrame({"AST": closes,
-                                "MKT": clean_series(frames["MKT"]),
-                                "SEC": clean_series(frames["SEC"])}
-                               ).sort_index().dropna()
+        aligned = _adjusted_aligned(True)
         rets = aligned.pct_change().dropna()
         x = np.column_stack([np.ones(len(rets)), rets["MKT"], rets["SEC"]])
         coef, *_ = np.linalg.lstsq(x, rets["AST"].to_numpy(), rcond=None)
@@ -534,7 +663,12 @@ the number of split-table events."""
             frames[asset] = _frame(asset, dates, _closes(
                 random.uniform(40, 180), [0.0] + rets))
         extras = self._deck("f4_extras", _EXTRAS_DECK)
-        frames, problems = self._apply_extras(frames, extras, assets)
+        frames, problems, _used = self._apply_extras(frames, extras, assets)
+        self._fix_repeats(
+            lambda: pd.DataFrame({t: clean_series(f) for t, f in frames.items()}),
+            lambda t, d: self._nudge_close(frames[t], d))
+        self._fix_repeats(lambda: aligned_prices(frames),
+                          lambda t, d: self._nudge_close(frames[t], d))
         combined, more = self._shuffle(frames, extras)
         problems += more
 
@@ -602,7 +736,7 @@ rebalances performed."""
                 self.generate_task_factor_exposure,
                 self.generate_task_portfolio_pipeline]
 
-    def generate_all_tasks(self, output_dir, num_tasks=20):
+    def generate_all_tasks(self, output_dir, num_tasks=25):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "answers").mkdir(exist_ok=True)
