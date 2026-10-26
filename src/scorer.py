@@ -37,8 +37,8 @@ _PATTERNS = {
     "duplicate": r"\bduplicat\w*\b",
     "missing": r"\bmissing\b|\bgaps?\b",
     "bad_price": r"\bbad(?:ly)?\b|\bincorrect\w*\b|\bspikes?\b|\bjump\w*\b",
-    "split": r"\bsplits?\b",
-    "reverse_split": r"\breverse splits?\b|\b1-for-\d+\b|\b\d+-for-1\b",
+    "split": r"\bsplits?\b|\b\d+-for-1\b|\b\d+:1\b",
+    "reverse_split": r"\breverse splits?\b|\b1-for-\d+\b|\b1:\d+\b",
     "unit_change": r"\bunit change\b|\bdollars? to cents\b|\bcents\b|\b100x\b",
     "out_of_order": r"\bout of (?:chronological )?order\b|\bchronological order\b"
                     r"|\bunsorted\b|\bout of sequence\b|\brow order\b",

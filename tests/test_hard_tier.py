@@ -159,6 +159,7 @@ class TestHardTaskGenerator:
             # fixed possible-issues list and general rules are present
             assert "may contain any" in prompt or "any\nsubset" in prompt or "subset" in prompt
             assert "ddof=1" in prompt
+            assert "same ticker and the same date/timestamp" in " ".join(prompt.split())
             assert "inner join" in prompt
             assert "America/New_York" in prompt
             assert "adj_close" in prompt
@@ -380,9 +381,23 @@ class TestKeyDetectability:
                     frame = read_csv_any(out / t["data_file"])
                     where = (seed, t["id"], sorted(cats))
                     intraday = "timestamp" in frame.columns
+                    # Keys must match a solver that follows the prompt's
+                    # wording (duplicate = same ticker + same date/timestamp).
+                    got = solve(t, out / t["data_file"])
+                    for field, want in key.items():
+                        if field == "problems_found":
+                            continue
+                        assert got[field] == pytest.approx(want, abs=1e-4), \
+                            (where, field, got.get(field), want)
                     if "duplicate" in cats:
                         cols = ["ticker", "timestamp" if intraday else "date"]
                         assert frame.duplicated(subset=cols).any(), where
+                        # Duplicates are injected after all value-changing
+                        # injections, so every duplicate pair in the final
+                        # CSV must be byte-identical across all columns.
+                        dup_rows = frame[frame.duplicated(subset=cols, keep=False)]
+                        for _, group in dup_rows.groupby(cols):
+                            assert len(group.drop_duplicates()) == 1, where
                     if "missing" in cats:
                         if intraday:
                             # the missing bar really is absent: one New-York
@@ -405,6 +420,32 @@ class TestKeyDetectability:
                         assert r <= 150, (where, r)
                         assert "unit_change" in cats if r > 50 \
                             else "reverse_split" in cats, (where, r)
+
+    def test_duplicate_pairs_identical_when_bundle_forced(self):
+        # Force the bundles that combine a duplicate with a value-changing
+        # injection: a scale whose cut lands between the two copies would
+        # make them differ, so the copies must be injected afterwards.
+        for seed in range(1, 201):
+            gen = HardTaskGenerator(seed=seed)
+            dfs = gen.generate_clean_prices_multi_asset(
+                ["T"], datetime(2024, 1, 1), 100)
+            df, problems = gen._apply_series_bundle(
+                dfs["T"], ["unit_change", "duplicate"])
+            assert any(p.startswith("duplicate_row") for p in problems)
+            dup = df[df.duplicated(subset=["date"], keep=False)]
+            assert len(dup) == 2, seed
+            assert len(dup.drop_duplicates()) == 1, seed
+            # Beta path: duplicate combined with an adj_close conflict,
+            # whose first-half scaling could split the pair the same way.
+            gen = HardTaskGenerator(seed=seed)
+            gen._decks = {"beta": [[["duplicate", "adj_close"]], 0]}
+            task, combined = gen.generate_task_beta()
+            cats = {p.split("_")[0] for p in task["expected"]["problems_found"]}
+            assert "duplicate" in cats
+            asset = combined[combined["ticker"] == "ACME"]
+            dup = asset[asset.duplicated(subset=["date"], keep=False)]
+            assert len(dup) == 2, seed
+            assert len(dup.drop_duplicates()) == 1, seed
 
     def test_known_collision_cases(self):
         from src.scorer import categories_for_items

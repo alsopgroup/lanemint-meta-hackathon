@@ -166,7 +166,7 @@ The data may contain quality issues such as duplicate rows, missing days,
 or bad price ticks.
 
 Cleaning rules:
-1. Remove duplicate rows (keep first occurrence)
+1. Remove duplicate rows (keep first occurrence): a row is a duplicate if it has the same ticker and the same date as an earlier row
 2. Note any missing trading days but proceed with available data
 3. Remove bad price ticks: a tick is bad if its close price is >50% different from
    BOTH the previous close AND the next close (use a 3-day window to identify outliers)
@@ -232,7 +232,7 @@ The data may contain quality issues such as duplicate rows, bad price ticks,
 or unadjusted stock splits.
 
 Cleaning rules:
-1. Remove duplicate rows (keep first occurrence)
+1. Remove duplicate rows (keep first occurrence): a row is a duplicate if it has the same ticker and the same date as an earlier row
 2. Remove bad price ticks: a tick is bad if its close is >50% different from
    BOTH the previous and next close (identifies spike outliers)
 3. Detect 2-for-1 splits: look for a sustained ~50% drop (ratio between 0.4-0.6)
@@ -290,7 +290,7 @@ Return your answer as JSON with fields:
 The data may contain quality issues such as duplicate rows or missing days.
 
 Cleaning rules:
-1. Remove duplicate rows (keep first occurrence)
+1. Remove duplicate rows (keep first occurrence): a row is a duplicate if it has the same ticker and the same date as an earlier row
 2. Note any missing trading days but proceed with available data
 3. Calculate daily returns, then annualized volatility as: std(daily_returns, ddof=1) * sqrt(252)
 

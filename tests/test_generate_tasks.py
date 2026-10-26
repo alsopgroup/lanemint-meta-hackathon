@@ -177,6 +177,15 @@ class TestCleaningRuleConsistency:
         assert 'pct_change' in prompt or 'daily returns' in prompt.lower(), \
             "Prompt should explain return calculation"
 
+    def test_all_prompts_define_duplicate_by_ticker_and_date(self):
+        """Every easy prompt defines a duplicate as same ticker + same date."""
+        generator = TaskGenerator(seed=42)
+        for maker in (generator.generate_task_return_calculation,
+                      generator.generate_task_backtest,
+                      generator.generate_task_volatility):
+            task, _df = maker()
+            assert "same ticker and the same date" in task['prompt']
+
     def test_backtest_prompt_mentions_split_adjustment(self):
         """Test that backtest prompt mentions split adjustment."""
         generator = TaskGenerator(seed=42)

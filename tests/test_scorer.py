@@ -226,6 +226,29 @@ class TestNewNegationPhrases:
         assert categories_for_text('timestamps mix utc and offsets') == {'timezone'}
 
 
+class TestSplitRatioMapping:
+    """Only 1-for-N (or explicit 'reverse') is a reverse split; N-for-1 is a split."""
+
+    @pytest.mark.parametrize(('phrase', 'want'), [
+        ('2-for-1 split', {'split'}),
+        ('2:1 split', {'split'}),
+        ('10-for-1 forward split', {'split'}),
+        ('stock split (2:1)', {'split'}),
+        ('1-for-3 reverse split', {'reverse_split'}),
+        ('1-for-10 split', {'reverse_split'}),
+        ('1:5 reverse split', {'reverse_split'}),
+        ('3:1 reverse split', {'reverse_split'}),
+    ])
+    def test_ratio_phrases(self, phrase, want):
+        from src.scorer import categories_for_text
+        assert categories_for_text(phrase) == want
+
+    def test_forward_split_scores_as_split(self):
+        from src.scorer import categories_for_items
+        assert categories_for_items(['2-for-1 split']) == {'split'}
+        assert categories_for_items(['1-for-3 reverse split']) == {'reverse_split'}
+
+
 class TestStructuredF1:
     ALL_CODES = ['duplicate', 'missing', 'bad_price', 'split', 'reverse_split',
                  'unit_change', 'out_of_order', 'timezone', 'currency', 'adj_close',

@@ -29,8 +29,10 @@ GENERAL_RULES = """General consistency rules (apply in this order, whichever app
    row is a new header; rows after it follow that header's column order until
    any later header row. Map every data row by its current header names.
 2. Ordering: sort records ascending by ticker (if present), then by date or
-   timestamp. Sorting is stable. Exact duplicate records for the same
-   ticker and date/timestamp are dropped, keeping the first.
+   timestamp. Sorting is stable. A row is a duplicate if it has the same
+   ticker and the same date/timestamp as an earlier row; drop every such
+   duplicate row, keeping the first occurrence, whether or not the other
+   fields match.
 3. Price field: always use the "close" column after the adjustments below.
    Ignore any "adj_close" column entirely; it may be partly adjusted and can
    disagree with "close".
@@ -411,9 +413,6 @@ class HardTaskGenerator:
     def _apply_series_bundle(self, df, bundle):
         """Apply a bundle to one series; shifts always precede shuffling."""
         problems = []
-        if "duplicate" in bundle:
-            df, p = self.inject_duplicate_row(df)
-            problems.append(p)
         if "missing" in bundle:
             df, p = self.inject_missing_row(df)
             problems.append(p)
@@ -429,6 +428,11 @@ class HardTaskGenerator:
             problems.extend(ps)
         elif "adj_close" in bundle:
             df, p = self.add_adj_close_conflict(df)
+            problems.append(p)
+        # Duplicates go in only after every value-changing injection, so a
+        # scale can never land between the two copies and make them differ.
+        if "duplicate" in bundle:
+            df, p = self.inject_duplicate_row(df)
             problems.append(p)
         if "out_of_order" in bundle:
             df, p = self.inject_out_of_order_rows(df, 4)
@@ -552,9 +556,6 @@ and cleaning."""
             asset = self.add_currency_columns(asset, "EUR")
             bench = self.add_currency_columns(bench, "USD")
             problems.append("currency_mismatch_ACME_EUR")
-        if "duplicate" in bundle:
-            asset, p = self.inject_duplicate_row(asset)
-            problems.append(p)
         if "missing" in bundle:
             bench, p = self.inject_missing_row(bench)
             problems.append(p)
@@ -571,6 +572,10 @@ and cleaning."""
             problems.extend(ps)
         elif "adj_close" in bundle:
             asset, p = self.add_adj_close_conflict(asset)
+            problems.append(p)
+        # Duplicates last among value-changing injections: copies stay exact.
+        if "duplicate" in bundle:
+            asset, p = self.inject_duplicate_row(asset)
             problems.append(p)
         if "out_of_order" in bundle:
             if random.choice([True, False]):
@@ -615,12 +620,9 @@ ddof=1). mean_beta is the arithmetic mean of those window betas."""
         problems = [p]
         # The repeated instant exists twice (two textual forms of one bar);
         # deleting either copy would leave the bar present, so the missing
-        # pick must never land on it. Captured now because a duplicate-row
-        # insertion below can shift row positions.
+        # pick must never land on it. Its row positions are recomputed at
+        # the missing pick because injections change row positions.
         repeated_instant = pd.Timestamp(intra.iloc[10]["timestamp"])
-        if "duplicate" in bundle:
-            intra, p = self.inject_duplicate_row(intra)
-            problems.append(p)
         if "missing" in bundle:
             repeated_rows = [i for i, stamp in enumerate(intra["timestamp"])
                              if pd.Timestamp(stamp) == repeated_instant]
@@ -652,6 +654,10 @@ ddof=1). mean_beta is the arithmetic mean of those window betas."""
             problems.extend(ps)
         elif "adj_close" in bundle:
             intra, p = self.add_adj_close_conflict(intra)
+            problems.append(p)
+        # Duplicates last among value-changing injections: copies stay exact.
+        if "duplicate" in bundle:
+            intra, p = self.inject_duplicate_row(intra)
             problems.append(p)
         if "out_of_order" in bundle:
             intra, p = self.inject_out_of_order_rows(intra, 4)
