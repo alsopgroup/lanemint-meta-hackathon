@@ -57,8 +57,8 @@ class TaskRunner:
 
         self.dry_run = dry_run
         self.base_url = base_url or os.getenv('META_BASE_URL', 'https://api.meta.ai/v1')
-        self.api_key = api_key or os.getenv('META_API_KEY', '')
-        self.model_name = model_name or os.getenv('META_MODEL_NAME', 'llama-3.1-8b')
+        self.api_key = api_key or os.getenv('META_API_KEY') or os.getenv('MODEL_API_KEY', '')
+        self.model_name = model_name or os.getenv('META_MODEL_NAME', 'muse-spark-1.3')
 
         if dry_run:
             print("[DRY RUN] Using stub model")

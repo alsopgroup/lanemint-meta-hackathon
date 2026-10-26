@@ -1,164 +1,148 @@
 """
-Fine-tuning script for Meta Llama models.
+Fine-tuning configuration for local Muse Glimmer training.
 
-This is a stub/template - actual fine-tuning requires approval
-and will be run separately with hackathon credits.
+Validates fine-tuning data and provides configuration templates for
+local training with TRL (Hugging Face) or Axolotl.
 """
 
-import os
+import json
 from pathlib import Path
 
-from dotenv import load_dotenv
 
+class FineTuneValidator:
+    """Validates and reports on fine-tuning data preparation."""
 
-class FineTuner:
-    """Handles fine-tuning jobs."""
-
-    def __init__(self, api_key: str | None = None, base_url: str | None = None):
-        """Initialize fine-tuner."""
-        load_dotenv()
-        self.api_key = api_key or os.getenv('META_API_KEY', '')
-        self.base_url = base_url or os.getenv('META_BASE_URL', 'https://api.meta.ai/v1')
-
-    def estimate_cost(self, train_file: Path, validation_file: Path | None = None) -> dict:
+    def validate_jsonl(self, file_path: Path) -> dict:
         """
-        Estimate fine-tuning cost.
+        Validate JSONL format and structure.
 
-        Based on Meta's pricing (approximate):
-        - Training: ~$0.0001 per token
-        - Validation: ~$0.00005 per token
+        Returns statistics about the dataset.
         """
-        def count_tokens_approx(file_path: Path) -> int:
-            """Rough token count estimate (1 token ≈ 4 chars)."""
+        if not file_path.exists():
+            return {
+                'valid': False,
+                'error': f'File not found: {file_path}'
+            }
+
+        examples = []
+        errors = []
+
+        try:
             with open(file_path) as f:
-                content = f.read()
-                return len(content) // 4
+                for i, line in enumerate(f, 1):
+                    try:
+                        example = json.loads(line)
+                        if 'messages' not in example:
+                            errors.append(f"Line {i}: missing 'messages' field")
+                        else:
+                            examples.append(example)
+                    except json.JSONDecodeError as e:
+                        errors.append(f"Line {i}: {e}")
+        except Exception as e:
+            return {
+                'valid': False,
+                'error': str(e)
+            }
 
-        train_tokens = count_tokens_approx(train_file)
-        val_tokens = count_tokens_approx(validation_file) if validation_file else 0
-
-        # Estimate costs (adjust based on actual Meta pricing)
-        train_cost = train_tokens * 0.0001 / 1000  # per 1k tokens
-        val_cost = val_tokens * 0.00005 / 1000
-        total_cost = train_cost + val_cost
+        # Calculate statistics
+        total_tokens_approx = sum(
+            len(json.dumps(ex)) // 4  # Rough token estimate
+            for ex in examples
+        )
 
         return {
-            'train_tokens': train_tokens,
-            'validation_tokens': val_tokens,
-            'estimated_train_cost_usd': round(train_cost, 4),
-            'estimated_validation_cost_usd': round(val_cost, 4),
-            'estimated_total_cost_usd': round(total_cost, 4),
-            'note': 'This is a rough estimate. Actual costs depend on model size and final token counts.'
+            'valid': len(errors) == 0,
+            'num_examples': len(examples),
+            'errors': errors,
+            'total_tokens_approx': total_tokens_approx,
+            'avg_tokens_per_example': total_tokens_approx // len(examples) if examples else 0
         }
 
-    def create_finetune_job(
+    def check_fine_tuning_data(
         self,
         train_file: Path,
-        validation_file: Path | None,
-        model: str = 'llama-3.1-8b',
-        suffix: str = 'market-data',
-        dry_run: bool = True
+        validation_file: Path | None = None
     ) -> dict:
         """
-        Create a fine-tuning job.
+        Validate fine-tuning data files.
 
         Args:
             train_file: Path to training JSONL
             validation_file: Path to validation JSONL (optional)
-            model: Base model to fine-tune
-            suffix: Custom suffix for fine-tuned model name
-            dry_run: If True, only show what would be done
         """
-        if dry_run:
-            print("\n[DRY RUN] Would create fine-tuning job with:")
-            print(f"  Base model: {model}")
-            print(f"  Training file: {train_file}")
-            if validation_file:
-                print(f"  Validation file: {validation_file}")
-            print(f"  Model suffix: {suffix}")
-            print(f"  API base URL: {self.base_url}")
+        print("\n=== Fine-Tuning Data Validation ===\n")
 
-            estimate = self.estimate_cost(train_file, validation_file)
-            print("\nCost estimate:")
-            print(f"  Training tokens: ~{estimate['train_tokens']:,}")
-            if estimate['validation_tokens'] > 0:
-                print(f"  Validation tokens: ~{estimate['validation_tokens']:,}")
-            print(f"  Estimated total cost: ${estimate['estimated_total_cost_usd']:.4f}")
-            print("\n  Hackathon budget: $150.00")
-            print(f"  Remaining after this run: ${150 - estimate['estimated_total_cost_usd']:.4f}")
+        # Validate training file
+        print(f"Checking training file: {train_file}")
+        train_result = self.validate_jsonl(train_file)
 
-            return {
-                'status': 'dry_run',
-                'estimate': estimate,
-                'message': 'Set dry_run=False and ensure META_API_KEY is set to run actual fine-tuning'
-            }
+        if train_result['valid']:
+            print("✓ Valid JSONL format")
+            print(f"  Examples: {train_result['num_examples']}")
+            print(f"  Approx tokens: {train_result['total_tokens_approx']:,}")
+            print(f"  Avg tokens/example: {train_result['avg_tokens_per_example']}")
+        else:
+            print(f"✗ Invalid: {train_result.get('error', 'See errors below')}")
+            for error in train_result.get('errors', []):
+                print(f"    {error}")
 
-        if not self.api_key:
-            raise ValueError(
-                "META_API_KEY not set. Cannot create fine-tuning job.\n"
-                "Set the key in .env file or META_API_KEY environment variable."
+        # Validate validation file if provided
+        val_result = None
+        if validation_file and validation_file.exists():
+            print(f"\nChecking validation file: {validation_file}")
+            val_result = self.validate_jsonl(validation_file)
+
+            if val_result['valid']:
+                print("✓ Valid JSONL format")
+                print(f"  Examples: {val_result['num_examples']}")
+                print(f"  Approx tokens: {val_result['total_tokens_approx']:,}")
+                print(f"  Avg tokens/example: {val_result['avg_tokens_per_example']}")
+            else:
+                print(f"✗ Invalid: {val_result.get('error', 'See errors below')}")
+                for error in val_result.get('errors', []):
+                    print(f"    {error}")
+
+        # Print fine-tuning guidance
+        if train_result['valid']:
+            print("\n=== Local Fine-Tuning Guide ===\n")
+            print("Target Model: Muse Glimmer 30B (Apache 2.0)")
+            print("  Hugging Face: meta-models/Muse-Glimmer-30B")
+            print("  GGUF variant: meta-models/Muse-Glimmer-30B-GGUF\n")
+
+            print("Approach 1: Supervised Fine-Tuning (SFT)")
+            print("  Framework: TRL (Hugging Face) or Axolotl")
+            print("  Method: QLoRA for parameter-efficient training")
+            print("  Data: Use train.jsonl as-is\n")
+
+            print("Approach 2: GRPO (Group Relative Policy Optimization)")
+            print("  Framework: TRL GRPOTrainer or Meta's TitanRL")
+            print("  Reward: Use src/scorer.py as deterministic reward function")
+            print("  Data: Sample from train.jsonl for policy optimization\n")
+
+            print("Installation (optional dependencies):")
+            print("  pip install transformers trl peft accelerate bitsandbytes")
+            print("  pip install axolotl  # Alternative to TRL\n")
+
+            print("Example TRL SFT command:")
+            print("  # See TRL documentation for full configuration")
+            print("  # https://huggingface.co/docs/trl/")
+
+        return {
+            'train': train_result,
+            'validation': val_result,
+            'all_valid': train_result['valid'] and (
+                val_result['valid'] if val_result else True
             )
-
-        print("\n⚠️  CREATING REAL FINE-TUNING JOB")
-        print("This will use hackathon credits.")
-
-        try:
-            from openai import OpenAI
-            client = OpenAI(base_url=self.base_url, api_key=self.api_key)
-
-            # Upload training file
-            print(f"\nUploading training file: {train_file}")
-            with open(train_file, 'rb') as f:
-                train_file_obj = client.files.create(file=f, purpose='fine-tune')
-
-            # Upload validation file if provided
-            val_file_id = None
-            if validation_file:
-                print(f"Uploading validation file: {validation_file}")
-                with open(validation_file, 'rb') as f:
-                    val_file_obj = client.files.create(file=f, purpose='fine-tune')
-                val_file_id = val_file_obj.id
-
-            # Create fine-tuning job
-            print("\nCreating fine-tuning job...")
-            job = client.fine_tuning.jobs.create(
-                training_file=train_file_obj.id,
-                validation_file=val_file_id,
-                model=model,
-                suffix=suffix
-            )
-
-            result = {
-                'status': 'created',
-                'job_id': job.id,
-                'model': model,
-                'fine_tuned_model': None,  # Will be set when job completes
-                'status_url': f"{self.base_url}/fine_tuning/jobs/{job.id}",
-                'message': f'Fine-tuning job created: {job.id}'
-            }
-
-            print(f"\n✓ Fine-tuning job created: {job.id}")
-            print(f"Monitor status: {result['status_url']}")
-
-            return result
-
-        except ImportError:
-            raise ImportError(
-                "openai package required. Run: pip install -r requirements.txt"
-            ) from None
-        except Exception as e:
-            return {
-                'status': 'error',
-                'error': str(e),
-                'message': f'Failed to create fine-tuning job: {e}'
-            }
+        }
 
 
 def main():
-    """CLI for fine-tuning."""
+    """CLI for fine-tuning data validation."""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Launch fine-tuning job')
+    parser = argparse.ArgumentParser(
+        description='Validate fine-tuning data for local Muse Glimmer training'
+    )
     parser.add_argument(
         '--train-file',
         type=Path,
@@ -172,25 +156,10 @@ def main():
         help='Validation JSONL file'
     )
     parser.add_argument(
-        '--model',
-        default='llama-3.1-8b',
-        help='Base model to fine-tune (default: llama-3.1-8b)'
-    )
-    parser.add_argument(
-        '--suffix',
-        default='market-data',
-        help='Suffix for fine-tuned model name (default: market-data)'
-    )
-    parser.add_argument(
         '--dry-run',
         action='store_true',
         default=True,
-        help='Show estimate without creating job (default: True)'
-    )
-    parser.add_argument(
-        '--run',
-        action='store_true',
-        help='Actually create fine-tuning job (overrides --dry-run)'
+        help='Validate and show guidance (default: True, always enabled)'
     )
 
     args = parser.parse_args()
@@ -200,28 +169,18 @@ def main():
         print("Run: python -m src.finetune_prep first")
         return 1
 
-    dry_run = not args.run
-
-    tuner = FineTuner()
-    result = tuner.create_finetune_job(
+    validator = FineTuneValidator()
+    result = validator.check_fine_tuning_data(
         train_file=args.train_file,
-        validation_file=args.validation_file if args.validation_file.exists() else None,
-        model=args.model,
-        suffix=args.suffix,
-        dry_run=dry_run
+        validation_file=args.validation_file if args.validation_file.exists() else None
     )
 
-    if result['status'] == 'dry_run':
-        print("\n" + "="*60)
-        print("DRY RUN COMPLETE")
-        print("="*60)
-        print("\nTo run actual fine-tuning:")
-        print("  1. Set META_API_KEY in .env file")
-        print("  2. Run with --run flag:")
-        print("     python -m src.finetune --run")
-        print("\n⚠️  This will use hackathon credits!")
-
-    return 0
+    if result['all_valid']:
+        print("\n✓ All data files are valid and ready for local fine-tuning")
+        return 0
+    else:
+        print("\n✗ Validation failed - fix errors before fine-tuning")
+        return 1
 
 
 if __name__ == '__main__':
