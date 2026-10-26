@@ -23,7 +23,10 @@ _UNCERTAIN = re.compile(r"\b(cannot|can't|can not|could not|couldn't) rule out\b
 _IDIOM_NEG = re.compile(
     r"\bfree of\b|\bruled out\b|\babsence of\b|\blacks?\b|\bneither\b")
 _UNCERTAIN_ADJ = {"possible", "possibly", "potential", "potentially",
-                  "suspected", "unconfirmed", "maybe", "perhaps"}
+                  "suspected", "unconfirmed", "maybe", "perhaps", "unlikely"}
+_CODE_NEGATED = re.compile(
+    r"^\s*(none\b|not\b|no\b|0\b|zero\b|absent\b|ruled out\b|not present\b|"
+    r"not detected\b|not found\b|no issues?\b)")
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
     "out_of_order", "timezone", "currency", "adj_close", "column_order", "calendar",
@@ -49,15 +52,18 @@ _PATTERNS = {
 }
 
 
+_CLAUSE_WORD_SEPS = (" - ", " — ", " but ", " although ", " however ")
+
+
 def _clause_bounds(text, start, end):
     lo = max(text.rfind(sep, 0, start) for sep in _CLAUSE_SEP) + 1
-    for dash in (" - ", " — "):
+    for dash in _CLAUSE_WORD_SEPS:
         idx = text.rfind(dash, 0, start)
         if idx != -1:
             lo = max(lo, idx + len(dash))
     stops = [text.find(sep, end) for sep in _CLAUSE_SEP]
     stops = [s for s in stops if s != -1]
-    for dash in (" - ", " — "):
+    for dash in _CLAUSE_WORD_SEPS:
         idx = text.find(dash, end)
         if idx != -1:
             stops.append(idx)
@@ -71,6 +77,15 @@ def _clause(text, start, end):
 
 
 def _occurrence_positive(text, match):
+    # "checked for duplicates but found none": the trailing clause negates
+    # this match unless it introduces a different keyword of its own.
+    tail = text[match.end():]
+    stop = tail.find(".")
+    segment = tail[:stop] if stop != -1 else tail
+    m = re.search(r"\bbut (?:found )?(none|no|not)\b", segment)
+    if m and not re.search(r"\b(duplicate|missing|gap|split|bad|spike)s?\b",
+                           segment[m.end():]):
+        return False
     clause = _clause(text, match.start(), match.end())
     if _UNCERTAIN.search(clause) or _IDIOM_NEG.search(clause):
         # "besides/except" re-asserts what follows it: "no issues besides a duplicate"
@@ -100,12 +115,15 @@ def _occurrence_positive(text, match):
     return True
 
 
-def _canonical(found):
+def _canonical(found, text=""):
     found = set(found)
     if "reverse_split" in found:
         found.discard("split")
     if "unit_change" in found:
         found.discard("bad_price")
+    if "timezone" in found and "duplicate" in found and \
+            any(w in text for w in ("instant", "timestamp", "hour")):
+        found.discard("duplicate")
     return found
 
 
@@ -118,7 +136,7 @@ def categories_for_text(text):
             if _occurrence_positive(norm, match):
                 found.add(category)
                 break
-    return _canonical(found)
+    return _canonical(found, norm)
 
 
 def categories_for_items(items):
@@ -134,7 +152,9 @@ def categories_for_items(items):
         m = re.match(r"^([a-z_]+)\s*(?::|$)", text)
         code = m.group(1).replace(" ", "_") if m else None
         if code in CANONICAL_CATEGORIES:
-            found.add(code)
+            detail = text[m.end():] if ":" in text else ""
+            if not _CODE_NEGATED.match(detail):
+                found.add(code)
         else:
             found |= categories_for_text(text)
     return _canonical(found)
@@ -244,8 +264,12 @@ class TaskScorer:
         overall = sum(scores.values()) / len(scores) if scores else 0.0
         if not scores:
             feedback.append("No scoreable fields found")
-        # Correct numbers with junk/empty problem identification must not pass.
-        problems_ok = scores.get('problems', 1.0) >= 0.5
+        # Passing requires exact problem-set identification (F1 = 1.0):
+        # correct numbers plus a guessed or partial category set must not
+        # pass, because the bundles are randomised enough that a fixed
+        # per-type guess matches only a small minority of tasks (measured
+        # in tests/test_scorer.py::TestGuessBaselines).
+        problems_ok = scores.get('problems', 1.0) >= 1.0
         return {'task_id': task_id, 'passed': overall >= 0.8 and problems_ok,
                 'score': round(overall, 3), 'component_scores': scores,
                 'feedback': '; '.join(feedback) if feedback else 'All checks passed'}

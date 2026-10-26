@@ -64,6 +64,26 @@ class TaskGenerator:
 
         return pd.DataFrame(rows)
 
+    @staticmethod
+    def dedupe_stale_closes(df: pd.DataFrame) -> pd.DataFrame:
+        """After all injection, nudge closes repeating the previous distinct date.
+
+        Split rounding can collapse distinct closes into ties; rows sharing
+        the same date (intended duplicates) are exempt.
+        """
+        df = df.copy().reset_index(drop=True)
+        prev_close, prev_date = None, None
+        for idx in range(len(df)):
+            date = df.loc[idx, 'date']
+            close = round(float(df.loc[idx, 'close']), 2)
+            if prev_close is not None and date != prev_date and close == prev_close:
+                close = round(prev_close + 0.01, 2)
+                df.loc[idx, 'close'] = close
+                df.loc[idx, 'high'] = max(float(df.loc[idx, 'high']), close)
+                df.loc[idx, 'low'] = min(float(df.loc[idx, 'low']), close)
+            prev_close, prev_date = close, date
+        return df
+
     def inject_duplicate_row(self, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         """Inject a duplicate row."""
         idx = random.randint(5, len(df) - 5)
@@ -127,6 +147,7 @@ class TaskGenerator:
         for inject_func in issue_types:
             df, problem = inject_func(df)
             problems.append(problem)
+        df = self.dedupe_stale_closes(df)
 
         # Calculate expected answer using the reference cleaner
         clean_df = self._clean_data(df.copy(), has_split=False)
@@ -188,6 +209,7 @@ Return your answer as JSON with fields:
         for inject_func in issue_types:
             df, problem = inject_func(df)
             problems.append(problem)
+        df = self.dedupe_stale_closes(df)
 
         # Calculate expected answer using reference cleaner
         clean_df = self._clean_data(df.copy(), has_split=has_split)
@@ -248,6 +270,7 @@ Return your answer as JSON with fields:
         for inject_func in issue_types:
             df, problem = inject_func(df)
             problems.append(problem)
+        df = self.dedupe_stale_closes(df)
 
         # Calculate expected answer
         clean_df = self._clean_data(df.copy(), has_split=False)

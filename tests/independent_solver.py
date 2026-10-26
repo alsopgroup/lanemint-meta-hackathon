@@ -34,7 +34,7 @@ def clean_close_series(frame):
     """Sort, convert currency, then fix sustained level shifts. Returns closes by date."""
     frame = frame.copy()
     frame["date"] = pd.to_datetime(frame["date"])
-    frame = frame.sort_values("date")
+    frame = frame.sort_values("date").drop_duplicates(subset=["date"], keep="first")
     closes = [float(v) for v in frame["close"]]
     if "currency" in frame.columns:
         closes = [c * float(r) for c, r in zip(closes, frame["fx_rate"], strict=True)]
@@ -58,18 +58,31 @@ def solve(task, csv_path):
     if kind == "dst_intraday":
         frame = read_csv_any(csv_path)
         seen, bars = set(), []
-        for stamp, close in zip(frame["timestamp"], frame["close"], strict=True):
-            instant = pd.Timestamp(stamp)
+        has_fx = "currency" in frame.columns
+        for _, row in frame.iterrows():
+            instant = pd.Timestamp(row["timestamp"])
             if instant.tzinfo is None:
                 instant = instant.tz_localize("UTC")
             instant = instant.tz_convert(NY)
             if instant in seen:
                 continue
             seen.add(instant)
-            bars.append((instant, float(close)))
+            close = float(row["close"]) * (float(row["fx_rate"]) if has_fx else 1.0)
+            bars.append((instant, close))
         bars.sort(key=lambda b: b[0])
+        closes_only = [c for _, c in bars]
+        i = 1
+        while i < len(closes_only):
+            if closes_only[i - 1] > 0:
+                ratio = closes_only[i] / closes_only[i - 1]
+                if ratio > 1.8 and i + 1 < len(closes_only) and \
+                        closes_only[i + 1] / closes_only[i - 1] > 1.8:
+                    divisor = 100.0 if ratio > 50 else float(
+                        min((3, 10), key=lambda c: abs(ratio - c) / c))
+                    closes_only = closes_only[:i] + [c / divisor for c in closes_only[i:]]
+            i += 1
         daily = {}
-        for instant, close in bars:
+        for (instant, _), close in zip(bars, closes_only, strict=True):
             daily[instant.date()] = close
         closes = pd.Series([daily[d] for d in sorted(daily)], dtype=float)
         rets = closes.pct_change().dropna()

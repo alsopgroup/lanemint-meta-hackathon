@@ -229,7 +229,7 @@ def main():
 
     print(f"\n✓ Completed {len(results)} tasks")
     print("\nNext step: Score the results")
-    print(f"  python -m src.scorer {args.output_dir}/results.json")
+    print(f"  python -m src.scorer {args.output_dir}/results.json {args.tasks_dir}/answers")
 
     return 0
 

@@ -29,7 +29,8 @@ GENERAL_RULES = """General consistency rules (apply in this order, whichever app
    row is a new header; rows after it follow that header's column order until
    any later header row. Map every data row by its current header names.
 2. Ordering: sort records ascending by ticker (if present), then by date or
-   timestamp. Sorting is stable.
+   timestamp. Sorting is stable. Exact duplicate records for the same
+   ticker and date/timestamp are dropped, keeping the first.
 3. Price field: always use the "close" column after the adjustments below.
    Ignore any "adj_close" column entirely; it may be partly adjusted and can
    disagree with "close".
@@ -140,11 +141,68 @@ class HardTaskGenerator:
             done += 1
         return df, f"out_of_order_rows_{done}_swaps"
 
+    @staticmethod
+    def _row_label(df, idx):
+        row = df.iloc[idx]
+        if "date" in df.columns:
+            return row["date"].strftime("%Y-%m-%d")
+        return str(row["timestamp"])
+
+    def inject_duplicate_row(self, df):
+        df = df.copy().reset_index(drop=True)
+        idx = random.randint(5, len(df) - 5)
+        out = pd.concat([df.iloc[:idx + 1], df.iloc[idx:idx + 1], df.iloc[idx + 1:]],
+                        ignore_index=True)
+        return out, f"duplicate_row_{self._row_label(df, idx)}"
+
+    def inject_missing_row(self, df):
+        df = df.copy().reset_index(drop=True)
+        idx = random.randint(5, len(df) - 5)
+        label = self._row_label(df, idx)
+        out = pd.concat([df.iloc[:idx], df.iloc[idx + 1:]], ignore_index=True)
+        kind = "day" if "date" in df.columns else "bar"
+        return out, f"missing_{kind}_{label}"
+
+    @staticmethod
+    def dedupe_stale_closes(df, order_col="date"):
+        """Nudge closes (by +0.01) that repeat the previous distinct date/instant.
+
+        Runs after injection, so split/unit/intraday scaling cannot leave
+        identical consecutive closes. Rows sharing the same date/instant
+        (intended duplicates) are exempt.
+        """
+        df = df.copy()
+        if "close" not in df.columns:
+            return df
+        groups = df.groupby("ticker", sort=False) if "ticker" in df.columns else [("", df)]
+        for _, group in groups:
+            if order_col == "timestamp":
+                keys = [pd.Timestamp(v) for v in group[order_col]]
+                if keys and keys[0].tzinfo is None:
+                    keys = [k.tz_localize("UTC") for k in keys]
+                keys = [k.tz_convert(NY) for k in keys]
+            else:
+                keys = list(group[order_col])
+            order = sorted(range(len(group)), key=lambda i: keys[i])
+            prev_close, prev_key = None, None
+            for pos in order:
+                idx = group.index[pos]
+                key = keys[pos]
+                close = round(float(df.loc[idx, "close"]), 2)
+                if prev_close is not None and key != prev_key and close == prev_close:
+                    close = round(prev_close + 0.01, 2)
+                    df.loc[idx, "close"] = close
+                    if "high" in df.columns:
+                        df.loc[idx, "high"] = max(float(df.loc[idx, "high"]), close)
+                    if "low" in df.columns:
+                        df.loc[idx, "low"] = min(float(df.loc[idx, "low"]), close)
+                prev_close, prev_key = close, key
+        return df
+
     def inject_unit_change(self, df, change_point):
         df = df.copy().reset_index(drop=True)
         df.loc[change_point:, PRICE_COLS] = (df.loc[change_point:, PRICE_COLS] * 100).round(2)
-        date_str = df.iloc[change_point]["date"].strftime("%Y-%m-%d")
-        return df, f"unit_change_{date_str}_dollars_to_cents"
+        return df, f"unit_change_{self._row_label(df, change_point)}_dollars_to_cents"
 
     def inject_reverse_split(self, df, multiple=3, add_adj_close=False):
         """Exact integer reverse split: post-split prices x multiple, volume / multiple."""
@@ -152,7 +210,7 @@ class HardTaskGenerator:
         idx = random.randint(20, len(df) - 20)
         df.loc[idx:, PRICE_COLS] = (df.loc[idx:, PRICE_COLS] * multiple).round(2)
         df.loc[idx:, "volume"] = (df.loc[idx:, "volume"] // multiple).astype(int)
-        date_str = df.iloc[idx]["date"].strftime("%Y-%m-%d")
+        date_str = self._row_label(df, idx)
         problems = [f"reverse_split_{date_str}_1-for-{multiple}"]
         if add_adj_close:
             df, p = self.add_adj_close_conflict(df, multiple=multiple)
@@ -216,6 +274,8 @@ class HardTaskGenerator:
             else:
                 src["timestamp"] = instant.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
             out = pd.concat([out, src.to_frame().T], ignore_index=True)
+        for col in [*PRICE_COLS, "volume"]:
+            out[col] = pd.to_numeric(out[col])
         return out, "timezone_mixed_offsets_repeated_instant"
 
     def make_column_order_csv(self, df, split_point):
@@ -262,6 +322,7 @@ class HardTaskGenerator:
 
     def _clean_series(self, df):
         df = df.copy().sort_values("date").reset_index(drop=True)
+        df = df.drop_duplicates(subset=["date"], keep="first").reset_index(drop=True)
         if "currency" in df.columns:
             df["close"] = df["close"].astype(float) * df["fx_rate"].astype(float)
         return self._adjust_shifts(df)
@@ -307,24 +368,59 @@ class HardTaskGenerator:
         return datetime(2024, 1, 1) + timedelta(days=random.randint(0, 60))
 
     _BUNDLES = {
-        "portfolio": [["reverse_split", "out_of_order"], ["currency", "reverse_split"],
-                      ["adj_close", "out_of_order"], ["currency", "adj_close", "out_of_order"],
-                      ["reverse_split", "adj_close"], ["currency", "out_of_order"]],
-        "max_drawdown": [["unit_change", "out_of_order"], ["unit_change", "column_order"],
-                         ["reverse_split", "out_of_order"],
-                         ["reverse_split", "column_order", "adj_close"],
-                         ["out_of_order", "column_order"],
-                         ["unit_change", "out_of_order", "column_order"]],
-        "beta": [["currency", "reverse_split", "adj_close"], ["currency", "out_of_order"],
-                 ["reverse_split", "adj_close", "out_of_order"], ["currency", "adj_close"],
-                 ["reverse_split", "out_of_order"]],
-        "dst": [["timezone", "out_of_order"], ["timezone", "column_order"],
-                ["timezone", "out_of_order", "column_order"]],
-        "volatility": [["reverse_split", "adj_close"], ["reverse_split", "column_order"],
-                       ["unit_change", "out_of_order"], ["unit_change", "column_order"],
-                       ["out_of_order", "column_order"], ["reverse_split", "out_of_order"],
-                       ["adj_close", "column_order"]],
+        "portfolio": [["reverse_split"], ["out_of_order"], ["currency"], ["unit_change"],
+                      ["adj_close", "out_of_order"], ["reverse_split", "currency"],
+                      ["out_of_order", "currency", "adj_close"], ["reverse_split", "adj_close"],
+                      ["column_order", "out_of_order"], ["unit_change", "out_of_order"],
+                      ["reverse_split", "out_of_order", "currency", "adj_close"],
+                      ["column_order", "currency"]],
+        "max_drawdown": [["unit_change"], ["reverse_split", "adj_close"], ["out_of_order"],
+                         ["column_order"], ["missing"],
+                         ["unit_change", "out_of_order"], ["duplicate", "column_order"],
+                         ["reverse_split", "out_of_order"], ["adj_close", "column_order"],
+                         ["unit_change", "missing", "out_of_order", "column_order"],
+                         ["reverse_split", "unit_change"], ["duplicate", "out_of_order"]],
+        "beta": [["currency"], ["reverse_split"], ["adj_close", "out_of_order"],
+                 ["currency", "reverse_split", "adj_close"], ["unit_change", "out_of_order"],
+                 ["column_order", "currency"], ["missing", "reverse_split"],
+                 ["duplicate", "adj_close"],
+                 ["currency", "out_of_order", "unit_change", "adj_close"],
+                 ["reverse_split", "column_order"]],
+        "dst": [["timezone"], ["timezone", "out_of_order"], ["timezone", "column_order"],
+                ["timezone", "adj_close"], ["timezone", "currency"], ["timezone", "unit_change"],
+                ["timezone", "duplicate"], ["timezone", "missing"],
+                ["timezone", "out_of_order", "column_order", "adj_close"],
+                ["timezone", "reverse_split"]],
+        "volatility": [["unit_change"], ["reverse_split", "adj_close"], ["out_of_order"],
+                       ["column_order", "missing"], ["duplicate"], ["adj_close", "column_order"],
+                       ["unit_change", "out_of_order", "column_order"],
+                       ["reverse_split", "out_of_order"], ["missing", "adj_close"],
+                       ["unit_change", "duplicate"], ["reverse_split", "unit_change"]],
     }
+
+    def _apply_series_bundle(self, df, bundle):
+        """Apply a bundle to one series; shifts always precede shuffling."""
+        problems = []
+        if "duplicate" in bundle:
+            df, p = self.inject_duplicate_row(df)
+            problems.append(p)
+        if "missing" in bundle:
+            df, p = self.inject_missing_row(df)
+            problems.append(p)
+        if "unit_change" in bundle:
+            df, p = self.inject_unit_change(df, random.randint(30, len(df) - 30))
+            problems.append(p)
+        if "reverse_split" in bundle:
+            df, ps = self.inject_reverse_split(
+                df, multiple=random.choice([3, 10]), add_adj_close="adj_close" in bundle)
+            problems.extend(ps)
+        elif "adj_close" in bundle:
+            df, p = self.add_adj_close_conflict(df)
+            problems.append(p)
+        if "out_of_order" in bundle:
+            df, p = self.inject_out_of_order_rows(df, 4)
+            problems.append(p)
+        return df, problems
 
     def _bundle(self, kind):
         # Cycle through a seeded shuffle of the bundle deck so a run of tasks
@@ -348,14 +444,8 @@ class HardTaskGenerator:
         if len(set().union(*date_sets)) > len(set.intersection(*date_sets)):
             problems.append("calendar_misalignment_US_EU_holidays")
         bundle = self._bundle("portfolio")
-        if "out_of_order" in bundle:
-            t = random.choice(tickers)
-            dfs[t], p = self.inject_out_of_order_rows(dfs[t], 3)
-            problems.append(p)
-        if "reverse_split" in bundle:
-            t = random.choice(tickers)
-            dfs[t], ps = self.inject_reverse_split(dfs[t], multiple=random.choice([3, 10]))
-            problems.extend(ps)
+        while problems and len(bundle) > 3:  # keep total key size <= 4 with calendar
+            bundle = self._bundle("portfolio")
         if "currency" in bundle:
             t = random.choice(tickers)
             dfs[t] = self.add_currency_columns(dfs[t], "EUR")
@@ -363,11 +453,32 @@ class HardTaskGenerator:
                 if other != t:
                     dfs[other] = self.add_currency_columns(dfs[other], "USD")
             problems.append(f"currency_mismatch_{t}_EUR")
+        # Price-level shifts must be injected before any row shuffling, so a
+        # swapped row can never land on the wrong side of a split.
+        if "unit_change" in bundle:
+            t = random.choice(tickers)
+            dfs[t], p = self.inject_unit_change(
+                dfs[t], random.randint(30, len(dfs[t]) - 30))
+            problems.append(p)
+        if "reverse_split" in bundle:
+            t = random.choice(tickers)
+            dfs[t], ps = self.inject_reverse_split(dfs[t], multiple=random.choice([3, 10]))
+            problems.extend(ps)
         if "adj_close" in bundle:
             t = random.choice(tickers)
             dfs[t], p = self.add_adj_close_conflict(dfs[t])
             problems.append(p)
+        if "out_of_order" in bundle:
+            t = random.choice(tickers)
+            dfs[t], p = self.inject_out_of_order_rows(dfs[t], 3)
+            problems.append(p)
+        for t in tickers:
+            dfs[t] = self.dedupe_stale_closes(dfs[t])
         combined = pd.concat(dfs.values(), ignore_index=True)
+        if "column_order" in bundle:
+            combined, p = self.make_column_order_csv(
+                combined, random.randint(30, len(combined) - 30))
+            problems.append(p)
         ret, n_days = self.compute_equal_weight_portfolio_return(dfs)
         expected = {"portfolio_return": round(ret, 6), "num_assets": len(tickers),
                     "num_aligned_days": n_days, "problems_found": sorted(problems)}
@@ -393,19 +504,9 @@ portfolio_return = final portfolio value - 1.0."""
         ticker = random.choice(["TECH_A", "ENERGY_B", "FINANCE_C"])
         df = self.generate_clean_prices_multi_asset([ticker], self._start(),
                                                     random.randint(100, 140))[ticker]
-        problems = []
         bundle = self._bundle("max_drawdown")
-        if "unit_change" in bundle:
-            df, p = self.inject_unit_change(df, random.randint(30, len(df) - 30))
-            problems.append(p)
-        if "reverse_split" in bundle:
-            df, ps = self.inject_reverse_split(
-                df, multiple=random.choice([3, 10]),
-                add_adj_close="adj_close" in bundle)
-            problems.extend(ps)
-        if "out_of_order" in bundle:
-            df, p = self.inject_out_of_order_rows(df, 4)
-            problems.append(p)
+        df, problems = self._apply_series_bundle(df, bundle)
+        df = self.dedupe_stale_closes(df)
         payload = df
         if "column_order" in bundle:
             payload, p = self.make_column_order_csv(df, random.randint(30, len(df) - 30))
@@ -435,6 +536,16 @@ and cleaning."""
             asset = self.add_currency_columns(asset, "EUR")
             bench = self.add_currency_columns(bench, "USD")
             problems.append("currency_mismatch_ACME_EUR")
+        if "duplicate" in bundle:
+            asset, p = self.inject_duplicate_row(asset)
+            problems.append(p)
+        if "missing" in bundle:
+            bench, p = self.inject_missing_row(bench)
+            problems.append(p)
+        # Shifts before shuffling.
+        if "unit_change" in bundle:
+            asset, p = self.inject_unit_change(asset, random.randint(30, len(asset) - 30))
+            problems.append(p)
         if "reverse_split" in bundle:
             asset, ps = self.inject_reverse_split(
                 asset, multiple=random.choice([3, 10]),
@@ -444,13 +555,18 @@ and cleaning."""
             asset, p = self.add_adj_close_conflict(asset)
             problems.append(p)
         if "out_of_order" in bundle:
-            target = random.choice(["asset", "bench"])
-            if target == "asset":
+            if random.choice([True, False]):
                 asset, p = self.inject_out_of_order_rows(asset, 3)
             else:
                 bench, p = self.inject_out_of_order_rows(bench, 3)
             problems.append(p)
+        asset = self.dedupe_stale_closes(asset)
+        bench = self.dedupe_stale_closes(bench)
         combined = pd.concat([asset, bench], ignore_index=True)
+        if "column_order" in bundle:
+            combined, p = self.make_column_order_csv(
+                combined, random.randint(30, len(combined) - 30))
+            problems.append(p)
         clean_a = self._clean_series(asset)
         clean_b = self._clean_series(bench)
         frame = pd.DataFrame({"asset": clean_a.set_index("date")["close"],
@@ -479,9 +595,40 @@ ddof=1). mean_beta is the arithmetic mean of those window betas."""
         bundle = self._bundle("dst")
         intra, p = self.inject_mixed_timezone_intraday(df, repeat_instant=True)
         problems = [p]
+        if "duplicate" in bundle:
+            intra, p = self.inject_duplicate_row(intra)
+            problems.append(p)
+        if "missing" in bundle:
+            intra, p = self.inject_missing_row(intra)
+            problems.append(p)
+        if "currency" in bundle:
+            rate, rates = 1.08, {}
+            for stamp in intra["timestamp"]:
+                day = pd.Timestamp(stamp).tz_convert(NY).date() \
+                    if pd.Timestamp(stamp).tzinfo else pd.Timestamp(stamp).date()
+                if day not in rates:
+                    rate = max(0.5, rate * random.uniform(0.995, 1.005))
+                    rates[day] = round(rate, 6)
+            intra["currency"] = "EUR"
+            intra["fx_rate"] = [rates[pd.Timestamp(s).tz_convert(NY).date()
+                                    if pd.Timestamp(s).tzinfo else pd.Timestamp(s).date()]
+                                for s in intra["timestamp"]]
+            problems.append("currency_mismatch_INTR_EUR")
+        # Shifts before shuffling.
+        if "unit_change" in bundle:
+            intra, p = self.inject_unit_change(intra, random.randint(20, len(intra) - 20))
+            problems.append(p)
+        if "reverse_split" in bundle:
+            intra, ps = self.inject_reverse_split(
+                intra, multiple=random.choice([3, 10]), add_adj_close="adj_close" in bundle)
+            problems.extend(ps)
+        elif "adj_close" in bundle:
+            intra, p = self.add_adj_close_conflict(intra)
+            problems.append(p)
         if "out_of_order" in bundle:
             intra, p = self.inject_out_of_order_rows(intra, 4)
             problems.append(p)
+        intra = self.dedupe_stale_closes(intra, order_col="timestamp")
         payload = intra
         if "column_order" in bundle:
             payload, p = self.make_column_order_csv(intra, random.randint(20, len(intra) - 20))
@@ -506,10 +653,11 @@ daily closes."""
                 "data_file": f"task_h_{self.task_id:03d}.csv", "expected": expected}
         return task, payload
 
-    @staticmethod
-    def _daily_closes_from_intraday(intra):
+    @classmethod
+    def _daily_closes_from_intraday(cls, intra):
         seen = set()
         records = []
+        has_fx = "currency" in intra.columns
         for _, row in intra.iterrows():
             instant = pd.Timestamp(row["timestamp"])
             if instant.tzinfo is None:
@@ -519,10 +667,13 @@ daily closes."""
             if key in seen:
                 continue
             seen.add(key)
-            records.append((instant, float(row["close"])))
+            close = float(row["close"]) * (float(row["fx_rate"]) if has_fx else 1.0)
+            records.append((instant, close))
         records.sort(key=lambda r: r[0])
+        adjusted = cls._adjust_shifts(pd.DataFrame(
+            {"close": [c for _, c in records]}))["close"].tolist()
         daily = {}
-        for instant, close in records:
+        for (instant, _), close in zip(records, adjusted, strict=True):
             daily[instant.date()] = close
         return pd.Series([daily[d] for d in sorted(daily)], dtype=float)
 
@@ -531,22 +682,9 @@ daily closes."""
         ticker = random.choice(["TECH_A", "ENERGY_B", "FINANCE_C"])
         df = self.generate_clean_prices_multi_asset([ticker], self._start(),
                                                     random.randint(90, 120))[ticker]
-        problems = []
         bundle = self._bundle("volatility")
-        if "unit_change" in bundle:
-            df, p = self.inject_unit_change(df, random.randint(30, len(df) - 30))
-            problems.append(p)
-        if "reverse_split" in bundle:
-            df, ps = self.inject_reverse_split(
-                df, multiple=random.choice([3, 10]),
-                add_adj_close="adj_close" in bundle)
-            problems.extend(ps)
-        elif "adj_close" in bundle:
-            df, p = self.add_adj_close_conflict(df)
-            problems.append(p)
-        if "out_of_order" in bundle:
-            df, p = self.inject_out_of_order_rows(df, 4)
-            problems.append(p)
+        df, problems = self._apply_series_bundle(df, bundle)
+        df = self.dedupe_stale_closes(df)
         payload = df
         if "column_order" in bundle:
             payload, p = self.make_column_order_csv(df, random.randint(30, len(df) - 30))

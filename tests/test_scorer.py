@@ -205,9 +205,18 @@ class TestNewNegationPhrases:
 
     def test_besides_and_instead(self):
         from src.scorer import categories_for_text
-        assert 'duplicate' in categories_for_text('No issues besides a duplicate instant')
+        # A repeated instant is the timezone category, not a duplicate row.
+        assert categories_for_text('No issues besides a duplicate instant') == {'timezone'}
         got = categories_for_text('no reverse split - prices are in cents instead')
         assert 'unit_change' in got and 'split' not in got and 'reverse_split' not in got
+
+    def test_code_none_and_but_missing(self):
+        from src.scorer import categories_for_items, categories_for_text
+        assert 'split' not in categories_for_items(['split: none detected'])
+        assert 'reverse_split' not in categories_for_items(['reverse_split: not present'])
+        assert 'missing' not in categories_for_items(['missing: 0 days'])
+        got = categories_for_text('not a duplicate but a missing day')
+        assert 'missing' in got and 'duplicate' not in got
 
 
 class TestStructuredF1:
@@ -251,6 +260,56 @@ class TestStructuredF1:
                  'problems': bad_problems}))
             assert result['passed'] is False
             assert result['component_scores']['problems'] == 0.0
+
+
+class TestGuessBaselines:
+    """A fixed guess per task type, or pasting every code, must rarely pass.
+
+    Passing requires exact problem-set identification (F1 = 1.0), so the
+    guess pass rate is the fraction of tasks whose key set exactly equals
+    the guessed set (with correct numbers assumed).
+    """
+
+    def test_guess_baselines_seeds_1_to_40(self):
+        from collections import Counter, defaultdict
+
+        from src.generate_tasks import TaskGenerator
+        from src.hard_tier import HardTaskGenerator
+        from src.scorer import categories_for_items
+
+        hard_by_type = defaultdict(list)
+        for seed in range(1, 41):
+            gen = HardTaskGenerator(seed=seed)
+            for maker in gen.task_generators():
+                task, _payload = maker()
+                hard_by_type[task['type']].append(
+                    frozenset(categories_for_items(task['expected']['problems_found'])))
+
+        all_codes = ['duplicate', 'missing', 'bad_price', 'split', 'reverse_split',
+                     'unit_change', 'out_of_order', 'timezone', 'currency', 'adj_close',
+                     'column_order', 'calendar']
+        total, fixed_passes, paste_passes = 0, 0, 0
+        for _type, sets in hard_by_type.items():
+            most_common, count = Counter(sets).most_common(1)[0]
+            assert count / len(sets) <= 0.20, (_type, most_common, count, len(sets))
+            fixed_passes += count
+            paste_passes += sum(1 for s in sets if s == frozenset(
+                categories_for_items(all_codes)))
+            total += len(sets)
+        assert fixed_passes / total <= 0.20
+        assert paste_passes / total <= 0.02
+
+        easy_sets = []
+        for seed in range(1, 41):
+            gen = TaskGenerator(seed=seed)
+            for maker in (gen.generate_task_return_calculation, gen.generate_task_backtest,
+                          gen.generate_task_volatility):
+                task, _df = maker()
+                easy_sets.append(frozenset(categories_for_items(task['expected']['problems_found'])))
+        easy_paste = sum(1 for s in easy_sets
+                         if s == frozenset(categories_for_items(
+                             ['duplicate', 'missing', 'bad_price', 'split'])))
+        assert easy_paste / len(easy_sets) <= 0.02
 
 
 class TestHardNumericScoring:

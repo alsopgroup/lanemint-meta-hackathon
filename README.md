@@ -149,7 +149,7 @@ This creates:
 | **Problem Types** | Duplicates, missing days, bad ticks, 2:1 splits | Misaligned calendars, mixed-timezone intraday bars, unit changes, currency conversion, reverse splits (1-for-3, 1-for-10), out-of-order rows, conflicting `adj_close`, column-order changes |
 | **Prompt Style** | Lists expected problems and cleaning rules | Gives one fixed list of possible issue categories plus general rules that apply whichever are present, then the exact analytic definition; it does not say which issues a file contains |
 | **Analytics** | Mean/sample-std of returns, total return, annualised volatility | Equal-weight portfolio (inner-join alignment, holdings drift, reset every 20 return observations), max drawdown, rolling 20-observation beta, intraday-to-daily volatility |
-| **Problem Count** | 2-3 problems per task | 2-3 problems per task |
+| **Problem Count** | 2-3 problems per task | 1-4 problems per task (drawn per task) |
 | **Task IDs** | `task_001`, `task_002`, ... | `task_h_1001`, `task_h_1002`, ... |
 
 **Important**: The default seed 42 is reserved for the evaluation set. Use different seeds when generating training data to avoid train/eval overlap:
@@ -291,13 +291,13 @@ Each easy task contains 2-3 problems. Prompts list which problem types may be pr
 
 The hard tier uses general, textbook data-quality problems. It does not use delisted stocks/survivorship, ticker renames, dividends, stale or repeated prices, or too-short history. Consecutive closes for a ticker are never identical, and OHLC bars are internally consistent (`low ≤ open, close ≤ high`).
 
-The default 25 hard tasks cycle through five task types, five of each. For every task, a bundle of 2–3 problems is drawn (seeded) from those compatible with that task's analytic — plus calendar misalignment for portfolio tasks only when the tickers' date sets really differ — so the problem set is not fixed by task type:
+The default 25 hard tasks cycle through five task types, five of each. For every task, a bundle of 1–4 problems is drawn (seeded) from those compatible with that task's analytic, so the problem set is not fixed by task type. Calendar misalignment is labelled for portfolio tasks only when the tickers' date sets really differ, and counts toward that task's total, so every hard key lists between 1 and 4 categories:
 
-1. **Multi-asset portfolio** (3 tickers) - equal-weight portfolio with inner-join alignment, holdings drifting and resetting every 20 return observations. Compatible problems: US/European calendar misalignment (only labelled when the tickers' date sets really differ), out-of-order rows, a reverse split, EUR quotation with a per-date `fx_rate` column (USD per EUR), conflicting `adj_close`
-2. **Max drawdown** - maximum drawdown from the running peak. Compatible problems: dollars-to-cents unit change, reverse split, out-of-order rows, conflicting `adj_close`, a second header block with reordered columns partway through the file
-3. **Rolling beta** - mean of rolling 20-observation betas against the IDX benchmark. Compatible problems: EUR/`fx_rate` currency conversion, reverse split, conflicting `adj_close`, out-of-order rows
-4. **Intraday timezone/DST** - bars at 01:00–20:00 New-York time across the March 2024 spring-forward, timestamps mixing UTC and offset forms (the 20:00 bar's UTC date is the next day), one instant repeated in a second textual form; the daily close is the last bar per New-York date. Compatible extra problems: out-of-order rows, reordered second header block
-5. **Single-asset volatility** - annualised volatility. Compatible problems: unit change, reverse split, conflicting `adj_close`, out-of-order rows, reordered second header block
+1. **Multi-asset portfolio** (3 tickers) - equal-weight portfolio with inner-join alignment, holdings drifting and resetting every 20 return observations. Compatible problems: US/European calendar misalignment (only labelled when the tickers' date sets really differ), out-of-order rows, reverse split, unit change, EUR quotation with a per-date `fx_rate` column (USD per EUR), conflicting `adj_close`, reordered second header block
+2. **Max drawdown** - maximum drawdown from the running peak. Compatible problems: dollars-to-cents unit change, reverse split, out-of-order rows, conflicting `adj_close`, duplicate row, missing row, a second header block with reordered columns partway through the file
+3. **Rolling beta** - mean of rolling 20-observation betas against the IDX benchmark. Compatible problems: EUR/`fx_rate` currency conversion, reverse split, unit change, conflicting `adj_close`, out-of-order rows, duplicate row, missing row, reordered second header block
+4. **Intraday timezone/DST** - bars at 01:00–20:00 New-York time across the March 2024 spring-forward, timestamps mixing UTC and offset forms (the 20:00 bar's UTC date is the next day), one instant repeated in a second textual form; the daily close is the last bar per New-York date. Compatible extra problems: out-of-order rows, reordered second header block, conflicting `adj_close`, currency conversion, unit change, reverse split, duplicate bar, missing bar
+5. **Single-asset volatility** - annualised volatility. Compatible problems: unit change, reverse split, conflicting `adj_close`, out-of-order rows, duplicate row, missing row, reordered second header block
 
 Reverse splits multiply prices by exactly 3 or exactly 10; the prompts state that an observed sustained jump is snapped to whichever of the candidate ratios {3, 10} is relatively closest. Scaled values are rounded to 2 decimals, so no float artefacts mark the changed rows.
 
@@ -305,7 +305,9 @@ Every hard prompt carries the same fixed list of possible issue categories and t
 
 ### Problem identification scoring
 
-Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. A task cannot pass on numbers alone: its problem-identification component must also reach 0.5.
+Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. Passing a task requires the problem set to be identified exactly (F1 = 1.0) in addition to the numeric threshold, so a guessed or partial category set cannot pass with correct numbers alone.
+
+> **Format change:** the easy tier previously asked for a free-text `problems_found` list and now asks for the `problems` code array. Easy-tier results produced with the earlier prompts are therefore not directly comparable and need re-running under the current prompts (old responses are still scored through the free-text fallback).
 
 ### Generating and scoring the hard tier
 

@@ -61,7 +61,7 @@ class TestHardTaskGenerator:
             for t in tasks:
                 key = json.loads((out / "answers" / f"{t['id']}_answer.json").read_text())
                 all_problems.extend(key["problems_found"])
-                assert 2 <= len(key["problems_found"]) <= 4
+                assert 1 <= len(key["problems_found"]) <= 4
         joined = " ".join(all_problems).lower()
         for marker in ["calendar", "out_of_order", "reverse_split", "unit_change",
                        "currency", "adj_close", "timezone", "column_order"]:
@@ -139,9 +139,9 @@ class TestHardTaskGenerator:
                             continue
                         for _, g in frame.groupby("ticker"):
                             g = g.sort_values("date")
-                            closes = [float(c) for c in g["close"]]
-                            assert all(a != b for a, b in
-                                       zip(closes, closes[1:], strict=False)), (seed, t["id"])
+                            rows = list(zip(g["date"], g["close"], strict=True))
+                            for (d1, c1), (d2, c2) in zip(rows, rows[1:], strict=False):
+                                assert d1 == d2 or float(c1) != float(c2), (seed, t["id"])
 
     def test_ohlc_consistent(self):
         for seed in range(20):
@@ -229,6 +229,72 @@ class TestHandComputed:
         dfs = gen.generate_clean_prices_multi_asset(["T"], datetime(2024, 1, 1), 60)
         _, problem = gen.inject_out_of_order_rows(dfs["T"], num_swaps=3)
         assert problem.endswith("3_swaps")
+
+
+def _assert_no_stale(frame):
+    if "timestamp" in frame.columns:
+        for _, g in frame.groupby("ticker"):
+            bars = sorted(
+                (pd.Timestamp(s).tz_convert("America/New_York")
+                 if pd.Timestamp(s).tzinfo else pd.Timestamp(s).tz_localize("UTC"),
+                 float(c))
+                for s, c in zip(g["timestamp"], g["close"], strict=True))
+            for (t1, c1), (t2, c2) in zip(bars, bars[1:], strict=False):
+                assert t1 == t2 or c1 != c2, "stale intraday close"
+    else:
+        for _, g in frame.groupby("ticker"):
+            rows = sorted(zip(pd.to_datetime(g["date"]), g["close"], strict=True),
+                          key=lambda r: r[0])  # stable: keeps file order within a date
+            for (d1, c1), (d2, c2) in zip(rows, rows[1:], strict=False):
+                assert d1 == d2 or float(c1) != float(c2), "stale daily close"
+
+
+class TestFinalCsvScans:
+    def test_hard_no_undeclared_jumps_and_no_stale_seeds_1_to_200(self):
+        from tests.independent_solver import read_csv_any
+        for seed in range(1, 201):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen_tasks(seed, 5, tmp)
+                for t in tasks:
+                    key = json.loads((out / "answers" / f"{t['id']}_answer.json").read_text())
+                    frame = read_csv_any(out / t["data_file"])
+                    _assert_no_stale(frame)
+                    shifts = sum(1 for p in key["problems_found"]
+                                 if p.startswith(("reverse_split", "unit_change")))
+                    jumps = 0
+                    col = "timestamp" if "timestamp" in frame.columns else "date"
+                    for _, g in frame.groupby("ticker"):
+                        if col == "date":
+                            g = g.drop_duplicates(subset=["date"])
+                            closes = [float(c) for c in
+                                      g.sort_values("date")["close"]]
+                        else:
+                            closes = [float(c) for _, c in sorted(
+                                (pd.Timestamp(s), c) for s, c in
+                                zip(g["timestamp"], g["close"], strict=True))]
+                        # de-duplicate identical instants for DST
+                        if col == "timestamp":
+                            seen, uniq = set(), []
+                            for s, c in sorted((pd.Timestamp(s), float(c)) for s, c in
+                                               zip(g["timestamp"], g["close"], strict=True)):
+                                if s not in seen:
+                                    seen.add(s)
+                                    uniq.append(c)
+                            closes = uniq
+                        for a, b in zip(closes, closes[1:], strict=False):
+                            if a > 0 and (b / a >= 2 or b / a <= 0.5):
+                                jumps += 1
+                    assert jumps <= shifts, (seed, t["id"], jumps, shifts, key)
+
+    def test_easy_no_stale_final_csvs_seeds_1_to_200(self):
+        from src.generate_tasks import TaskGenerator
+        for seed in range(1, 201):
+            with tempfile.TemporaryDirectory() as tmp:
+                gen = TaskGenerator(seed=seed)
+                tasks = gen.generate_all_tasks(Path(tmp), num_tasks=5)
+                for t in tasks:
+                    frame = pd.read_csv(Path(tmp) / t["data_file"])
+                    _assert_no_stale(frame)
 
 
 class TestIndependentSolver:
