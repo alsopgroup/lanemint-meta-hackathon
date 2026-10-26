@@ -13,7 +13,12 @@ Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [Lane
 
 ## Overview
 
-Test language models on their ability to detect and handle data quality issues in financial time series. Each task provides synthetic market data with intentional problems (duplicate rows, missing days, bad prices, unadjusted stock splits) and asks the model to identify issues and compute metrics. A deterministic scorer validates responses with detailed feedback.
+Test language models on their ability to detect and handle data quality issues in financial time series. The benchmark offers two difficulty tiers:
+
+- **Easy tier**: Baseline tasks with clear problems (duplicates, missing days, bad prices, 2:1 splits) and explicit cleaning rules
+- **Hard tier**: Complex multi-problem scenarios (multi-asset panels, timezone/DST issues, unit changes, reverse splits, harder analytics) where prompts state computation rules but don't enumerate problems
+
+Each task asks the model to identify issues and compute metrics. A deterministic scorer validates responses with detailed feedback.
 
 ### Workflow
 
@@ -37,7 +42,8 @@ graph LR
 
 ### Key Features
 
-- 🎯 **~25 synthetic tasks** with known data quality issues
+- 🎯 **Two difficulty tiers**: Easy (baseline) and Hard (more problems per task, combined)
+- 📊 **25 tasks per tier by default** with known data quality issues
 - ✅ **Deterministic scoring** with detailed per-problem feedback
 - 🧪 **Dry-run mode** for safe testing without API costs
 - 🔧 **Local fine-tuning** targeting open-weights Muse Glimmer (30B)
@@ -119,28 +125,45 @@ The API is OpenAI-compatible. Available models: `muse-spark-1.3` (default), `mus
 Create synthetic market data tasks with quality issues:
 
 ```bash
+# Generate easy tier (default)
 python -m src.generate_tasks
+
+# Generate hard tier
+python -m src.generate_tasks --tier hard
 ```
 
 This creates:
-- `tasks/tasks.json` - Task definitions and prompts
-- `tasks/task_*.csv` - Dirty market data CSV files
-- `tasks/answers/` - Expected answers (hidden from model)
+- Easy tier (default output `tasks/`): `tasks/tasks.json`, `tasks/task_*.csv`, `tasks/answers/`
+- Hard tier (default output `tasks_hard/`, so it does not overwrite the easy set): `tasks_hard/tasks.json`, `tasks_hard/task_h_*.csv`, `tasks_hard/answers/`
 
 **Options**:
+- `--tier {easy,hard}`: Difficulty tier (default: easy)
 - `--seed SEED`: Random seed for reproducibility (default: 42)
 - `--count COUNT`: Number of tasks to generate (default: 25)
-- `--output-dir DIR`: Output directory (default: tasks/)
+- `--output-dir DIR`: Output directory (default: `tasks/` for easy, `tasks_hard/` for hard)
+
+#### Tier Comparison
+
+| Aspect | Easy Tier | Hard Tier |
+|--------|-----------|-----------|
+| **Problem Types** | Duplicates, missing days, bad ticks, 2:1 splits | Misaligned calendars, mixed-timezone intraday bars, unit changes, currency conversion, reverse splits (1-for-3, 1-for-10), out-of-order rows, conflicting `adj_close`, column-order changes |
+| **Prompt Style** | Lists expected problems and cleaning rules | Gives one fixed list of possible issue categories plus general rules that apply whichever are present, then the exact analytic definition; it does not say which issues a file contains |
+| **Analytics** | Mean/sample-std of returns, total return, annualised volatility | Equal-weight portfolio (inner-join alignment, holdings drift, reset every 20 return observations), max drawdown, rolling 20-observation beta, intraday-to-daily volatility |
+| **Problem Count** | 2-3 problems per task | 1-4 problems per task (drawn per task) |
+| **Task IDs** | `task_001`, `task_002`, ... | `task_h_1001`, `task_h_1002`, ... |
 
 **Important**: The default seed 42 is reserved for the evaluation set. Use different seeds when generating training data to avoid train/eval overlap:
 
 ```bash
-# Evaluation set (seed 42, default)
+# Easy tier evaluation set (seed 42, default)
 python -m src.generate_tasks
+
+# Hard tier evaluation set (seed 42)
+python -m src.generate_tasks --tier hard
 
 # Training data (different seeds)
 python -m src.generate_tasks --seed 100 --count 100 --output-dir train_tasks_100
-python -m src.generate_tasks --seed 200 --count 100 --output-dir train_tasks_200
+python -m src.generate_tasks --tier hard --seed 200 --count 50 --output-dir train_hard_200
 ```
 
 ### 2. Run Tasks (Dry Run)
@@ -229,13 +252,16 @@ python -m src.scorer output/finetuned/results.json
 │       └── test.yml              # CI/CD configuration
 ├── src/
 │   ├── __init__.py
-│   ├── generate_tasks.py         # Task and data generator
+│   ├── generate_tasks.py         # Task and data generator (easy tier)
+│   ├── hard_tier.py              # Hard tier task generator
 │   ├── scorer.py                 # Deterministic scoring engine (also usable as reward function)
 │   ├── runner.py                 # Model runner with dry-run mode
 │   ├── finetune_prep.py          # Fine-tuning data preparation (SFT/GRPO)
 │   └── finetune.py               # Fine-tuning configuration and validation
 ├── tests/
 │   ├── __init__.py
+│   ├── test_generate_tasks.py    # Easy tier tests
+│   ├── test_hard_tier.py         # Hard tier tests
 │   └── test_scorer.py            # Unit tests for scorer
 ├── tasks/                        # Generated tasks (gitignored)
 ├── output/                       # Model results (gitignored)
@@ -250,14 +276,51 @@ python -m src.scorer output/finetuned/results.json
 
 ## Data Quality Issues
 
-The generator injects these types of problems:
+### Easy Tier
+
+The easy tier injects these problems with explicit cleaning rules stated in prompts:
 
 1. **Duplicate rows** - Same date appears twice
 2. **Missing days** - Gaps in trading day sequence
-3. **Bad prices** - Obvious price errors (10x jump or 90% drop)
-4. **Unadjusted stock splits** - Price discontinuities from splits
+3. **Bad prices** - Obvious price errors (spikes that revert: >50% deviation from both neighbors)
+4. **Unadjusted 2:1 stock splits** - Sustained ~50% price drops requiring adjustment
 
-Each task contains 2-3 random issues. The model must identify and handle them appropriately.
+Each easy task contains 2-3 problems. Prompts list which problem types may be present and provide exact cleaning steps.
+
+### Hard Tier
+
+The hard tier uses general, textbook data-quality problems. It does not use delisted stocks/survivorship, ticker renames, dividends, stale or repeated prices, or too-short history. Consecutive closes for a ticker are never identical, and OHLC bars are internally consistent (`low ≤ open, close ≤ high`).
+
+The default 25 hard tasks cycle through five task types, five of each. For every task, a bundle of 1–4 problems is drawn (seeded) from those compatible with that task's analytic, so the problem set is not fixed by task type. Calendar misalignment is labelled for portfolio tasks only when the tickers' date sets really differ, and counts toward that task's total, so every hard key lists between 1 and 4 categories:
+
+1. **Multi-asset portfolio** (3 tickers) - equal-weight portfolio with inner-join alignment, holdings drifting and resetting every 20 return observations. Compatible problems: US/European calendar misalignment (only labelled when the tickers' date sets really differ), out-of-order rows, reverse split, unit change, EUR quotation with a per-date `fx_rate` column (USD per EUR), conflicting `adj_close`, reordered second header block
+2. **Max drawdown** - maximum drawdown from the running peak. Compatible problems: dollars-to-cents unit change, reverse split, out-of-order rows, conflicting `adj_close`, duplicate row, missing row, a second header block with reordered columns partway through the file
+3. **Rolling beta** - mean of rolling 20-observation betas against the IDX benchmark. Compatible problems: EUR/`fx_rate` currency conversion, reverse split, unit change, conflicting `adj_close`, out-of-order rows, duplicate row, missing row, reordered second header block
+4. **Intraday timezone/DST** - bars at 01:00–20:00 New-York time across the March 2024 spring-forward, timestamps mixing UTC and offset forms (the 20:00 bar's UTC date is the next day), one instant repeated in a second textual form; the daily close is the last bar per New-York date. Compatible extra problems: out-of-order rows, reordered second header block, conflicting `adj_close`, currency conversion, unit change, reverse split, duplicate bar, missing bar
+5. **Single-asset volatility** - annualised volatility. Compatible problems: unit change, reverse split, conflicting `adj_close`, out-of-order rows, duplicate row, missing row, reordered second header block
+
+Reverse splits multiply prices by exactly 3 or exactly 10; the prompts state that an observed sustained jump is snapped to whichever of the candidate ratios {3, 10} is relatively closest. Scaled values are rounded to 2 decimals, so no float artefacts mark the changed rows.
+
+Every hard prompt carries the same fixed list of possible issue categories and the same general rules (parsing, ordering, `close` vs `adj_close`, FX direction, timezone conversion and de-duplication, sustained-shift adjustment with the {3, 10} candidate set, return definition, ddof=1, annualisation, inner-join alignment, rounding), so the prompt does not reveal which issues a given file contains and the answer is determined by the stated rules. An independent solver in `tests/independent_solver.py`, written separately from the reference code, reproduces every key in the test suite.
+
+### Problem identification scoring
+
+Prompts ask for a JSON `problems` array containing only category codes from the fixed list (easy tier: `duplicate`, `missing`, `bad_price`, `split`; hard tier: those plus `reverse_split`, `unit_change`, `out_of_order`, `timezone`, `currency`, `adj_close`, `column_order`, `calendar`). The scorer compares the returned codes with the key's categories using precision and recall (F1), so returning extra codes — including the whole list — lowers the score on both tiers. A legacy free-text `problems_found` array is still accepted as a fallback and is mapped to categories with the same F1 scoring. Passing a task requires the problem set to be identified exactly (F1 = 1.0) in addition to the numeric threshold, so a partial category set fails even with correct numbers. A fixed guess still passes occasionally by luck: as a guessing baseline (not a model result), always answering with the most common category set for the task type, with otherwise-correct numbers, passes about 10% of hard-tier tasks across seeds 1–200. On the easy tier the same fixed guess passes about 57%, because the easy prompts name the problems to look for.
+
+> **Format change:** the easy tier previously asked for a free-text `problems_found` list and now asks for the `problems` code array. Easy-tier results produced with the earlier prompts are therefore not directly comparable and need re-running under the current prompts (old responses are still scored through the free-text fallback).
+
+### Generating and scoring the hard tier
+
+```bash
+# Generate the hard set (writes tasks_hard/, leaving the easy tasks/ set intact)
+python -m src.generate_tasks --tier hard
+
+# Run it (dry-run shown; drop --dry-run with API credentials configured)
+python -m src.runner --tasks-dir tasks_hard --output-dir output/hard --dry-run
+
+# Score it (second argument points the scorer at the hard answers)
+python -m src.scorer output/hard/results.json tasks_hard/answers
+```
 
 ---
 
@@ -326,9 +389,9 @@ Market data is never clean in the real world. Duplicate rows, missing trading da
 
 The deterministic scorer enables both evaluation and reinforcement learning, closing the loop from detection to improvement.
 
-### Optional Tooling
+### Development Note
 
-Meta's **Muse Code** (coding agent) can be used as optional tooling for development workflows, but is not required for the benchmark itself.
+Development of this project switched to Meta's Muse Wonder as the coding model in Cursor during the hard-tier work. Earlier work on the repository was done before that switch, so this note does not describe the tooling used for the whole history.
 
 ---
 

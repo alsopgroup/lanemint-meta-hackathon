@@ -21,7 +21,7 @@ class StubModel:
             'choices': [{
                 'message': {
                     'content': json.dumps({
-                        'problems_found': ['duplicate_row', 'bad_price'],
+                        'problems': ['duplicate', 'bad_price'],
                         'mean_return': 0.001234,
                         'std_return': 0.023456,
                         'total_return': 0.123456,
@@ -229,7 +229,7 @@ def main():
 
     print(f"\n✓ Completed {len(results)} tasks")
     print("\nNext step: Score the results")
-    print(f"  python -m src.scorer {args.output_dir}/results.json")
+    print(f"  python -m src.scorer {args.output_dir}/results.json {args.tasks_dir}/answers")
 
     return 0
 

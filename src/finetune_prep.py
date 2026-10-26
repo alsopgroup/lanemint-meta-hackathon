@@ -38,6 +38,19 @@ class FineTunePrep:
 
         return tasks
 
+    @staticmethod
+    def target_answer(expected: dict) -> dict:
+        """Convert a stored key to the answer format the prompts ask for.
+
+        Stored keys use ``problems_found`` with descriptive strings; prompts
+        ask for a JSON ``problems`` array of category codes.
+        """
+        from src.scorer import categories_for_items
+        answer = {k: v for k, v in expected.items() if k != 'problems_found'}
+        answer = {'problems': sorted(categories_for_items(expected.get('problems_found', []))),
+                  **answer}
+        return answer
+
     def format_for_training(self, task: dict) -> dict:
         """Format a single task as a training example."""
         messages = [
@@ -51,7 +64,7 @@ class FineTunePrep:
             },
             {
                 'role': 'assistant',
-                'content': json.dumps(task['expected'])
+                'content': json.dumps(self.target_answer(task['expected']))
             }
         ]
 

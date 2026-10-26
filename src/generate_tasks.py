@@ -41,27 +41,48 @@ class TaskGenerator:
 
         # Generate OHLC with proper relationships: low <= open,close <= high
         rows = []
+        prev_close = None
         for date, close in zip(dates, prices, strict=False):
-            # Generate high and low around the close price
+            close_r = round(close, 2)
+            if prev_close is not None and close_r == prev_close:
+                close_r = round(prev_close + 0.01, 2)  # never a stale close
             high_mult = random.uniform(1.00, 1.03)
             low_mult = random.uniform(0.97, 1.00)
-            high = close * high_mult
-            low = close * low_mult
-
-            # Open is between low and high
+            high = max(close, close_r) * high_mult
+            low = min(close, close_r) * low_mult
             open_price = random.uniform(low, high)
-
             rows.append({
                 'date': date,
                 'ticker': ticker,
                 'open': round(open_price, 2),
-                'high': round(high, 2),
-                'low': round(low, 2),
-                'close': round(close, 2),
+                'high': round(max(high, close_r), 2),
+                'low': round(min(low, close_r), 2),
+                'close': close_r,
                 'volume': random.randint(1000000, 10000000)
             })
+            prev_close = close_r
 
         return pd.DataFrame(rows)
+
+    @staticmethod
+    def dedupe_stale_closes(df: pd.DataFrame) -> pd.DataFrame:
+        """After all injection, nudge closes repeating the previous distinct date.
+
+        Split rounding can collapse distinct closes into ties; rows sharing
+        the same date (intended duplicates) are exempt.
+        """
+        df = df.copy().reset_index(drop=True)
+        prev_close, prev_date = None, None
+        for idx in range(len(df)):
+            date = df.loc[idx, 'date']
+            close = round(float(df.loc[idx, 'close']), 2)
+            if prev_close is not None and date != prev_date and close == prev_close:
+                close = round(prev_close + 0.01, 2)
+                df.loc[idx, 'close'] = close
+                df.loc[idx, 'high'] = max(float(df.loc[idx, 'high']), close)
+                df.loc[idx, 'low'] = min(float(df.loc[idx, 'low']), close)
+            prev_close, prev_date = close, date
+        return df
 
     def inject_duplicate_row(self, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         """Inject a duplicate row."""
@@ -126,6 +147,7 @@ class TaskGenerator:
         for inject_func in issue_types:
             df, problem = inject_func(df)
             problems.append(problem)
+        df = self.dedupe_stale_closes(df)
 
         # Calculate expected answer using the reference cleaner
         clean_df = self._clean_data(df.copy(), has_split=False)
@@ -144,7 +166,7 @@ The data may contain quality issues such as duplicate rows, missing days,
 or bad price ticks.
 
 Cleaning rules:
-1. Remove duplicate rows (keep first occurrence)
+1. Remove duplicate rows (keep first occurrence): a row is a duplicate if it has the same ticker and the same date as an earlier row
 2. Note any missing trading days but proceed with available data
 3. Remove bad price ticks: a tick is bad if its close price is >50% different from
    BOTH the previous close AND the next close (use a 3-day window to identify outliers)
@@ -153,12 +175,12 @@ Cleaning rules:
 Your task:
 1. Identify and describe any data quality problems
 2. Clean the data using the rules above
-3. Calculate the mean and standard deviation of daily returns
+3. Calculate the mean and sample standard deviation (ddof=1) of daily returns
 
 Return your answer as JSON with fields:
-- problems_found: list of issues you identified (be specific about dates/types)
+- problems: JSON array containing only the category codes that apply, from [duplicate, missing, bad_price, split] (for example ["duplicate"]); list each code at most once and include no others
 - mean_return: mean daily return (6 decimal places)
-- std_return: standard deviation of daily returns (6 decimal places)""",
+- std_return: sample standard deviation (ddof=1) of daily returns (6 decimal places)""",
             'data_file': f'task_{self.task_id:03d}.csv',
             'expected': expected
         }
@@ -187,6 +209,7 @@ Return your answer as JSON with fields:
         for inject_func in issue_types:
             df, problem = inject_func(df)
             problems.append(problem)
+        df = self.dedupe_stale_closes(df)
 
         # Calculate expected answer using reference cleaner
         clean_df = self._clean_data(df.copy(), has_split=has_split)
@@ -209,7 +232,7 @@ The data may contain quality issues such as duplicate rows, bad price ticks,
 or unadjusted stock splits.
 
 Cleaning rules:
-1. Remove duplicate rows (keep first occurrence)
+1. Remove duplicate rows (keep first occurrence): a row is a duplicate if it has the same ticker and the same date as an earlier row
 2. Remove bad price ticks: a tick is bad if its close is >50% different from
    BOTH the previous and next close (identifies spike outliers)
 3. Detect 2-for-1 splits: look for a sustained ~50% drop (ratio between 0.4-0.6)
@@ -223,7 +246,7 @@ Your task:
 3. Report the final cleaned price
 
 Return your answer as JSON with fields:
-- problems_found: list of issues (be specific about dates/types)
+- problems: JSON array containing only the category codes that apply, from [duplicate, missing, bad_price, split] (for example ["duplicate"]); list each code at most once and include no others
 - total_return: (final_price - initial_price) / initial_price (6 decimals)
 - final_price: the last valid close price (2 decimals)""",
             'data_file': f'task_{self.task_id:03d}.csv',
@@ -247,6 +270,7 @@ Return your answer as JSON with fields:
         for inject_func in issue_types:
             df, problem = inject_func(df)
             problems.append(problem)
+        df = self.dedupe_stale_closes(df)
 
         # Calculate expected answer
         clean_df = self._clean_data(df.copy(), has_split=False)
@@ -266,17 +290,17 @@ Return your answer as JSON with fields:
 The data may contain quality issues such as duplicate rows or missing days.
 
 Cleaning rules:
-1. Remove duplicate rows (keep first occurrence)
+1. Remove duplicate rows (keep first occurrence): a row is a duplicate if it has the same ticker and the same date as an earlier row
 2. Note any missing trading days but proceed with available data
-3. Calculate daily returns, then annualized volatility as: std(daily_returns) * sqrt(252)
+3. Calculate daily returns, then annualized volatility as: std(daily_returns, ddof=1) * sqrt(252)
 
 Your task:
 1. Identify and fix data quality problems
-2. Calculate annualized volatility using the formula above
+2. Calculate annualized volatility using the formula above (sample std with ddof=1)
 3. Count the number of valid trading days after cleaning
 
 Return your answer as JSON with fields:
-- problems_found: list of specific issues found
+- problems: JSON array containing only the category codes that apply, from [duplicate, missing, bad_price, split] (for example ["duplicate"]); list each code at most once and include no others
 - annualized_volatility: volatility measure (6 decimals)
 - num_clean_days: number of valid rows after cleaning""",
             'data_file': f'task_{self.task_id:03d}.csv',
@@ -446,8 +470,15 @@ def main():
     parser.add_argument(
         '--output-dir',
         type=Path,
-        default=Path('tasks'),
-        help='Output directory (default: tasks/)'
+        default=None,
+        help='Output directory (default: tasks/ for easy, tasks_hard/ for hard)'
+    )
+    parser.add_argument(
+        '--tier',
+        type=str,
+        choices=['easy', 'hard'],
+        default='easy',
+        help='Difficulty tier: easy (default) or hard'
     )
 
     args = parser.parse_args()
@@ -458,9 +489,17 @@ def main():
         print("   Default seed 42 is reserved for the evaluation set.")
         print("   Use different seeds for training data to avoid train/eval overlap.\n")
 
-    generator = TaskGenerator(seed=args.seed)
-    tasks = generator.generate_all_tasks(args.output_dir, num_tasks=args.count)
-    print(f"Created {len(tasks)} tasks with seed {args.seed}")
+    if args.tier == 'hard':
+        from src.hard_tier import HardTaskGenerator
+        print("Generating HARD tier tasks...")
+        generator = HardTaskGenerator(seed=args.seed)
+    else:
+        print("Generating EASY tier tasks...")
+        generator = TaskGenerator(seed=args.seed)
+
+    output_dir = args.output_dir or (Path('tasks_hard') if args.tier == 'hard' else Path('tasks'))
+    tasks = generator.generate_all_tasks(output_dir, num_tasks=args.count)
+    print(f"Created {len(tasks)} {args.tier} tier tasks with seed {args.seed}")
 
 
 if __name__ == '__main__':
