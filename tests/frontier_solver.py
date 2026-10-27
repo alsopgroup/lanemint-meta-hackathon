@@ -184,10 +184,13 @@ def solve(task, csv_path):
             problems.add("source_conflict")
         aligned = pd.DataFrame(trusted).sort_index().dropna()
         rel = aligned.iloc[-1] / aligned.iloc[0]
+        value = (aligned / aligned.iloc[0]).mean(axis=1)
+        drawdown = (value - value.cummax()) / value.cummax()
         return {"problems": sorted(problems),
                 "mismatch_count": len(conflicts),
                 "first_conflict_date": min(conflicts) if conflicts else None,
                 "reconciled_total_return": round(float(rel.mean() - 1.0), 6),
+                "reconciled_max_drawdown": round(float(drawdown.min()), 6),
                 "num_tickers": len(trusted), "num_aligned_days": len(aligned)}
 
     if kind == "frontier_factor_exposure":

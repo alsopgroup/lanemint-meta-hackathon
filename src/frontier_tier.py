@@ -20,15 +20,24 @@ import numpy as np
 import pandas as pd
 
 FRONTIER_FAMILY_SETTINGS = {
-    # F1: long-history multi-asset rolling risk (plan: 250-750 rows,
-    # 3-6 assets plus an index, 60-day window).
-    "rolling_risk": {"rows": 500, "assets": 4, "window": 60},
+    # F1: multi-asset rolling risk. Pilot calibration (Spark 1.3,
+    # seed 42, two pilots): at 500 rows/4 assets/60-day window and again
+    # at 250 rows/2 assets/20-day window the model emitted placeholders
+    # instead of computing (0/8 across pilots), so the shipped default is
+    # ~120 rows, 2 assets, 10-day window: difficulty lives in the data
+    # problems and exact rolling semantics, not volume. All three knobs
+    # can be raised again per family.
+    "rolling_risk": {"rows": 120, "assets": 2, "window": 10},
     # F2: two-vendor reconciliation (plan knobs: conflicts, rows,
     # unit difference between files -> Vendor B quotes cents).
     "vendor_reconciliation": {"rows": 250, "assets": 3, "conflicts": 12},
     # F3: split-adjusted two-factor exposures (plan knobs: rows,
-    # number of corporate actions; factors fixed at market + sector).
-    "factor_exposure": {"rows": 500, "actions": 3},
+    # number of corporate actions, drawn per task as 1..actions;
+    # factors fixed at market + sector). At 250 rows / 1-2 events the
+    # model still emitted placeholders (0/8 across pilots), so the
+    # shipped default is ~120 rows with exactly 1 explicit split-table
+    # event (actions=1).
+    "factor_exposure": {"rows": 120, "actions": 1},
     # F4: chained portfolio pipeline (plan knobs: assets, rebalances,
     # cost bps). Steps = rebalance interval in return observations.
     "portfolio_pipeline": {"rows": 300, "assets": 4,
@@ -468,12 +477,16 @@ equal-weight portfolio returns."""
         trusted_frames, conflicts = _trusted_and_conflicts()
         aligned = pd.DataFrame(trusted_frames).sort_index().dropna()
         rel = aligned.iloc[-1] / aligned.iloc[0]
+        port_value = (aligned / aligned.iloc[0]).mean(axis=1)
+        port_peak = port_value.cummax()
         problems = [f"source_conflict_{len(conflicts)}_pairs"] + problems \
             if conflicts else problems
         expected = {
             "mismatch_count": len(conflicts),
             "first_conflict_date": min(d for d, _ in conflicts) if conflicts else None,
             "reconciled_total_return": round(float(rel.mean() - 1.0), 6),
+            "reconciled_max_drawdown": round(
+                float(((port_value - port_peak) / port_peak).min()), 6),
             "num_tickers": n_assets, "num_aligned_days": len(aligned),
             "problems_found": sorted(problems),
         }
@@ -495,13 +508,16 @@ series on the inner join. The reconciled portfolio holds equal dollar
 amounts of each ticker from the first aligned date (buy and hold, no
 rebalancing): its value on a date is the mean over tickers of
 close / first aligned close, and reconciled_total_return is the final value
-minus 1."""
+minus 1. reconciled_max_drawdown is the minimum over all aligned dates of
+(value - running maximum value) / running maximum value, so it depends on
+the whole reconciled path, not only the first and last closes."""
         task = {"id": f"task_f_{self.task_id:03d}",
                 "type": "frontier_vendor_reconciliation",
                 "prompt": _prompt(layout, analytic,
                                   "- mismatch_count: integer\n"
                                   "- first_conflict_date: YYYY-MM-DD or null\n"
                                   "- reconciled_total_return: (6 decimals)\n"
+                                  "- reconciled_max_drawdown: (negative decimal, 6 decimals)\n"
                                   "- num_tickers: number of tickers\n"
                                   "- num_aligned_days: dates kept by the inner join"),
                 "data_file": f"task_f_{self.task_id:03d}.csv", "expected": expected}
@@ -511,7 +527,8 @@ minus 1."""
     def generate_task_factor_exposure(self):
         self.task_id += 1
         cfg = self.settings["factor_exposure"]
-        rows, n_actions = cfg["rows"], cfg["actions"]
+        rows = cfg["rows"]
+        n_actions = random.randint(1, max(1, cfg["actions"]))  # 1..actions events (exactly 1 at defaults)
         dates = _business_dates(rows)
         mkt = [random.gauss(0.0003, 0.010) for _ in range(rows - 1)]
         sec = [0.4 * m + random.gauss(0, 0.007) for m in mkt]

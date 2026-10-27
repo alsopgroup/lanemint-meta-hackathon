@@ -28,7 +28,8 @@ FIELDS = {
                               "final_window_volatility", "num_assets",
                               "num_aligned_days"],
     "frontier_vendor_reconciliation": ["mismatch_count", "first_conflict_date",
-                                       "reconciled_total_return", "num_tickers",
+                                       "reconciled_total_return",
+                                       "reconciled_max_drawdown", "num_tickers",
                                        "num_aligned_days"],
     "frontier_factor_exposure": ["alpha", "beta_market", "beta_sector",
                                  "r_squared", "num_return_days", "num_splits"],
@@ -55,12 +56,21 @@ def _score_all(tasks, out):
 
 class TestSettings:
     def test_defaults_taken_from_plan(self):
+        # Pilot-calibrated F1/F3 sizes (see FRONTIER_FAMILY_SETTINGS):
+        # tractable enough that a strong model actually computes, with
+        # difficulty in the data problems and rolling semantics.
         assert FRONTIER_FAMILY_SETTINGS["rolling_risk"] == \
-            {"rows": 500, "assets": 4, "window": 60}
-        assert 250 <= FRONTIER_FAMILY_SETTINGS["rolling_risk"]["rows"] <= 750
+            {"rows": 120, "assets": 2, "window": 10}
         assert FRONTIER_FAMILY_SETTINGS["vendor_reconciliation"]["conflicts"] == 12
-        assert FRONTIER_FAMILY_SETTINGS["factor_exposure"]["actions"] == 3
+        assert FRONTIER_FAMILY_SETTINGS["factor_exposure"] == \
+            {"rows": 120, "actions": 1}
         assert FRONTIER_FAMILY_SETTINGS["portfolio_pipeline"]["rebalance_every"] == 21
+
+    def test_f3_has_exactly_one_split_event(self):
+        for seed in range(1, 41):
+            gen = FrontierTaskGenerator(seed=seed)
+            task, _ = gen.generate_task_factor_exposure()
+            assert task["expected"]["num_splits"] == 1
 
     def test_settings_override_reaches_prompt(self):
         gen = FrontierTaskGenerator(seed=1, settings=SMALL)
@@ -166,6 +176,20 @@ class TestIndependentSolver:
             for task, result in _score_makers_default(seed, 25):
                 assert result["passed"] and result["score"] == 1.0, \
                     (seed, task["id"], result["feedback"])
+                assert result["analysis_flags"] == [], \
+                    (seed, task["id"], result["analysis_flags"])
+
+    def test_reference_answers_produce_no_no_attempt_flags_seeds_1_to_400(self):
+        # The reference (expected) answers themselves must never look
+        # like placeholders: 10,000 tasks at shipped defaults.
+        from src.scorer import _is_no_attempt
+        for seed in range(1, 401):
+            gen = FrontierTaskGenerator(seed=seed)
+            gens = gen.task_generators()
+            for i in range(25):
+                task, _ = gens[i % len(gens)]()
+                assert not _is_no_attempt(task["expected"]), \
+                    (seed, task["id"], task["expected"])
 
     @pytest.mark.parametrize(("seed", "count"), [(184, 3), (334, 7)])
     def test_injector_collision_regressions(self, seed, count):
@@ -254,11 +278,38 @@ class TestF2CentsConsistency:
         raise AssertionError(f"{task_id} not generated for seed {seed}")
 
 
+class TestF2ShortcutFails:
+    """First/last-close shortcuts score 0%: the drawdown core needs the path."""
+
+    def test_endpoint_only_drawdown_never_passes(self):
+        checked = 0
+        for seed in range(1, 21):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen(seed, SMALL, 4, tmp)
+                scorer = TaskScorer(out / "answers")
+                for task in tasks:
+                    if task["type"] != "frontier_vendor_reconciliation":
+                        continue
+                    key = json.loads((out / "answers" /
+                                      f"{task['id']}_answer.json").read_text())
+                    got = solve(task, out / task["data_file"])
+                    # What a first/last-only reader can report for the
+                    # drawdown: the two-point path [1, final value].
+                    shortcut = min(0.0, got["reconciled_total_return"])
+                    if abs(shortcut - key["reconciled_max_drawdown"]) <= 1e-3:
+                        continue  # coincidentally right; not a shortcut win
+                    got["reconciled_max_drawdown"] = round(shortcut, 6)
+                    result = scorer.score_task(task["id"], json.dumps(got))
+                    assert not result["passed"], (seed, task["id"])
+                    checked += 1
+        assert checked > 0
+
+
 class TestCoreFieldRequired:
     """Correct codes with constant numbers must pass 0% (core is required)."""
 
-    CORE = ("mean_betas", "reconciled_total_return", "beta_market",
-            "beta_sector", "final_return")
+    CORE = ("mean_betas", "reconciled_total_return", "reconciled_max_drawdown",
+            "beta_market", "beta_sector", "final_return")
 
     def _core_values(self, expected):
         vals = []
@@ -315,6 +366,26 @@ class TestScorerFrontierFields:
             {**answer, "final_return": 0.5, "max_drawdown": -0.9,
              "problems": ["duplicate"]}))
         assert half["checkpoint_score"] == pytest.approx(0.6)
+
+    def test_reconciled_max_drawdown_tolerance_is_1e_3(self, tmp_path):
+        # The path statistic accumulates over the whole series, so it is
+        # scored at 1e-3; other floats stay at 1e-4 and the endpoint-only
+        # shortcut (off by far more) still fails the core check.
+        answer = {"mismatch_count": 3, "first_conflict_date": "2024-02-01",
+                  "reconciled_total_return": 0.1,
+                  "reconciled_max_drawdown": -0.05, "num_tickers": 3,
+                  "num_aligned_days": 100,
+                  "problems_found": ["source_conflict_x"]}
+        (tmp_path / "task_f_2003_answer.json").write_text(json.dumps(answer))
+        scorer = TaskScorer(tmp_path)
+        good = {k: v for k, v in answer.items() if k != "problems_found"}
+        good["problems"] = ["source_conflict"]
+        close = {**good, "reconciled_max_drawdown": -0.0495}  # 5e-4 off
+        assert scorer.score_task("task_f_2003", json.dumps(close))["passed"]
+        far = {**good, "reconciled_max_drawdown": -0.048}  # 2e-3 off
+        result = scorer.score_task("task_f_2003", json.dumps(far))
+        assert result["component_scores"]["reconciled_max_drawdown"] == 0.0
+        assert not result["passed"]
 
     def test_date_and_dict_fields_exact_and_toleranced(self, tmp_path):
         answer = {"mean_betas": {"AST1": 1.0}, "peak_correlation": 0.5,

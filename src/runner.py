@@ -44,7 +44,8 @@ class TaskRunner:
         api_key: str | None = None,
         model_name: str | None = None,
         dry_run: bool = False,
-        max_tokens: int | None = None
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None
     ):
         """
         Initialize runner.
@@ -59,10 +60,14 @@ class TaskRunner:
                 frontier-tier tasks (task_h_* / task_f_* ids) default to
                 32000 and easy-tier tasks to 16000, because reasoning
                 tokens count against the cap.
+            reasoning_effort: 'low'/'medium'/'high' to send, or None to
+                omit the parameter (META_REASONING_EFFORT applies when
+                set). Recorded on every result entry.
         """
         load_dotenv()
 
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
         self.dry_run = dry_run
         self.base_url = base_url or os.getenv('META_BASE_URL', 'https://api.meta.ai/v1')
         self.api_key = api_key or os.getenv('META_API_KEY') or os.getenv('MODEL_API_KEY', '')
@@ -102,6 +107,11 @@ class TaskRunner:
         with open(data_path) as f:
             return f.read()
 
+    def _effective_reasoning_effort(self) -> str | None:
+        """Explicit argument, then META_REASONING_EFFORT, else omit (None)."""
+        return self.reasoning_effort or os.getenv('META_REASONING_EFFORT') \
+            or None
+
     def _max_tokens_for(self, task: dict) -> int:
         """Token cap for one task: explicit arg, then env, then tier default."""
         if self.max_tokens is not None:
@@ -129,8 +139,9 @@ class TaskRunner:
             response = self.client.chat_completions_create(messages=messages)
         else:
             extra = {}
-            if os.getenv('META_REASONING_EFFORT'):
-                extra['reasoning_effort'] = os.getenv('META_REASONING_EFFORT')
+            effort = self._effective_reasoning_effort()
+            if effort:
+                extra['reasoning_effort'] = effort
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
@@ -165,6 +176,7 @@ class TaskRunner:
             'response': content,
             'model': self.model_name,
             'max_tokens': self._max_tokens_for(task),
+            'reasoning_effort': self._effective_reasoning_effort(),
             'finish_reason': finish_reason,
             'prompt_tokens': prompt_tokens,
             'completion_tokens': completion_tokens,
@@ -196,6 +208,7 @@ class TaskRunner:
                 'response': '', 'finish_reason': None,
                 'model': self.model_name,
                 'max_tokens': self._max_tokens_for(task),
+                'reasoning_effort': self._effective_reasoning_effort(),
                 'prompt_tokens': None, 'completion_tokens': None,
                 'total_tokens': None,
                 'error': {'type': type(exc).__name__,
@@ -217,7 +230,8 @@ class TaskRunner:
         failing task is recorded with only its error type and HTTP
         status. Every entry records the model and token cap used. With
         ``resume=True``, tasks already present without an error are
-        skipped (refused if they were made with a different model) and
+        skipped (refused if they were made with a different model,
+        reasoning effort, or token cap) and
         error entries are retried; without it, any previous
         ``results.jsonl``/``results.json`` in the output dir is removed
         first so a fresh run never appends to a stale one.
@@ -264,6 +278,27 @@ class TaskRunner:
                     f"--resume refused: {output_dir} contains results from "
                     f"model(s) {sorted(prior_models)}, not "
                     f"{self.model_name!r}; use a different --output-dir "
+                    "or omit --resume to start fresh")
+            prior_efforts = {e['reasoning_effort'] for e in done.values()
+                             if 'reasoning_effort' in e}
+            effort = self._effective_reasoning_effort()
+            if prior_efforts and prior_efforts != {effort}:
+                raise ValueError(
+                    f"--resume refused: {output_dir} contains results with "
+                    f"reasoning_effort {sorted(prior_efforts, key=str)}, not "
+                    f"{effort!r}; use a different --output-dir "
+                    "or omit --resume to start fresh")
+            task_by_id = {t['id']: t for t in tasks}
+            mismatched_caps = {e['max_tokens'] for e in done.values()
+                               if 'max_tokens' in e
+                               and e['task_id'] in task_by_id
+                               and e['max_tokens']
+                               != self._max_tokens_for(task_by_id[e['task_id']])}
+            if mismatched_caps:
+                raise ValueError(
+                    f"--resume refused: {output_dir} contains results with "
+                    f"max_tokens {sorted(mismatched_caps)}, not the current "
+                    "run's cap; use a different --output-dir "
                     "or omit --resume to start fresh")
         else:
             # Fresh run: never append to a previous run's output.
@@ -375,6 +410,14 @@ def main():
         help='Output token cap (overrides META_MAX_TOKENS; default 32000 for '
              'hard- and frontier-tier tasks, 16000 for easy-tier tasks)'
     )
+    parser.add_argument(
+        '--reasoning-effort',
+        choices=['low', 'medium', 'high'],
+        default=None,
+        help='Reasoning effort to send to the model (default: omit the '
+             'parameter; META_REASONING_EFFORT applies when set). Recorded '
+             'per result entry; --resume refuses on a mismatch.'
+    )
 
     args = parser.parse_args()
 
@@ -392,7 +435,8 @@ def main():
         base_url=args.base_url,
         model_name=args.model,
         dry_run=args.dry_run,
-        max_tokens=args.max_tokens
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort
     )
 
     results = runner.run_all_tasks(

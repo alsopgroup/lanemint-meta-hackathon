@@ -318,6 +318,74 @@ def categories_for_items(items):
     return found
 
 
+def _placeholder_run(value: float) -> int:
+    """Longest sequential run in a number's fractional digits
+    (1.023456 -> 6, from 023456; integers use their whole digit string)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or value != value or value in (float('inf'), float('-inf')):
+        return 0
+    text = repr(abs(value))
+    if 'e' in text:
+        return 0
+    # Fractional digits only: a run crossing the decimal point (the 1
+    # and 0 in 1.023456) is an artefact, and correct answers such as
+    # 0.212345 or 1.234588 get their apparent run that way.
+    digits = text.split('.', 1)[1] if '.' in text else text
+    if len(digits) < 5:
+        return 0
+    best = run = 1
+    direction = 0
+    for prev, cur in zip(digits, digits[1:], strict=False):
+        step = int(cur) - int(prev)
+        if step == direction and step in (1, -1):
+            run += 1
+        elif step in (1, -1):
+            direction, run = step, 2
+        else:
+            direction, run = 0, 1
+        best = max(best, run)
+    return best
+
+
+def _placeholder_digits(value: float) -> bool:
+    """True for a lone sequential-digit placeholder: a fractional digit
+    run of >= 6 (1.023456, 0.987654, 0.654321). Genuine answers reach at
+    most a 5-digit run (0.212345, 1.187654), so a 5-digit run only counts
+    towards the >=2-placeholder-values rule in _is_no_attempt."""
+    return _placeholder_run(value) >= 6
+
+
+def _is_no_attempt(parsed: dict) -> bool:
+    """Tag placeholder-style answers: sequential-digit numbers, or every
+    numeric answer identical (e.g. all zeros). Analysis only; the score
+    itself is unchanged.
+
+    Calibrated against the frontier reference answers (seeds 1-400,
+    10,000 tasks, which produce zero flags): a single 5-digit fractional
+    run is not enough, because correct answers contain values such as
+    0.212345 and 1.187654."""
+    values = []
+
+    def collect(node):
+        if isinstance(node, dict):
+            for v in node.values():
+                collect(v)
+        elif isinstance(node, list):
+            for v in node:
+                collect(v)
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
+            values.append(node)
+
+    collect({k: v for k, v in parsed.items()
+             if k not in ('problems', 'problems_found')})
+    runs = [_placeholder_run(v) for v in values]
+    if any(r >= 6 for r in runs):
+        return True
+    if sum(1 for r in runs if r >= 5) >= 2:
+        return True
+    return len(values) >= 3 and len(set(values)) == 1
+
+
 class TaskScorer:
     """Scores task responses with detailed feedback."""
 
@@ -392,8 +460,12 @@ class TaskScorer:
 
         # Every remaining expected field is scored by type: dicts entry by
         # entry, integers and strings (dates, tickers) exactly, floats with
-        # a tolerance of 0.01 for price fields and 1e-4 for everything else
-        # (returns, betas, volatility, drawdown, correlations, values).
+        # a tolerance of 0.01 for price fields, 1e-3 for
+        # reconciled_max_drawdown (a path statistic accumulated over the
+        # whole reconciled series; low-effort runs landed within ~3e-4 of
+        # it while endpoint shortcuts are off by orders of magnitude more)
+        # and 1e-4 for everything else (returns, betas, volatility,
+        # correlations, values).
         for field, exp_val in expected.items():
             if field == 'problems_found':
                 continue
@@ -421,7 +493,8 @@ class TaskScorer:
                         f"{field}: expected {exp_val}, got {parsed.get(field)}")
             elif isinstance(exp_val, float):
                 tolerance = 0.01 if field == 'final_price' \
-                    or field.endswith('_price') else 1e-4
+                    or field.endswith('_price') else \
+                    1e-3 if field == 'reconciled_max_drawdown' else 1e-4
                 actual_val = parsed.get(field)
                 if actual_val is None:
                     scores[field] = 0.0
@@ -457,8 +530,8 @@ class TaskScorer:
         # secondary fields (codes plus secondary fields alone could
         # otherwise reach 0.8 with the core value guessed as 0.0).
         core_ok = True
-        for field in ('reconciled_total_return', 'final_return',
-                      'beta_market', 'beta_sector'):
+        for field in ('reconciled_total_return', 'reconciled_max_drawdown',
+                      'final_return', 'beta_market', 'beta_sector'):
             if field in expected and scores.get(field, 0.0) < 1.0:
                 core_ok = False
         if 'mean_betas' in expected:
@@ -468,7 +541,9 @@ class TaskScorer:
         result = {'task_id': task_id,
                   'passed': overall >= 0.8 and problems_ok and core_ok,
                   'score': round(overall, 3), 'component_scores': scores,
-                  'feedback': '; '.join(feedback) if feedback else 'All checks passed'}
+                  'feedback': '; '.join(feedback) if feedback else 'All checks passed',
+                  'analysis_flags': ['no_attempt'] if _is_no_attempt(parsed)
+                  else []}
         # Frontier F4 checkpoint score: partial progress along the pipeline
         # (aligned days, first rebalance value, final return, drawdown).
         # Reported only; the pass rule above is unchanged.
@@ -490,7 +565,11 @@ class TaskScorer:
         return {'total_tasks': len(scores), 'passed': num_passed,
                 'failed': len(scores) - num_passed,
                 'pass_rate': round(num_passed / len(scores), 3) if scores else 0,
-                'average_score': round(avg, 3), 'scores': scores}
+                'average_score': round(avg, 3),
+                'no_attempt_tasks': sum(
+                    1 for s in scores
+                    if 'no_attempt' in s.get('analysis_flags', [])),
+                'scores': scores}
 
 
 def main():

@@ -543,5 +543,87 @@ class TestHardNumericScoring:
         assert perfect['score'] == 1.0
 
 
+class TestNoAttemptFlag:
+    """Placeholder-style numeric answers are tagged 'no_attempt' (analysis
+    only; scoring itself is unchanged)."""
+
+    ANSWER = {'mean_return': 0.001, 'std_return': 0.02,
+              'annualized_volatility': 0.3, 'num_clean_days': 12,
+              'problems_found': ['unit_change_x']}
+
+    def _score(self, tmp_path, response):
+        import json as _json
+        (tmp_path / 'task_h_1001_answer.json').write_text(_json.dumps(self.ANSWER))
+        scorer = TaskScorer(tmp_path)
+        return scorer.score_task('task_h_1001', _json.dumps(response))
+
+    def test_sequential_digit_placeholders_flagged(self, tmp_path):
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 1.023456,
+            'std_return': 0.987654, 'annualized_volatility': 0.654321,
+            'num_clean_days': 12})
+        assert 'no_attempt' in result['analysis_flags']
+
+    def test_single_partial_placeholder_not_flagged(self, tmp_path):
+        # One placeholder-looking value on its own is not enough: correct
+        # answers contain single values like 1.023456-shaped neighbours
+        # (0.212345 etc.), so the tag requires >= 2 such values, a full
+        # 6-digit fractional run, or all values identical.
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 1.023456,
+            'std_return': 0.02, 'annualized_volatility': 0.3,
+            'num_clean_days': 12})
+        assert result['analysis_flags'] == []
+
+    def test_two_partial_placeholders_flagged(self, tmp_path):
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 0.212345,
+            'std_return': 1.187654, 'annualized_volatility': 0.3,
+            'num_clean_days': 12})
+        assert 'no_attempt' in result['analysis_flags']
+
+    @pytest.mark.parametrize('value', [0.212345, 1.234588, 1.187654, 0.345674])
+    def test_single_partial_run_in_correct_answer_not_flagged(self, tmp_path,
+                                                              value):
+        # Regression (frontier reference answers, seeds 1-400): correct
+        # answers contain single values with a 5-6 digit sequential run;
+        # one such value alone must not be tagged no_attempt.
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': value,
+            'std_return': 0.02, 'annualized_volatility': 0.3,
+            'num_clean_days': 12})
+        assert result['analysis_flags'] == []
+
+    def test_all_identical_values_flagged(self, tmp_path):
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 0.0,
+            'std_return': 0.0, 'annualized_volatility': 0.0,
+            'num_clean_days': 0})
+        assert 'no_attempt' in result['analysis_flags']
+
+    def test_all_identical_integer_values_flagged(self, tmp_path):
+        # JSON integers (0, not 0.0) count toward the identical check too.
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 0,
+            'std_return': 0, 'annualized_volatility': 0,
+            'num_clean_days': 0})
+        assert 'no_attempt' in result['analysis_flags']
+
+    def test_integer_sequential_placeholder_flagged(self, tmp_path):
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 123456,
+            'std_return': 0.02, 'annualized_volatility': 0.3,
+            'num_clean_days': 12})
+        assert 'no_attempt' in result['analysis_flags']
+
+    def test_real_answer_not_flagged(self, tmp_path):
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 0.001,
+            'std_return': 0.02, 'annualized_volatility': 0.3,
+            'num_clean_days': 12})
+        assert result['passed']
+        assert result['analysis_flags'] == []
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
