@@ -78,11 +78,13 @@ class TaskRunner:
             try:
                 from openai import OpenAI
                 # No SDK retries: a timed-out long request must never be
-                # silently re-sent (and billed) twice. The timeout is
-                # generous enough for 32k-token reasoning responses.
+                # silently re-sent (and billed) twice. The timeout sits
+                # well under provider context limits (Spark 1.3: ~1M
+                # context, 131k max output; our cap stays 32k) while
+                # allowing long reasoning responses to finish.
                 self.client = OpenAI(base_url=self.base_url,
                                      api_key=self.api_key,
-                                     max_retries=0, timeout=300.0)
+                                     max_retries=0, timeout=900.0)
             except ImportError:
                 raise ImportError(
                     "openai package not installed. Run: pip install -r requirements.txt"
@@ -161,25 +163,70 @@ class TaskRunner:
             'task_id': task['id'],
             'task_type': task['type'],
             'response': content,
+            'model': self.model_name,
+            'max_tokens': self._max_tokens_for(task),
             'finish_reason': finish_reason,
             'prompt_tokens': prompt_tokens,
             'completion_tokens': completion_tokens,
             'total_tokens': total_tokens,
         }
 
+    @staticmethod
+    def _repair_partial_line(path: Path) -> None:
+        """Truncate a trailing partial JSONL record left by a crash."""
+        if not path.exists():
+            return
+        data = path.read_bytes()
+        if not data or data.endswith(b'\n'):
+            return
+        cut = data.rfind(b'\n')
+        with open(path, 'r+b') as f:
+            f.truncate(cut + 1)
+
+    @staticmethod
+    def _error_status(exc: Exception) -> int | None:
+        status = getattr(exc, 'status_code', None) or getattr(exc, 'status', None)
+        return status if isinstance(status, int) and not isinstance(status, bool) \
+            else None
+
+    def _error_result(self, task: dict, exc: Exception) -> dict:
+        # Record only the exception type and HTTP status: never the
+        # exception text/body, which may echo request details.
+        return {'task_id': task['id'], 'task_type': task.get('type'),
+                'response': '', 'finish_reason': None,
+                'model': self.model_name,
+                'max_tokens': self._max_tokens_for(task),
+                'prompt_tokens': None, 'completion_tokens': None,
+                'total_tokens': None,
+                'error': {'type': type(exc).__name__,
+                          'status': self._error_status(exc)}}
+
     def run_all_tasks(
         self,
         tasks_dir: Path,
         output_dir: Path,
-        limit: int | None = None
+        limit: int | None = None,
+        resume: bool = False
     ) -> list[dict]:
         """
         Run all tasks and save results.
+
+        Results are appended to ``results.jsonl`` (flushed and fsynced
+        after every task) and collected into ``results.json`` at the end,
+        so one task's API failure cannot lose earlier paid responses: a
+        failing task is recorded with only its error type and HTTP
+        status. Every entry records the model and token cap used. With
+        ``resume=True``, tasks already present without an error are
+        skipped (refused if they were made with a different model) and
+        error entries are retried; without it, any previous
+        ``results.jsonl``/``results.json`` in the output dir is removed
+        first so a fresh run never appends to a stale one.
 
         Args:
             tasks_dir: Directory containing tasks and data
             output_dir: Directory to save results
             limit: Optional limit on number of tasks to run
+            resume: Skip tasks already successfully present in the output
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +234,41 @@ class TaskRunner:
         tasks = self.load_tasks(tasks_dir)
         if limit:
             tasks = tasks[:limit]
+        task_ids = {t['id'] for t in tasks}
+
+        jsonl_path = output_dir / 'results.jsonl'
+        results_file = output_dir / 'results.json'
+        done = {}
+        if resume:
+            # A crash can leave a partial last line: truncate back to
+            # the last newline before loading or appending, so a new
+            # record is never glued onto the fragment (which would make
+            # that task unparseable and bill it again on the next resume).
+            self._repair_partial_line(jsonl_path)
+            if jsonl_path.exists():
+                for line in jsonl_path.read_text().splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # partial line from a crash mid-write
+                    if entry.get('task_id') in task_ids:
+                        done[entry['task_id']] = entry
+            elif results_file.exists():
+                for entry in json.loads(results_file.read_text()):
+                    if entry.get('task_id') in task_ids:
+                        done[entry['task_id']] = entry
+            prior_models = {e.get('model') for e in done.values()
+                            if e.get('model')}
+            if prior_models and prior_models != {self.model_name}:
+                raise ValueError(
+                    f"--resume refused: {output_dir} contains results from "
+                    f"model(s) {sorted(prior_models)}, not "
+                    f"{self.model_name!r}; use a different --output-dir "
+                    "or omit --resume to start fresh")
+        else:
+            # Fresh run: never append to a previous run's output.
+            jsonl_path.unlink(missing_ok=True)
+            results_file.unlink(missing_ok=True)
 
         print(f"Running {len(tasks)} tasks...")
         if self.dry_run:
@@ -195,20 +277,41 @@ class TaskRunner:
             print(f"Model: {self.model_name}")
             print(f"Base URL: {self.base_url}")
 
-        results = []
-        for i, task in enumerate(tasks, 1):
-            print(f"[{i}/{len(tasks)}] Running {task['id']}...")
+        results_by_id = {}
+        with open(jsonl_path, 'a') as jf:
+            if resume and done and not jsonl_path.stat().st_size:
+                for task in tasks:  # seed jsonl from an earlier results.json
+                    if task['id'] in done:
+                        jf.write(json.dumps(done[task['id']]) + '\n')
+                jf.flush()
+                os.fsync(jf.fileno())
+            for i, task in enumerate(tasks, 1):
+                existing = done.get(task['id'])
+                if existing is not None and 'error' not in existing:
+                    print(f"[{i}/{len(tasks)}] Skipping {task['id']} "
+                          "(already in output)")
+                    results_by_id[task['id']] = existing
+                    continue
+                print(f"[{i}/{len(tasks)}] Running {task['id']}...")
+                try:
+                    data = self.load_data(tasks_dir, task['data_file'])
+                    result = self.run_task(task, data)
+                except Exception as exc:  # one failure must not lose the run
+                    result = self._error_result(task, exc)
+                    print(f"[{i}/{len(tasks)}] {task['id']} failed: "
+                          f"{result['error']['type']} "
+                          f"(status {result['error']['status']})")
+                results_by_id[task['id']] = result
+                jf.write(json.dumps(result) + '\n')
+                jf.flush()
+                os.fsync(jf.fileno())
 
-            data = self.load_data(tasks_dir, task['data_file'])
-            result = self.run_task(task, data)
-            results.append(result)
+                # Rate limiting (not needed for stub, but good practice)
+                if not self.dry_run and i < len(tasks):
+                    time.sleep(1)
 
-            # Rate limiting (not needed for stub, but good practice)
-            if not self.dry_run and i < len(tasks):
-                time.sleep(1)
-
-        # Save results
-        results_file = output_dir / 'results.json'
+        results = [results_by_id[t['id']] for t in tasks
+                   if t['id'] in results_by_id]
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
 
@@ -251,6 +354,13 @@ def main():
         help='Use stub model instead of real API'
     )
     parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Skip tasks already successfully present in the output '
+             'results.jsonl/results.json (error entries are retried); '
+             'results are appended incrementally to results.jsonl'
+    )
+    parser.add_argument(
         '--base-url',
         help='API base URL (overrides META_BASE_URL env var)'
     )
@@ -288,7 +398,8 @@ def main():
     results = runner.run_all_tasks(
         tasks_dir=args.tasks_dir,
         output_dir=args.output_dir,
-        limit=args.limit
+        limit=args.limit,
+        resume=args.resume
     )
 
     print(f"\n✓ Completed {len(results)} tasks")
