@@ -42,6 +42,9 @@ tasks/answers/
 tasks_hard/*.csv
 tasks_hard/*.json
 tasks_hard/answers/
+tasks_frontier/*.csv
+tasks_frontier/*.json
+tasks_frontier/answers/
 
 # Test coverage
 .coverage

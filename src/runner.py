@@ -19,6 +19,7 @@ class StubModel:
         """Return a mock response."""
         return {
             'choices': [{
+                'finish_reason': 'stop',
                 'message': {
                     'content': json.dumps({
                         'problems': ['duplicate', 'bad_price'],
@@ -54,9 +55,10 @@ class TaskRunner:
             model_name: Model name (default from META_MODEL_NAME env var)
             dry_run: If True, use stub model instead of real API
             max_tokens: Output token cap override. When unset, the
-                META_MAX_TOKENS env var wins; otherwise hard-tier tasks
-                (task_h_* ids) default to 32000 and easy-tier tasks to
-                16000, because reasoning tokens count against the cap.
+                META_MAX_TOKENS env var wins; otherwise hard- and
+                frontier-tier tasks (task_h_* / task_f_* ids) default to
+                32000 and easy-tier tasks to 16000, because reasoning
+                tokens count against the cap.
         """
         load_dotenv()
 
@@ -75,7 +77,12 @@ class TaskRunner:
 
             try:
                 from openai import OpenAI
-                self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+                # No SDK retries: a timed-out long request must never be
+                # silently re-sent (and billed) twice. The timeout is
+                # generous enough for 32k-token reasoning responses.
+                self.client = OpenAI(base_url=self.base_url,
+                                     api_key=self.api_key,
+                                     max_retries=0, timeout=300.0)
             except ImportError:
                 raise ImportError(
                     "openai package not installed. Run: pip install -r requirements.txt"
@@ -100,7 +107,8 @@ class TaskRunner:
         env = os.getenv('META_MAX_TOKENS')
         if env:
             return int(env)
-        return 32000 if str(task.get('id', '')).startswith('task_h_') else 16000
+        return 32000 if str(task.get('id', '')).startswith(('task_h_', 'task_f_')) \
+            else 16000
 
     def run_task(self, task: dict, data: str) -> dict:
         """Run a single task."""
@@ -132,11 +140,31 @@ class TaskRunner:
                 **extra
             )
 
+        if self.dry_run:
+            choice = response['choices'][0]
+            content = choice['message']['content']
+            finish_reason = choice.get('finish_reason')
+            usage = response.get('usage') or {}
+            prompt_tokens = usage.get('prompt_tokens')
+            completion_tokens = usage.get('completion_tokens')
+            total_tokens = usage.get('total_tokens')
+        else:
+            choice = response.choices[0]
+            content = choice.message.content or ''
+            finish_reason = getattr(choice, 'finish_reason', None)
+            usage = getattr(response, 'usage', None)
+            prompt_tokens = getattr(usage, 'prompt_tokens', None)
+            completion_tokens = getattr(usage, 'completion_tokens', None)
+            total_tokens = getattr(usage, 'total_tokens', None)
+
         return {
             'task_id': task['id'],
             'task_type': task['type'],
-            'response': response['choices'][0]['message']['content'] if self.dry_run
-                       else (response.choices[0].message.content or '')
+            'response': content,
+            'finish_reason': finish_reason,
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens,
+            'total_tokens': total_tokens,
         }
 
     def run_all_tasks(
@@ -196,8 +224,15 @@ def main():
     parser.add_argument(
         '--tasks-dir',
         type=Path,
-        default=Path('tasks'),
-        help='Directory containing tasks (default: tasks/)'
+        default=None,
+        help='Directory containing tasks (default: tasks/, or the --tier default)'
+    )
+    parser.add_argument(
+        '--tier',
+        choices=['easy', 'hard', 'frontier'],
+        default=None,
+        help='Task tier; sets the default tasks directory (tasks/, tasks_hard/, '
+             'tasks_frontier/) when --tasks-dir is not given'
     )
     parser.add_argument(
         '--output-dir',
@@ -228,10 +263,15 @@ def main():
         type=int,
         default=None,
         help='Output token cap (overrides META_MAX_TOKENS; default 32000 for '
-             'hard-tier tasks, 16000 for easy-tier tasks)'
+             'hard- and frontier-tier tasks, 16000 for easy-tier tasks)'
     )
 
     args = parser.parse_args()
+
+    if args.tasks_dir is None:
+        args.tasks_dir = {'hard': Path('tasks_hard'),
+                          'frontier': Path('tasks_frontier')}.get(
+                              args.tier, Path('tasks'))
 
     if not args.tasks_dir.exists():
         print(f"Error: Tasks directory not found: {args.tasks_dir}")

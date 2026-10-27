@@ -525,9 +525,9 @@ def main():
     parser.add_argument(
         '--tier',
         type=str,
-        choices=['easy', 'hard'],
+        choices=['easy', 'hard', 'frontier'],
         default='easy',
-        help='Difficulty tier: easy (default) or hard'
+        help='Difficulty tier: easy (default), hard or frontier'
     )
 
     args = parser.parse_args()
@@ -542,11 +542,17 @@ def main():
         from src.hard_tier import HardTaskGenerator
         print("Generating HARD tier tasks...")
         generator = HardTaskGenerator(seed=args.seed)
+    elif args.tier == 'frontier':
+        from src.frontier_tier import FrontierTaskGenerator
+        print("Generating FRONTIER tier tasks...")
+        generator = FrontierTaskGenerator(seed=args.seed)
     else:
         print("Generating EASY tier tasks...")
         generator = TaskGenerator(seed=args.seed)
 
-    output_dir = args.output_dir or (Path('tasks_hard') if args.tier == 'hard' else Path('tasks'))
+    output_dir = args.output_dir or {'hard': Path('tasks_hard'),
+                                     'frontier': Path('tasks_frontier')}.get(
+                                         args.tier, Path('tasks'))
     tasks = generator.generate_all_tasks(output_dir, num_tasks=args.count)
     print(f"Created {len(tasks)} {args.tier} tier tasks with seed {args.seed}")
 

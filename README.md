@@ -105,8 +105,8 @@ META_BASE_URL=https://api.meta.ai/v1
 META_MODEL_NAME=muse-spark-1.3
 
 # Optional: output token cap. Leave unset to use the runner defaults
-# (16000 for easy-tier tasks, 32000 for hard-tier tasks); setting this
-# overrides both tiers, so do not set it to 16000 for hard-tier runs.
+# (16000 for easy-tier tasks, 32000 for hard- and frontier-tier tasks); setting this
+# overrides all tiers, so do not set it to 16000 for hard/frontier runs.
 # META_MAX_TOKENS=32000
 
 # Optional: control reasoning effort (if supported by model)
@@ -131,14 +131,18 @@ python -m src.generate_tasks
 
 # Generate hard tier
 python -m src.generate_tasks --tier hard
+
+# Generate frontier tier
+python -m src.generate_tasks --tier frontier
 ```
 
 This creates:
 - Easy tier (default output `tasks/`): `tasks/tasks.json`, `tasks/task_*.csv`, `tasks/answers/`
 - Hard tier (default output `tasks_hard/`, so it does not overwrite the easy set): `tasks_hard/tasks.json`, `tasks_hard/task_h_*.csv`, `tasks_hard/answers/`
+- Frontier tier (default output `tasks_frontier/`): `tasks_frontier/tasks.json`, `tasks_frontier/task_f_*.csv`, `tasks_frontier/answers/`
 
 **Options**:
-- `--tier {easy,hard}`: Difficulty tier (default: easy)
+- `--tier {easy,hard,frontier}`: Difficulty tier (default: easy)
 - `--seed SEED`: Random seed for reproducibility (default: 42)
 - `--count COUNT`: Number of tasks to generate (default: 25)
 - `--output-dir DIR`: Output directory (default: `tasks/` for easy, `tasks_hard/` for hard)
@@ -255,6 +259,7 @@ python -m src.scorer output/finetuned/results.json
 │   ├── __init__.py
 │   ├── generate_tasks.py         # Task and data generator (easy tier)
 │   ├── hard_tier.py              # Hard tier task generator
+│   ├── frontier_tier.py          # Frontier tier task generator (F1-F4)
 │   ├── scorer.py                 # Deterministic scoring engine (also usable as reward function)
 │   ├── runner.py                 # Model runner with dry-run mode
 │   ├── finetune_prep.py          # Fine-tuning data preparation (SFT/GRPO)
@@ -264,6 +269,8 @@ python -m src.scorer output/finetuned/results.json
 │   ├── test_generate_tasks.py    # Easy tier tests
 │   ├── test_hard_tier.py         # Hard tier tests
 │   └── test_scorer.py            # Unit tests for scorer
+├── scripts/
+│   └── prompt_sizes.py           # Per-task prompt size report (chars/tokens)
 ├── tasks/                        # Generated tasks (gitignored)
 ├── output/                       # Model results (gitignored)
 ├── finetune_data/                # Training files (gitignored)
@@ -321,6 +328,35 @@ python -m src.runner --tasks-dir tasks_hard --output-dir output/hard --dry-run
 
 # Score it (second argument points the scorer at the hard answers)
 python -m src.scorer output/hard/results.json tasks_hard/answers
+```
+
+### Frontier Tier
+
+The frontier tier (`src/frontier_tier.py`, task IDs `task_f_*`) targets long numeric chains over larger files, where the v4 hard-tier runs showed models failing on numbers rather than problem identification. It has four families, each with its own settings in `FRONTIER_FAMILY_SETTINGS` (rows, assets, window/step counts), overridable via `FrontierTaskGenerator(settings={...})`:
+
+| Family | Type | Default settings | Task |
+|---|---|---|---|
+| F1 | `frontier_rolling_risk` | 500 rows, 4 assets + IDX index, window 60 | Clean and align the assets and index; report `mean_betas` (per-asset mean rolling beta as a JSON object), the peak rolling asset–index correlation (`peak_correlation`, `peak_correlation_asset`, `peak_correlation_date`) and `final_window_volatility` (annualised volatility of the last window of equal-weight portfolio returns) |
+| F2 | `frontier_vendor_reconciliation` | 250 rows, 3 tickers, base 12 conflicts (drawn per task, 6–18) | Two vendor blocks (`VENDOR_A` in dollars, `VENDOR_B` in cents) in one file; report `mismatch_count`, `first_conflict_date` and `reconciled_total_return` for the trusted series (Vendor A where it reports a date, Vendor B filling gaps) |
+| F3 | `frontier_factor_exposure` | 500 rows, 3 split-table events | Back-adjust AST prices with the explicit `SPLIT_TABLE` block, then report two-factor OLS exposures `alpha`, `beta_market`, `beta_sector`, `r_squared` against MKT and SEC |
+| F4 | `frontier_portfolio_pipeline` | 300 rows, 4 assets, rebalance every 21 return observations, 10 bps cost | Clean, align, drift holdings, rebalance with transaction cost; report checkpoints `num_aligned_days`, `first_rebalance_value`, `final_return`, `max_drawdown` (plus `num_rebalances`) |
+
+Conventions stated in every frontier prompt: the 12 hard-tier codes plus one new code, `source_conflict` (the two cleaned vendor series report closes for the same ticker and date differing by more than 0.01 after Vendor B is converted from cents); split ratios are written `A-for-B` (A new shares for B old shares), and in F3 every split-table event back-adjusts earlier AST closes by B/A, cumulatively. Splits appear **only** as explicit split-table events in F3; F1/F2/F4 price series contain no split or unit-change level shifts. The tier uses no dividends, delistings/survivorship, ticker renames, stale prices, or too-short histories, and every prompt defines every code and every output field. On repeated prices: the guarantee applies to the analysed series — after cleaning (dedupe, bad-tick removal), split adjustment and alignment, no two consecutive closes for a ticker are equal, in every family. It does not apply to each raw F2 vendor block on its own: the two vendor extracts may individually contain a repeated close across a date the other vendor fills, and only the reconciled (trusted, aligned) series is guaranteed repeat-free.
+
+**Scoring and pass rule (explicit):** frontier tasks use the same scorer and the same pass rule as the other tiers — a task passes only when the returned problem-code set is exactly right (F1 = 1.0) **and** the overall score is at least 0.8. In addition, each family's core numeric output is a required field that must itself be correct: `mean_betas` (every asset) for F1, `reconciled_total_return` for F2, `beta_market` and `beta_sector` for F3, and `final_return` for F4 — so correct codes plus constant guessed numbers cannot pass (tested: 0% in `TestCoreFieldRequired`). Numeric tolerances are 1e-4 absolute for returns, betas, correlations, volatility, drawdown, R² and portfolio values; 0.01 for prices; counts, dates and ticker strings are exact. F4 results additionally carry a `checkpoint_score` (the fraction of the checkpoint fields that are correct); it is reported for diagnostics and does not change the pass rule.
+
+**Verification:** an independent pandas solver in `tests/frontier_solver.py` (written from the prompt rules; it imports nothing from the generator) scores 100% (pass, score 1.0) against the keys at the **shipped default settings** for seeds 1–400 at the full default task count (25 tasks per seed, 10,000 tasks) in `tests/test_frontier_tier.py`, and on the seed-42 default set (25/25). Guessing baselines, recomputed the same way as the other tiers (fresh generator per seed, most common exact problem set per type, correct numbers assumed), stay near zero: across seeds 1–200 at shipped default settings over all 25 generated tasks per seed (5,000 tasks), a fixed per-type guess passes 7.0% of frontier tasks overall (per-type 6.1–7.9%) and pasting all 13 codes passes 0%. The seed-42 default frontier set is 25 tasks (7 F1, 6 each of F2/F3/F4) totalling 2,134,137 bytes of CSV (2,500 data rows per F1 file, about 1,500 per F2/F3 file, 1,200 per F4 file). Prompt sizes for a generated set (full runner message: prompt + data) are reported by `python3 scripts/prompt_sizes.py --tasks-dir tasks_frontier` (characters and tokens; tokens use tiktoken's cl100k_base encoding as an approximation when available, else a labelled regex approximation); on the seed-42 set the maxima are 131,888 chars / 75,528 tokens (F1), 85,850 / 48,913 (F2), 80,352 / 44,943 (F3) and 64,450 / 37,150 (F4).
+
+```bash
+# Generate the frontier set (writes tasks_frontier/)
+python -m src.generate_tasks --tier frontier
+
+# Run it (dry-run shown; drop --dry-run with API credentials configured).
+# Frontier tasks default to a 32000 output-token cap, like the hard tier.
+python -m src.runner --tier frontier --output-dir output/frontier --dry-run
+
+# Score it
+python -m src.scorer output/frontier/results.json tasks_frontier/answers
 ```
 
 ---

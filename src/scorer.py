@@ -52,6 +52,7 @@ def _is_nothing_detail(detail):
 CANONICAL_CATEGORIES = {
     "duplicate", "missing", "bad_price", "split", "reverse_split", "unit_change",
     "out_of_order", "timezone", "currency", "adj_close", "column_order", "calendar",
+    "source_conflict",
 }
 
 # category -> regex on text with underscores turned into spaces
@@ -72,6 +73,7 @@ _PATTERNS = {
     "adj_close": r"\badj close\b|\badjusted close\b",
     "column_order": r"\bcolumn order\b|\bheader\b|\bcolumns? (?:reordered|changed|swapped)\b",
     "calendar": r"\bcalendar\b|\bmisalign\w*\b|\bholidays?\b|\btrading calendars?\b",
+    "source_conflict": r"\bsource conflicts?\b|\bvendor (?:conflict|disagreement)\w*\b",
 }
 
 
@@ -215,18 +217,27 @@ def categories_for_key_items(items):
     heuristics apply, so numeric suffixes can never suppress a category.
     """
     found = set()
+    explicit = set()
     for item in items or []:
         text = str(item).strip().lower()
         if text.startswith("stock_split"):
             found.add("split")
+            explicit.add("split")
             continue
         for code in _CODES_BY_LENGTH:
             if text == code or text.startswith((code + "_", code + ":", code + " ")):
                 found.add(code)
+                explicit.add(code)
                 break
         else:
             found |= categories_for_items([item])
-    return _canonical(found)
+    found = _canonical(found)
+    if {"split", "reverse_split"} <= explicit:
+        # A key may explicitly assert both (e.g. a split table with
+        # forward and reverse events); the free-text "reverse wins"
+        # canonicalisation must not erase an explicit assertion.
+        found |= {"split", "reverse_split"}
+    return found
 
 
 def _head_code(segment):
@@ -257,6 +268,7 @@ def categories_for_items(items):
     after the colon, so ``split: 1:2`` asserts ``reverse_split``.
     """
     found = set()
+    explicit = set()
     for item in items or []:
         text = str(item).strip().lower()
         # Explicit non-detections: a code-like head, a separator, and a
@@ -280,8 +292,10 @@ def categories_for_items(items):
                     if ratio and float(ratio.group(2)) > 0 and \
                             float(ratio.group(1)) / float(ratio.group(2)) < 1:
                         found.add("reverse_split")
+                        explicit.add("reverse_split")
                         continue
                 found.add(code)
+                explicit.add(code)
             continue
         # A verbatim key string (``bad_price_2024-07-09_0.1``) is an
         # assertion of its leading code, suffix and all; a purely-nothing
@@ -293,9 +307,15 @@ def categories_for_items(items):
             sep = re.search(r":", rest) or re.search(r"[—–-]", rest)
             if not (sep and _is_nothing_detail(rest[sep.end():])):
                 found.add(key_code)
+                explicit.add(key_code)
         else:
             found |= categories_for_text(text)
-    return _canonical(found)
+    found = _canonical(found)
+    if {"split", "reverse_split"} <= explicit:
+        # Both were explicitly asserted as structured entries (a split
+        # table can contain forward and reverse events); keep both.
+        found |= {"split", "reverse_split"}
+    return found
 
 
 class TaskScorer:
@@ -370,34 +390,58 @@ class TaskScorer:
             if prob_score < 1.0:
                 feedback.append(f"Problems: {prob_feedback}")
 
-        numeric_fields = [
-            ('mean_return', 1e-4), ('std_return', 1e-4), ('total_return', 1e-4),
-            ('final_price', 0.01), ('annualized_volatility', 1e-4),
-            ('max_drawdown', 1e-4), ('portfolio_return', 1e-4),
-            ('mean_beta', 1e-4), ('beta', 1e-4),
-        ]
-        for field, tolerance in numeric_fields:
-            if field in expected:
+        # Every remaining expected field is scored by type: dicts entry by
+        # entry, integers and strings (dates, tickers) exactly, floats with
+        # a tolerance of 0.01 for price fields and 1e-4 for everything else
+        # (returns, betas, volatility, drawdown, correlations, values).
+        for field, exp_val in expected.items():
+            if field == 'problems_found':
+                continue
+            if isinstance(exp_val, dict):
+                actual_map = parsed.get(field)
+                for key, sub in exp_val.items():
+                    comp = f"{field}.{key}"
+                    actual_val = actual_map.get(key) \
+                        if isinstance(actual_map, dict) else None
+                    if isinstance(actual_val, (int, float)) \
+                            and not isinstance(actual_val, bool) \
+                            and self.compare_float(actual_val, sub, 1e-4):
+                        scores[comp] = 1.0
+                    else:
+                        scores[comp] = 0.0
+                        feedback.append(f"{comp}: expected {sub}, got {actual_val}")
+            elif isinstance(exp_val, bool):
+                continue
+            elif isinstance(exp_val, int):
+                if parsed.get(field) == exp_val:
+                    scores[field] = 1.0
+                else:
+                    scores[field] = 0.0
+                    feedback.append(
+                        f"{field}: expected {exp_val}, got {parsed.get(field)}")
+            elif isinstance(exp_val, float):
+                tolerance = 0.01 if field == 'final_price' \
+                    or field.endswith('_price') else 1e-4
                 actual_val = parsed.get(field)
                 if actual_val is None:
                     scores[field] = 0.0
                     feedback.append(f"{field}: missing")
-                elif not isinstance(actual_val, (int, float)) or isinstance(actual_val, bool):
+                elif not isinstance(actual_val, (int, float)) \
+                        or isinstance(actual_val, bool):
                     scores[field] = 0.0
                     feedback.append(f"{field}: not a number")
-                elif self.compare_float(actual_val, expected[field], tolerance):
+                elif self.compare_float(actual_val, exp_val, tolerance):
                     scores[field] = 1.0
                 else:
                     scores[field] = 0.0
-                    feedback.append(f"{field}: expected {expected[field]}, got {actual_val}")
-
-        for field in ('num_clean_days', 'num_assets', 'num_aligned_days', 'num_return_days'):
-            if field in expected:
-                if parsed.get(field) == expected[field]:
+                    feedback.append(f"{field}: expected {exp_val}, got {actual_val}")
+            elif isinstance(exp_val, str) or exp_val is None:
+                if parsed.get(field) == exp_val:
                     scores[field] = 1.0
                 else:
                     scores[field] = 0.0
-                    feedback.append(f"{field}: expected {expected[field]}, got {parsed.get(field)}")
+                    feedback.append(
+                        f"{field}: expected {exp_val}, got {parsed.get(field)}")
 
         overall = sum(scores.values()) / len(scores) if scores else 0.0
         if not scores:
@@ -408,9 +452,34 @@ class TaskScorer:
         # per-type guess matches only a small minority of tasks (measured
         # in tests/test_scorer.py::TestGuessBaselines).
         problems_ok = scores.get('problems', 1.0) >= 1.0
-        return {'task_id': task_id, 'passed': overall >= 0.8 and problems_ok,
-                'score': round(overall, 3), 'component_scores': scores,
-                'feedback': '; '.join(feedback) if feedback else 'All checks passed'}
+        # Frontier families have a required core numeric output: the
+        # headline computation must be right, not just the codes and
+        # secondary fields (codes plus secondary fields alone could
+        # otherwise reach 0.8 with the core value guessed as 0.0).
+        core_ok = True
+        for field in ('reconciled_total_return', 'final_return',
+                      'beta_market', 'beta_sector'):
+            if field in expected and scores.get(field, 0.0) < 1.0:
+                core_ok = False
+        if 'mean_betas' in expected:
+            core_ok = core_ok and all(
+                scores.get(f'mean_betas.{k}', 0.0) >= 1.0
+                for k in expected['mean_betas'])
+        result = {'task_id': task_id,
+                  'passed': overall >= 0.8 and problems_ok and core_ok,
+                  'score': round(overall, 3), 'component_scores': scores,
+                  'feedback': '; '.join(feedback) if feedback else 'All checks passed'}
+        # Frontier F4 checkpoint score: partial progress along the pipeline
+        # (aligned days, first rebalance value, final return, drawdown).
+        # Reported only; the pass rule above is unchanged.
+        if 'first_rebalance_value' in expected:
+            ckpt = [f for f in ('num_aligned_days', 'first_rebalance_value',
+                                'final_return', 'max_drawdown', 'num_rebalances')
+                    if f in scores]
+            if ckpt:
+                result['checkpoint_score'] = round(
+                    sum(scores[f] for f in ckpt) / len(ckpt), 3)
+        return result
 
     def score_all(self, results_file: Path) -> dict:
         with open(results_file) as f:
