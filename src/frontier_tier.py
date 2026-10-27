@@ -21,14 +21,13 @@ import pandas as pd
 
 FRONTIER_FAMILY_SETTINGS = {
     # F1: multi-asset rolling risk. Pilot calibration (Spark 1.3,
-    # seed 42, three pilots): at 500 rows/4 assets/60-day window, again
-    # at 250/2/20, and again at 120/2/10 the model emitted placeholders
-    # or wrong search results instead of computing (0/12), so the shipped
-    # default is ~120 rows, 2 assets, 10-day window and a single named
-    # target asset's mean rolling beta (the peak-correlation search was
-    # dropped after pilot 3: codes were right but the peak answer was
-    # always wrong). Difficulty lives in the data problems and exact
-    # rolling semantics, not volume. All knobs can be raised again.
+    # seed 42, four pilots): larger/rolling-search variants scored 0/16
+    # (placeholders, fabricated betas, peak-correlation always wrong),
+    # so the shipped default is ~120 rows, 2 assets, 10-day window and
+    # ONE statistic per core field over the LAST window only: the target
+    # asset's beta vs IDX over the final 10 return observations, plus
+    # the final-window volatility. Difficulty lives in the data problems
+    # and exact semantics, not volume. All knobs can be raised again.
     "rolling_risk": {"rows": 120, "assets": 2, "window": 10},
     # F2: two-vendor reconciliation (plan knobs: conflicts, rows,
     # unit difference between files -> Vendor B quotes cents).
@@ -325,15 +324,16 @@ class FrontierTaskGenerator:
 
         prices = aligned_prices(frames)
         rets = prices.pct_change().dropna()
-        cov = rets.rolling(window).cov(rets["IDX"])
-        var = rets["IDX"].rolling(window).var(ddof=1)
-        beta_frame = cov.div(var, axis=0)
-        # One named target asset (pilot 3 simplification): a single mean
-        # rolling beta to compute, no peak-correlation search.
+        # One named target asset, LAST window only (pilot 4): a single
+        # beta over the final `window` return observations, no rolling
+        # search and no full-sample regression.
         target = random.choice(assets)
+        last = rets.iloc[-window:]
+        last_beta = float(last[target].cov(last["IDX"])
+                          / last["IDX"].var(ddof=1))
         ew = rets[assets].mean(axis=1)
         expected = {
-            "mean_beta": round(float(beta_frame[target].mean()), 6),
+            "last_window_beta": round(last_beta, 6),
             "target_asset": target,
             "final_window_volatility": round(
                 float(ew.iloc[-window:].std(ddof=1) * 252 ** 0.5), 6),
@@ -343,17 +343,19 @@ class FrontierTaskGenerator:
         layout = ("One CSV block with header date,ticker,open,high,low,close,volume. "
                   f"Tickers: {', '.join(assets)} and the index IDX.")
         analytic = f"""Clean every ticker with the general rules and align on the
-inner join. Compute simple daily returns. The target asset is {target}. For
-the target asset and each window of {window} consecutive return observations
-(windows end at return observations {window}, {window + 1}, ..., N), beta =
-cov(target, IDX, ddof=1) / var(IDX, ddof=1). mean_beta is the arithmetic
-mean of the target asset's window betas. The equal-weight portfolio return
-on a day is the mean of the assets' returns that day (IDX excluded);
-final_window_volatility is the annualised volatility of the last {window}
-equal-weight portfolio returns."""
+inner join. Compute simple daily returns. The target asset is {target}.
+Consider only the last window: the final {window} consecutive return
+observations. last_window_beta is the beta of the target asset against IDX
+over those {window} returns only: cov(target, IDX, ddof=1) / var(IDX,
+ddof=1), using the simple returns of the target and of IDX on the aligned
+dates of that last window (not a full-sample regression and not an average
+over windows). The equal-weight portfolio return on a day is the mean of
+the assets' returns that day (IDX excluded); final_window_volatility is
+the annualised volatility of the last {window} equal-weight portfolio
+returns."""
         task = {"id": f"task_f_{self.task_id:03d}", "type": "frontier_rolling_risk",
                 "prompt": _prompt(layout, analytic,
-                                  "- mean_beta: mean rolling beta of the target asset (6 decimals)\n"
+                                  "- last_window_beta: beta of the target asset vs IDX over the last window only (6 decimals)\n"
                                   "- target_asset: ticker string of the target asset\n"
                                   "- final_window_volatility: (6 decimals)\n"
                                   "- num_assets: number of asset tickers (IDX excluded)\n"
@@ -644,7 +646,8 @@ the whole reconciled path, not only the first and last closes."""
 back-adjust AST closes with the split table: for each event with ratio
 A-for-B on date D, multiply every AST close with date < D by B/A (events
 apply cumulatively; the close on D itself is already on the new basis).
-MKT and SEC are never adjusted. Compute simple daily returns on the aligned
+MKT and SEC are never adjusted. Compute simple daily returns (not log
+returns) on the aligned
 (inner join) adjusted AST, MKT and SEC closes and run the ordinary least
 squares regression AST_return = alpha + beta_market * MKT_return +
 beta_sector * SEC_return + error over all aligned return days. Report the
