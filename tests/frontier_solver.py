@@ -135,14 +135,16 @@ def solve(task, csv_path):
         problems = _detect(block)
         prices = _aligned(_frames(block))
         assets = sorted(t for t in prices.columns if t != "IDX")
-        window = int(re.search(r"window of\s+(\d+)", prompt).group(1))
+        window = int(re.search(r"final (\d+) consecutive return",
+                               prompt).group(1))
         target = re.search(r"target asset is (\w+)", prompt).group(1)
         rets = prices.pct_change().dropna()
-        cov = rets.rolling(window).cov(rets["IDX"])
-        var = rets["IDX"].rolling(window).var(ddof=1)
+        last = rets.iloc[-window:]
         ew = rets[assets].mean(axis=1)
         return {"problems": sorted(problems),
-                "mean_beta": round(float((cov[target] / var).mean()), 6),
+                "last_window_beta": round(
+                    float(last[target].cov(last["IDX"])
+                          / last["IDX"].var(ddof=1)), 6),
                 "target_asset": target,
                 "final_window_volatility": round(
                     float(ew.iloc[-window:].std(ddof=1) * np.sqrt(252)), 6),

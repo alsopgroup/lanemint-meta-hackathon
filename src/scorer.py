@@ -465,7 +465,12 @@ class TaskScorer:
         # whole reconciled series; low-effort runs landed within ~3e-4 of
         # it while endpoint shortcuts are off by orders of magnitude more)
         # and for the F3 factor betas beta_market/beta_sector (pilot
-        # near-misses landed 3e-4-1e-3 off the exact OLS values), and
+        # near-misses landed 3e-4-1e-3 off the exact OLS values), 1e-3 for
+        # frontier max_drawdown (same accumulated-path reasoning; the
+        # hard tier's max_drawdown tasks keep 1e-4), 1e-5 for r_squared
+        # (the simple-vs-log-returns discriminator: a regression run on
+        # log returns shifts R-squared by more than 1e-5 whenever its
+        # betas are close enough to pass at 1e-3, measured 0/400), and
         # 1e-4 for everything else (returns, other betas, volatility,
         # correlations, values).
         for field, exp_val in expected.items():
@@ -496,8 +501,11 @@ class TaskScorer:
             elif isinstance(exp_val, float):
                 tolerance = 0.01 if field == 'final_price' \
                     or field.endswith('_price') else \
+                    1e-5 if field == 'r_squared' else \
                     1e-3 if field in ('reconciled_max_drawdown',
-                                      'beta_market', 'beta_sector') else 1e-4
+                                      'beta_market', 'beta_sector') or (
+                        field == 'max_drawdown'
+                        and str(task_id).startswith('task_f_')) else 1e-4
                 actual_val = parsed.get(field)
                 if actual_val is None:
                     scores[field] = 0.0
@@ -534,15 +542,24 @@ class TaskScorer:
         # otherwise reach 0.8 with the core value guessed as 0.0).
         core_ok = True
         for field in ('reconciled_total_return', 'reconciled_max_drawdown',
-                      'final_return', 'beta_market', 'beta_sector'):
+                      'final_return', 'beta_market', 'beta_sector',
+                      'r_squared'):
             if field in expected and scores.get(field, 0.0) < 1.0:
                 core_ok = False
-        # Frontier F1's core is the single target asset's mean beta
-        # (identified by the accompanying target_asset field; the hard
-        # tier's unrelated mean_beta tasks have no such field and keep
-        # their existing pass rule).
-        if 'mean_beta' in expected and 'target_asset' in expected:
-            core_ok = core_ok and scores.get('mean_beta', 0.0) >= 1.0
+        # Frontier F1's cores are the last-window beta and the
+        # final-window volatility (both identified by last_window_beta;
+        # the hard tier's unrelated mean_beta tasks are unaffected).
+        if 'last_window_beta' in expected:
+            core_ok = core_ok and \
+                scores.get('last_window_beta', 0.0) >= 1.0 and \
+                scores.get('final_window_volatility', 0.0) >= 1.0
+        # Frontier F4's max_drawdown is core too (identified by the
+        # accompanying first_rebalance_value; pilot passes had it wrong
+        # while reaching 0.8 overall). The hard tier's standalone
+        # max_drawdown tasks have no first_rebalance_value and keep
+        # their existing pass rule.
+        if 'max_drawdown' in expected and 'first_rebalance_value' in expected:
+            core_ok = core_ok and scores.get('max_drawdown', 0.0) >= 1.0
         result = {'task_id': task_id,
                   'passed': overall >= 0.8 and problems_ok and core_ok,
                   'score': round(overall, 3), 'component_scores': scores,
