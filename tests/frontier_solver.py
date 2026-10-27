@@ -136,20 +136,14 @@ def solve(task, csv_path):
         prices = _aligned(_frames(block))
         assets = sorted(t for t in prices.columns if t != "IDX")
         window = int(re.search(r"window of\s+(\d+)", prompt).group(1))
+        target = re.search(r"target asset is (\w+)", prompt).group(1)
         rets = prices.pct_change().dropna()
         cov = rets.rolling(window).cov(rets["IDX"])
         var = rets["IDX"].rolling(window).var(ddof=1)
-        betas = {a: round(float((cov[a] / var).mean()), 6) for a in assets}
-        # First maximum in (window-end date, asset order) order is the
-        # prompt's tie break: earliest date, then asset ticker order.
-        corr = rets.rolling(window).corr(rets["IDX"])[assets].dropna()
-        pos = int(np.argmax(corr.to_numpy()))
-        wi, ai = np.unravel_index(pos, corr.shape)
         ew = rets[assets].mean(axis=1)
-        return {"problems": sorted(problems), "mean_betas": betas,
-                "peak_correlation": round(float(corr.to_numpy()[wi, ai]), 6),
-                "peak_correlation_asset": assets[ai],
-                "peak_correlation_date": str(corr.index[wi]),
+        return {"problems": sorted(problems),
+                "mean_beta": round(float((cov[target] / var).mean()), 6),
+                "target_asset": target,
                 "final_window_volatility": round(
                     float(ew.iloc[-window:].std(ddof=1) * np.sqrt(252)), 6),
                 "num_assets": len(assets), "num_aligned_days": len(prices)}
