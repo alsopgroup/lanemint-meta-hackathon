@@ -97,6 +97,23 @@ def _max_tokens() -> int:
         return DEFAULT_MAX_TOKENS
 
 
+def _safe_exc_summary(exc: BaseException) -> str:
+    """Log only the exception type and HTTP status.
+
+    Exception text (and JSON parse snippets) can echo request headers
+    or response bodies that contain credentials; never write those.
+    """
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None:
+        return f"{name} status={status}"
+    return name
+
+
 def _parse_findings(content: str, num_rows: int) -> list[dict]:
     text = (content or "").strip()
     if "```json" in text:
@@ -110,9 +127,9 @@ def _parse_findings(content: str, num_rows: int) -> list[dict]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        # Generic message only: parse details (and any echoed response
-        # text) must never reach the browser. Details stay in the log.
-        print(f"[_parse_findings] model returned invalid JSON: {exc}")
+        # Type only: parse-error text can include a snippet of the
+        # response body, which may echo credentials.
+        print(f"[_parse_findings] {_safe_exc_summary(exc)}")
         raise MuseUpstreamError("Model did not return valid JSON") from exc
 
     raw = parsed.get("findings") if isinstance(parsed, dict) else None
@@ -199,10 +216,9 @@ def check_csv(filename: str, csv_text: str) -> dict:
             max_tokens=_max_tokens(),
         )
     except Exception as exc:  # upstream/network errors become a clean 502
-        # Generic message only: upstream error text can echo request
-        # headers (including credentials) and must never reach the
-        # browser. The detail is logged server-side instead.
-        print(f"[check_csv] upstream request failed: {exc}")
+        # Type + status only: exception text can echo request headers
+        # (including credentials) and must never be written to logs.
+        print(f"[check_csv] {_safe_exc_summary(exc)}")
         raise MuseUpstreamError("Muse request failed") from exc
     latency_ms = round((time.perf_counter() - started) * 1000)
 

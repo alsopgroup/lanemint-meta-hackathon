@@ -218,17 +218,54 @@ def test_malformed_responses_still_hit_budget(monkeypatch):
     assert "budget" in second.json()["error"]
 
 
-def test_upstream_error_text_never_reaches_browser(monkeypatch):
+def test_upstream_error_text_never_reaches_browser(monkeypatch, capsys):
     monkeypatch.setenv("META_API_KEY", "test-key")
 
+    class FakeAPIError(RuntimeError):
+        status_code = 401
+
     def exploding_create(self, **kwargs):  # noqa: ANN001, ANN202
-        raise RuntimeError("upstream echoed header authorization: Bearer FAKEKEY123")
+        raise FakeAPIError("upstream echoed header authorization: Bearer FAKEKEY123")
 
     _stub_openai(monkeypatch, exploding_create)
     resp = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
     assert resp.status_code == 502
     assert resp.json()["error"] == "Muse request failed"
     assert "FAKEKEY123" not in resp.text
+    logged = capsys.readouterr().out
+    assert "FAKEKEY123" not in logged
+    assert "FakeAPIError status=401" in logged
+    assert "Bearer" not in logged
+
+
+def test_parse_error_log_has_no_response_body(capsys):
+    secret = "FAKEKEY123 echoed in the body"
+    with pytest.raises(muse_client.MuseUpstreamError):
+        muse_client._parse_findings(secret, num_rows=3)
+    logged = capsys.readouterr().out
+    assert "FAKEKEY123" not in logged
+    assert "JSONDecodeError" in logged
+
+
+def test_zero_limit_is_a_hard_block(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "0")
+    monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
+    _stub_openai(monkeypatch, _live_ok_create)
+    resp = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    assert resp.status_code == 429
+    assert "rate limit" in resp.json()["error"]
+
+
+def test_zero_budget_is_a_hard_block(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "100")
+    monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
+    monkeypatch.setenv("LIVE_DAILY_BUDGET_USD", "0")
+    _stub_openai(monkeypatch, _live_ok_create)
+    resp = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    assert resp.status_code == 429
+    assert "budget" in resp.json()["error"]
 
 
 def test_client_ip_prefers_x_real_ip(monkeypatch):

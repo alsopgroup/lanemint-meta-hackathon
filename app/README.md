@@ -44,7 +44,8 @@ which fits a single Railway replica but is not a distributed limiter):
   so billed-but-malformed responses cannot slip past the cap. The
   client uses `max_retries=0`, so one request is one billed attempt.
   Tune with `LIVE_RATE_PER_MINUTE`, `LIVE_RATE_PER_HOUR`,
-  `LIVE_DAILY_MAX_CALLS`, `LIVE_DAILY_BUDGET_USD`. Violations get
+  `LIVE_DAILY_MAX_CALLS`, `LIVE_DAILY_BUDGET_USD`. A value of `0`
+  is a hard block (no live calls), not unlimited. Violations get
   `429` + `Retry-After`.
 - **The daily counters reset on every redeploy** (and at UTC
   midnight): they live in process memory, so a redeploy restarts the

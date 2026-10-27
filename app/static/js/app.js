@@ -326,8 +326,17 @@ function renderAnalyze() {
   const logLines = [];
   if (st.stage !== 'idle') {
     if (simulated) {
-      logLines.push({ t: '[simulated] No API request was sent — demo data only, no model was called', c: 'var(--warning-500)' });
-      logLines.push({ t: `  file=${s.file}  rows=${s.rows.length}  cols=${s.cols.length}`, c: 'var(--text-3)' });
+      if (serverLive()) {
+        // A live request was actually sent (or blocked); don't claim none was.
+        logLines.push({ t: `→ POST /api/check  model=${appConfig.model || 'muse-spark'}`, c: 'var(--text-2)' });
+        logLines.push({ t: `  file=${s.file}  rows=${s.rows.length}  cols=${s.cols.length}`, c: 'var(--text-3)' });
+        logLines.push({ t: st.limitHit
+          ? '[simulated] Live request was blocked by a usage limit — showing demo data, not a model result'
+          : '[simulated] Live request failed — showing demo data, not a model result', c: 'var(--warning-500)' });
+      } else {
+        logLines.push({ t: '[simulated] No API request was sent — demo data only, no model was called', c: 'var(--warning-500)' });
+        logLines.push({ t: `  file=${s.file}  rows=${s.rows.length}  cols=${s.cols.length}`, c: 'var(--text-3)' });
+      }
       let c2 = 0; STEPS.forEach(([k, , w]) => { c2 += w; if (done || fr >= c2) simF.filter(f => f.step === k).forEach(f => logLines.push({ t: `[simulated] {"type":"${k}","rows":[${(f.rows || []).join(',')}],"title":"${f.title}"}`, c: TYPES[k] ? TYPES[k][1] : 'var(--text-1)' })); });
       if (running) logLines.push({ t: '▍', c: 'var(--accent)' });
       if (done) logLines.push({ t: `Demo complete · ${currentFindings().length} simulated findings`, c: 'var(--warning-500)' });
@@ -353,7 +362,7 @@ function renderAnalyze() {
       <div class="analyze-status">${badge(statusTone, statusLabel, true)}${st.err ? `<span class="form-error" style="font-size:13px">${esc(st.err)}</span>` : ''}</div>
     </div>
     <div class="stream-card">
-      <div class="stream-head"><span>${simulated ? 'simulated stream — no request sent' : 'response stream'}</span><span>${done ? currentFindings().length + ' findings' : running ? 'streaming' : ''}</span></div>
+      <div class="stream-head"><span>${simulated ? (serverLive() ? 'simulated stream — live request failed' : 'simulated stream — no request sent') : 'response stream'}</span><span>${done ? currentFindings().length + ' findings' : running ? 'streaming' : ''}</span></div>
       <div class="stream-log">${logLines.map(ln => `<span style="color:${ln.c}">${esc(ln.t)}</span>`).join('')}</div>
       ${done ? '<div class="stream-foot"><button class="btn btn-primary btn-sm" data-action="go" data-step="findings" type="button">See findings →</button></div>' : ''}
     </div></div>`;

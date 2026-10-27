@@ -94,15 +94,18 @@ class LiveCallGuard:
             hour = self._hour[client_ip]
             self._prune(minute, now, 60)
             self._prune(hour, now, 3600)
-            if per_minute and len(minute) >= per_minute:
-                return False, max(1, int(60 - (now - minute[0])) + 1), "rate limit: too many requests this minute"
-            if per_hour and len(hour) >= per_hour:
-                return False, max(1, int(3600 - (now - hour[0])) + 1), "rate limit: too many requests this hour"
-            if daily_max and self._daily_calls >= daily_max:
+            # 0 is a hard block (no live calls), not "unlimited".
+            if len(minute) >= per_minute:
+                retry = max(1, int(60 - (now - minute[0])) + 1) if minute else 60
+                return False, retry, "rate limit: too many requests this minute"
+            if len(hour) >= per_hour:
+                retry = max(1, int(3600 - (now - hour[0])) + 1) if hour else 3600
+                return False, retry, "rate limit: too many requests this hour"
+            if self._daily_calls >= daily_max:
                 return False, 3600, "daily live-call cap reached"
-            if daily_budget and self._daily_spend_usd >= daily_budget:
+            if self._daily_spend_usd >= daily_budget:
                 return False, 3600, "daily live-call budget reached"
-            if daily_budget and reserve_usd > 0 and (
+            if reserve_usd > 0 and (
                 self._daily_spend_usd + self._reserved_usd + reserve_usd > daily_budget
             ):
                 return False, 3600, "daily live-call budget reached"
