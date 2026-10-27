@@ -89,6 +89,8 @@ def test_check_live_success(monkeypatch):
         json={"filename": "x.csv", "csv": CSV, "model": "bogus-expensive-model"},
     )
     assert resp.status_code == 200
+    # One request = one billed attempt: the SDK must not retry.
+    assert _stub_openai.last_client_kwargs.get("max_retries") == 0
     body = resp.json()
     assert body["model"] == "muse-spark-1.3"
     assert body["findings"] == [
@@ -112,8 +114,10 @@ def _stub_openai(monkeypatch, fake_create):  # noqa: ANN001
 
     class FakeOpenAI:
         def __init__(self, **kwargs):  # noqa: ANN003
+            _stub_openai.last_client_kwargs = kwargs
             self.chat = _Chat(fake_create)
 
+    _stub_openai.last_client_kwargs = {}
     monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
 
 
@@ -165,17 +169,88 @@ def test_check_rate_limited_per_ip(monkeypatch):
     assert int(second.headers["Retry-After"]) >= 1
 
 
+def _live_full_usage_create(self, **kwargs):  # noqa: ANN001, ANN202
+    """Live stub whose reported usage costs ~one worst-case reserve."""
+    message = type(
+        "M", (), {"content": '{"findings": [{"type": "dups", "title": "Dup", '
+                            '"rows": [1], "explain": "e"}]}'}
+    )()
+    usage = type("U", (), {"prompt_tokens": 400, "completion_tokens": 4096})()
+    return type("R", (), {"choices": [type("C", (), {"message": message})()],
+                          "usage": usage})()
+
+
 def test_check_daily_budget_cap(monkeypatch):
     monkeypatch.setenv("META_API_KEY", "test-key")
     monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "100")
     monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
-    monkeypatch.setenv("LIVE_DAILY_BUDGET_USD", "0.000001")
-    _stub_openai(monkeypatch, _live_ok_create)
+    # Budget fits one reserved worst case (settled at ~full usage)
+    # but not a second reservation on top of that spend.
+    budget = muse_client.worst_case_cost_usd(CSV) * 1.5
+    monkeypatch.setenv("LIVE_DAILY_BUDGET_USD", str(budget))
+    _stub_openai(monkeypatch, _live_full_usage_create)
     first = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
     second = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
     assert first.status_code == 200
     assert second.status_code == 429
     assert "budget" in second.json()["error"]
+
+
+def test_malformed_responses_still_hit_budget(monkeypatch):
+    """Billed-but-unparseable responses must count against the budget."""
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "100")
+    monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
+    budget = muse_client.worst_case_cost_usd(CSV) * 1.5
+    monkeypatch.setenv("LIVE_DAILY_BUDGET_USD", str(budget))
+
+    def garbage_create(self, **kwargs):  # noqa: ANN001, ANN202
+        message = type("M", (), {"content": "definitely not json"})()
+        return type("R", (), {"choices": [type("C", (), {"message": message})()]})()
+
+    _stub_openai(monkeypatch, garbage_create)
+    first = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    second = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    assert first.status_code == 502
+    # The failed call settled at its reserved worst case, so the next
+    # reservation no longer fits the budget.
+    assert second.status_code == 429
+    assert "budget" in second.json()["error"]
+
+
+def test_upstream_error_text_never_reaches_browser(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+
+    def exploding_create(self, **kwargs):  # noqa: ANN001, ANN202
+        raise RuntimeError("upstream echoed header authorization: Bearer FAKEKEY123")
+
+    _stub_openai(monkeypatch, exploding_create)
+    resp = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    assert resp.status_code == 502
+    assert resp.json()["error"] == "Muse request failed"
+    assert "FAKEKEY123" not in resp.text
+
+
+def test_client_ip_prefers_x_real_ip(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "1")
+    monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
+    _stub_openai(monkeypatch, _live_ok_create)
+    first = client.post(
+        "/api/check", json={"filename": "x.csv", "csv": CSV},
+        headers={"X-Real-IP": "203.0.113.7", "X-Forwarded-For": "198.51.100.1"},
+    )
+    second = client.post(
+        "/api/check", json={"filename": "x.csv", "csv": CSV},
+        headers={"X-Real-IP": "203.0.113.7", "X-Forwarded-For": "198.51.100.2"},
+    )
+    third = client.post(
+        "/api/check", json={"filename": "x.csv", "csv": CSV},
+        headers={"X-Real-IP": "203.0.113.8", "X-Forwarded-For": "198.51.100.1"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 429  # same X-Real-IP bucket despite new XFF
+    assert third.status_code == 200  # different X-Real-IP, fresh bucket
 
 
 def test_check_chunked_oversized_body_413():

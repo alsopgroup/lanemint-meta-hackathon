@@ -35,6 +35,7 @@ from muse_client import (
     check_csv,
     live_config,
     validate_csv,
+    worst_case_cost_usd,
 )
 from rate_limit import guard
 
@@ -79,6 +80,13 @@ def _origin_allowed(request: Request) -> bool:
 
 
 def _client_ip(request: Request) -> str:
+    # X-Real-IP is set by Railway's edge proxy and is the trustworthy
+    # client address there; X-Forwarded-For's first hop is the fallback.
+    # Neither header is trustworthy if the service is reached directly,
+    # which is why the global daily caps exist alongside per-IP limits.
+    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
         return forwarded.split(",")[0].strip() or "unknown"
@@ -140,7 +148,11 @@ async def api_check(request: Request) -> JSONResponse:
             status_code=503,
         )
 
-    allowed, retry_after, reason = guard.acquire(_client_ip(request))
+    # Reserve the worst-case cost up front: the reservation is held
+    # against the daily budget for the whole call, so billed-but-failed
+    # calls (e.g. malformed model output) cannot slip past the cap.
+    reserve_usd = worst_case_cost_usd(csv_text)
+    allowed, retry_after, reason = guard.acquire(_client_ip(request), reserve_usd)
     if not allowed:
         return JSONResponse(
             {"error": reason},
@@ -152,17 +164,23 @@ async def api_check(request: Request) -> JSONResponse:
         # event loop so /healthz and static files stay responsive.
         result = await run_in_threadpool(check_csv, filename, csv_text)
     except MuseBadRequest as exc:
+        guard.settle(reserve_usd, reserve_usd)
         return JSONResponse({"error": str(exc)}, status_code=413)
     except MuseNotConfigured:
+        guard.settle(reserve_usd, reserve_usd)
         return JSONResponse(
             {"error": "Live mode is not configured; use simulated responses", "mode": "simulated"},
             status_code=503,
         )
     except MuseUpstreamError as exc:
+        # The upstream may have billed this attempt; settle at the
+        # reserved worst case rather than letting it vanish from the
+        # daily spend counter. exc text is generic by construction.
+        guard.settle(reserve_usd, reserve_usd)
         return JSONResponse({"error": str(exc)}, status_code=502)
     finally:
         guard.release()
-    guard.record_spend(float(result.pop("estimated_cost_usd", 0.0) or 0.0))
+    guard.settle(reserve_usd, float(result.pop("estimated_cost_usd", 0.0) or 0.0))
     return JSONResponse(result)
 
 

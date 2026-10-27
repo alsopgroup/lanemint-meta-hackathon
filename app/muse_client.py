@@ -72,6 +72,21 @@ def validate_csv(csv_text: str) -> tuple[str, int]:
     return "\n".join(lines), len(lines) - 1
 
 
+def worst_case_cost_usd(csv_text: str) -> float:
+    """Upper-bound cost of one check_csv call, for budget reservation.
+
+    Input tokens are estimated at ~4 chars/token over the whole prompt
+    (system prompt + header + CSV); output is capped at _max_tokens().
+    With max_retries=0 there is exactly one billed attempt per call.
+    """
+    prompt_chars = len(_SYSTEM_PROMPT) + len(csv_text) + 64
+    input_tokens = max(1, prompt_chars // 4)
+    return (
+        input_tokens * INPUT_USD_PER_TOKEN
+        + _max_tokens() * OUTPUT_USD_PER_TOKEN
+    )
+
+
 def _max_tokens() -> int:
     raw = os.getenv("META_MAX_TOKENS")
     if not raw:
@@ -95,7 +110,10 @@ def _parse_findings(content: str, num_rows: int) -> list[dict]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise MuseUpstreamError(f"Model did not return valid JSON: {exc}") from exc
+        # Generic message only: parse details (and any echoed response
+        # text) must never reach the browser. Details stay in the log.
+        print(f"[_parse_findings] model returned invalid JSON: {exc}")
+        raise MuseUpstreamError("Model did not return valid JSON") from exc
 
     raw = parsed.get("findings") if isinstance(parsed, dict) else None
     if not isinstance(raw, list):
@@ -160,7 +178,9 @@ def check_csv(filename: str, csv_text: str) -> dict:
     except ImportError as exc:  # pragma: no cover - dependency guard
         raise MuseUpstreamError("openai package is not installed") from exc
 
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=30.0)
+    # max_retries=0: one call = one billed attempt, so the budget
+    # reservation in rate_limit.py is a true worst case per request.
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=30.0, max_retries=0)
     started = time.perf_counter()
     try:
         response = client.chat.completions.create(
@@ -179,7 +199,11 @@ def check_csv(filename: str, csv_text: str) -> dict:
             max_tokens=_max_tokens(),
         )
     except Exception as exc:  # upstream/network errors become a clean 502
-        raise MuseUpstreamError(f"Muse request failed: {exc}") from exc
+        # Generic message only: upstream error text can echo request
+        # headers (including credentials) and must never reach the
+        # browser. The detail is logged server-side instead.
+        print(f"[check_csv] upstream request failed: {exc}")
+        raise MuseUpstreamError("Muse request failed") from exc
     latency_ms = round((time.perf_counter() - started) * 1000)
 
     content = ""
