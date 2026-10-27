@@ -163,11 +163,25 @@ class TaskRunner:
             'task_id': task['id'],
             'task_type': task['type'],
             'response': content,
+            'model': self.model_name,
+            'max_tokens': self._max_tokens_for(task),
             'finish_reason': finish_reason,
             'prompt_tokens': prompt_tokens,
             'completion_tokens': completion_tokens,
             'total_tokens': total_tokens,
         }
+
+    @staticmethod
+    def _repair_partial_line(path: Path) -> None:
+        """Truncate a trailing partial JSONL record left by a crash."""
+        if not path.exists():
+            return
+        data = path.read_bytes()
+        if not data or data.endswith(b'\n'):
+            return
+        cut = data.rfind(b'\n')
+        with open(path, 'r+b') as f:
+            f.truncate(cut + 1)
 
     @staticmethod
     def _error_status(exc: Exception) -> int | None:
@@ -180,6 +194,8 @@ class TaskRunner:
         # exception text/body, which may echo request details.
         return {'task_id': task['id'], 'task_type': task.get('type'),
                 'response': '', 'finish_reason': None,
+                'model': self.model_name,
+                'max_tokens': self._max_tokens_for(task),
                 'prompt_tokens': None, 'completion_tokens': None,
                 'total_tokens': None,
                 'error': {'type': type(exc).__name__,
@@ -199,8 +215,12 @@ class TaskRunner:
         after every task) and collected into ``results.json`` at the end,
         so one task's API failure cannot lose earlier paid responses: a
         failing task is recorded with only its error type and HTTP
-        status. With ``resume=True``, tasks already present without an
-        error are skipped; error entries are retried.
+        status. Every entry records the model and token cap used. With
+        ``resume=True``, tasks already present without an error are
+        skipped (refused if they were made with a different model) and
+        error entries are retried; without it, any previous
+        ``results.jsonl``/``results.json`` in the output dir is removed
+        first so a fresh run never appends to a stale one.
 
         Args:
             tasks_dir: Directory containing tasks and data
@@ -216,9 +236,15 @@ class TaskRunner:
             tasks = tasks[:limit]
         task_ids = {t['id'] for t in tasks}
 
+        jsonl_path = output_dir / 'results.jsonl'
+        results_file = output_dir / 'results.json'
         done = {}
         if resume:
-            jsonl_path = output_dir / 'results.jsonl'
+            # A crash can leave a partial last line: truncate back to
+            # the last newline before loading or appending, so a new
+            # record is never glued onto the fragment (which would make
+            # that task unparseable and bill it again on the next resume).
+            self._repair_partial_line(jsonl_path)
             if jsonl_path.exists():
                 for line in jsonl_path.read_text().splitlines():
                     try:
@@ -227,11 +253,22 @@ class TaskRunner:
                         continue  # partial line from a crash mid-write
                     if entry.get('task_id') in task_ids:
                         done[entry['task_id']] = entry
-            elif (output_dir / 'results.json').exists():
-                for entry in json.loads(
-                        (output_dir / 'results.json').read_text()):
+            elif results_file.exists():
+                for entry in json.loads(results_file.read_text()):
                     if entry.get('task_id') in task_ids:
                         done[entry['task_id']] = entry
+            prior_models = {e.get('model') for e in done.values()
+                            if e.get('model')}
+            if prior_models and prior_models != {self.model_name}:
+                raise ValueError(
+                    f"--resume refused: {output_dir} contains results from "
+                    f"model(s) {sorted(prior_models)}, not "
+                    f"{self.model_name!r}; use a different --output-dir "
+                    "or omit --resume to start fresh")
+        else:
+            # Fresh run: never append to a previous run's output.
+            jsonl_path.unlink(missing_ok=True)
+            results_file.unlink(missing_ok=True)
 
         print(f"Running {len(tasks)} tasks...")
         if self.dry_run:
@@ -241,7 +278,6 @@ class TaskRunner:
             print(f"Base URL: {self.base_url}")
 
         results_by_id = {}
-        jsonl_path = output_dir / 'results.jsonl'
         with open(jsonl_path, 'a') as jf:
             if resume and done and not jsonl_path.stat().st_size:
                 for task in tasks:  # seed jsonl from an earlier results.json
@@ -276,7 +312,6 @@ class TaskRunner:
 
         results = [results_by_id[t['id']] for t in tasks
                    if t['id'] in results_by_id]
-        results_file = output_dir / 'results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
 

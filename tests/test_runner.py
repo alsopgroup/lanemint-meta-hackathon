@@ -144,9 +144,9 @@ def _tasks_dir(tmp_path):
     return tmp_path
 
 
-def _runner_with_client(client):
+def _runner_with_client(client, model_name=None):
     from src.runner import TaskRunner
-    runner = TaskRunner(dry_run=True)
+    runner = TaskRunner(dry_run=True, model_name=model_name)
     runner.client = client
     runner.dry_run = True
     return runner
@@ -201,6 +201,71 @@ def test_resume_skips_successes_and_retries_errors(tmp_path):
     third = _runner_with_client(third_client)
     third.run_all_tasks(tasks_dir, out, resume=True)
     assert third_client.calls == 0  # everything already in the output
+
+
+def test_resume_repairs_partial_last_line_with_exactly_one_call(tmp_path):
+    import json as _json
+    tasks_dir = _tasks_dir(tmp_path / 'tasks')
+    out = tmp_path / 'out'
+    _runner_with_client(_StubClient()).run_all_tasks(tasks_dir, out)
+
+    # Simulate a crash mid-write: truncate the last JSONL record.
+    jsonl = out / 'results.jsonl'
+    data = jsonl.read_bytes()
+    last_start = data.rfind(b'\n', 0, len(data) - 1) + 1
+    jsonl.write_bytes(data[:last_start] + data[last_start:last_start + 10])
+    assert not jsonl.read_bytes().endswith(b'\n')
+
+    client = _StubClient()
+    results = _runner_with_client(client).run_all_tasks(
+        tasks_dir, out, resume=True)
+    assert client.calls == 1  # only the task whose record was cut
+    lines = jsonl.read_text().strip().splitlines()
+    assert len(lines) == 3
+    parsed = [_json.loads(line) for line in lines]  # every line is whole
+    assert [p['task_id'] for p in parsed] == ['task_001', 'task_002', 'task_003']
+    assert all('error' not in r for r in results)
+
+
+def test_without_resume_starts_fresh(tmp_path):
+    import json as _json
+    tasks_dir = _tasks_dir(tmp_path / 'tasks')
+    out = tmp_path / 'out'
+    _runner_with_client(_StubClient()).run_all_tasks(tasks_dir, out)
+
+    class AlwaysFail:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_completions_create(self, messages, **kwargs):
+            self.calls += 1
+            raise ConnectionError('down')
+
+    client = AlwaysFail()
+    results = _runner_with_client(client).run_all_tasks(tasks_dir, out)
+    assert client.calls == 3  # nothing skipped, nothing appended to stale
+    lines = (out / 'results.jsonl').read_text().strip().splitlines()
+    assert len(lines) == 3
+    assert all('error' in r for r in results)
+    saved = _json.loads((out / 'results.json').read_text())
+    assert all('error' in r for r in saved)  # stale successes replaced
+
+
+def test_resume_refuses_different_model(tmp_path):
+    import pytest
+
+    tasks_dir = _tasks_dir(tmp_path / 'tasks')
+    out = tmp_path / 'out'
+    results = _runner_with_client(
+        _StubClient(), model_name='model-a').run_all_tasks(tasks_dir, out)
+    assert results[0]['model'] == 'model-a'
+    assert results[0]['max_tokens'] == 16000
+
+    client = _StubClient()
+    with pytest.raises(ValueError, match='--resume refused'):
+        _runner_with_client(client, model_name='model-b').run_all_tasks(
+            tasks_dir, out, resume=True)
+    assert client.calls == 0
 
 
 def test_env_overrides_tier_default(monkeypatch):
