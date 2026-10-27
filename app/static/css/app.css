@@ -59,9 +59,9 @@ button{font:inherit}
 .hero-inner h1 .accent{color:var(--accent)}
 .hero-inner p{margin:0;max-width:660px;font-size:18px;line-height:26px;letter-spacing:-.01em;color:var(--text-2);text-wrap:pretty}
 .hero-actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
-.hero-meta{display:flex;align-items:center;gap:10px;margin-top:8px;color:var(--text-3);font-family:var(--font-ui);font-size:13px;letter-spacing:.25px}
+.hero-meta{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:14px;margin-top:8px;color:var(--text-2);font-family:var(--font-ui);font-size:15px;letter-spacing:.25px}
 .hero-meta img{width:22px;height:22px}
-.hero-meta img.meta-wordmark{width:auto;height:24px}
+.hero-meta img.meta-wordmark{width:auto;height:48px;max-width:72vw}
 
 /* ---------- App / demo panel ---------- */
 .app-section{scroll-margin-top:68px;max-width:1200px;margin:0 auto;padding:72px 24px 96px;display:flex;flex-direction:column;gap:24px}

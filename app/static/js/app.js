@@ -173,26 +173,43 @@ function run() {
   cancelInFlight();
   const runId = currentRunId;
   const s = cur(), live = serverLive(), t0 = performance.now();
-  Object.assign(state, { step: 'analyze', stage: 'running', elapsed: 0, live: null, err: null, active: -1, view: 'raw', runMode: live ? 'live' : 'simulated' });
+  Object.assign(state, { step: 'analyze', stage: 'running', elapsed: 0, live: null, err: null, limitHit: false, active: -1, view: 'raw', runMode: live ? 'live' : 'simulated' });
   if (live) {
     pendingLive = true;
     const controller = new AbortController();
     currentAbort = controller;
     fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ filename: s.file, csv: toCSV(s) }) })
-      .then(r => { if (!r.ok) throw new Error('Endpoint returned HTTP ' + r.status); return r.json(); })
+      .then(async r => {
+        if (!r.ok) {
+          // Keep the server's status + message so a 429 can be shown
+          // as a friendly limit notice instead of a generic failure.
+          let serverError = '';
+          try { serverError = (await r.json()).error || ''; } catch (e) { /* non-JSON error body */ }
+          const err = new Error(serverError || ('Endpoint returned HTTP ' + r.status));
+          err.status = r.status;
+          err.serverError = serverError;
+          throw err;
+        }
+        return r.json();
+      })
       .then(j => {
         if (runId !== currentRunId) return; // stale run: a newer run owns the UI
         pendingLive = false;
         state.live = { findings: (j.findings || []).map(f => ({ step: f.type || f.step, title: f.title || 'Problem', rows: (f.rows || []).map(Number), explain: f.explain || f.explanation || '' })), ms: Math.round(j.latency_ms || performance.now() - t0), model: j.model };
       })
-      .catch(() => {
+      .catch(fetchErr => {
         if (runId !== currentRunId) return; // aborted/superseded: stay silent
         pendingLive = false;
         // Fall back to simulated *within this run*: flipping runMode is
         // safe because the timer reads the per-run snapshot, and this
         // run now completes on simulated pacing instead of hanging.
         state.runMode = 'simulated';
-        state.err = 'Live call failed — showing simulated demo results, not a live model run.';
+        if (fetchErr && fetchErr.status === 429) {
+          state.limitHit = true;
+          state.err = 'Live checks are paused — ' + (fetchErr.serverError || 'usage limit reached') + '. Showing simulated demo results, not a live model run.';
+        } else {
+          state.err = 'Live call failed — showing simulated demo results, not a live model run.';
+        }
         renderMode();
       });
   }
@@ -205,11 +222,11 @@ function run() {
     else if (el >= s.ms) fin(s.ms); else { state.elapsed = el; renderAnalyze(); renderStepper(); }
   }, 40);
 }
-function trySample() { clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: 's1', upload: null, stage: 'idle', step: 'data', live: null, err: null, runMode: null }); render(); scrollToApp(); setTimeout(run, 500); }
+function trySample() { clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: 's1', upload: null, stage: 'idle', step: 'data', live: null, err: null, limitHit: false, runMode: null }); render(); scrollToApp(); setTimeout(run, 500); }
 function pickFile() { const f = $('fileInput'); if (f) f.click(); }
 function loadFile(file) {
   if (!file) return; const rd = new FileReader();
-  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
+  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, limitHit: false, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
   rd.readAsText(file);
 }
 
@@ -229,13 +246,17 @@ function renderMode() {
   $('modeText').textContent = live
     ? 'live · /api/check · ' + (appConfig.model || 'muse-spark')
     : fallback
-      ? 'live call failed · showing simulated demo results'
+      ? state.limitHit
+        ? 'live limit reached · showing simulated demo results'
+        : 'live call failed · showing simulated demo results'
       : 'demo mode · no API key configured — simulated responses';
   const banner = $('demoBanner');
   if (banner) {
     banner.hidden = live;
     const bannerText = $('demoBannerText');
-    if (bannerText && fallback) bannerText.textContent = 'The live Muse call failed, so the findings, timings, and scores below are simulated demo results — not a live model run.';
+    if (bannerText && fallback) bannerText.textContent = state.limitHit
+      ? 'Live checks are paused because a usage limit was reached, so the findings, timings, and scores below are simulated demo results — not a live model run.'
+      : 'The live Muse call failed, so the findings, timings, and scores below are simulated demo results — not a live model run.';
   }
 }
 
