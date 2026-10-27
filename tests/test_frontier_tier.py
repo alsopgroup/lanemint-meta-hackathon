@@ -28,7 +28,8 @@ FIELDS = {
                               "final_window_volatility", "num_assets",
                               "num_aligned_days"],
     "frontier_vendor_reconciliation": ["mismatch_count", "first_conflict_date",
-                                       "reconciled_total_return", "num_tickers",
+                                       "reconciled_total_return",
+                                       "reconciled_max_drawdown", "num_tickers",
                                        "num_aligned_days"],
     "frontier_factor_exposure": ["alpha", "beta_market", "beta_sector",
                                  "r_squared", "num_return_days", "num_splits"],
@@ -55,12 +56,21 @@ def _score_all(tasks, out):
 
 class TestSettings:
     def test_defaults_taken_from_plan(self):
+        # Pilot-calibrated F1/F3 sizes (see FRONTIER_FAMILY_SETTINGS):
+        # tractable enough that a strong model actually computes, with
+        # difficulty in the data problems and rolling semantics.
         assert FRONTIER_FAMILY_SETTINGS["rolling_risk"] == \
-            {"rows": 500, "assets": 4, "window": 60}
-        assert 250 <= FRONTIER_FAMILY_SETTINGS["rolling_risk"]["rows"] <= 750
+            {"rows": 250, "assets": 2, "window": 20}
         assert FRONTIER_FAMILY_SETTINGS["vendor_reconciliation"]["conflicts"] == 12
-        assert FRONTIER_FAMILY_SETTINGS["factor_exposure"]["actions"] == 3
+        assert FRONTIER_FAMILY_SETTINGS["factor_exposure"] == \
+            {"rows": 250, "actions": 2}
         assert FRONTIER_FAMILY_SETTINGS["portfolio_pipeline"]["rebalance_every"] == 21
+
+    def test_f3_has_one_or_two_split_events(self):
+        for seed in range(1, 41):
+            gen = FrontierTaskGenerator(seed=seed)
+            task, _ = gen.generate_task_factor_exposure()
+            assert 1 <= task["expected"]["num_splits"] <= 2
 
     def test_settings_override_reaches_prompt(self):
         gen = FrontierTaskGenerator(seed=1, settings=SMALL)
@@ -254,11 +264,38 @@ class TestF2CentsConsistency:
         raise AssertionError(f"{task_id} not generated for seed {seed}")
 
 
+class TestF2ShortcutFails:
+    """First/last-close shortcuts score 0%: the drawdown core needs the path."""
+
+    def test_endpoint_only_drawdown_never_passes(self):
+        checked = 0
+        for seed in range(1, 21):
+            with tempfile.TemporaryDirectory() as tmp:
+                tasks, out = _gen(seed, SMALL, 4, tmp)
+                scorer = TaskScorer(out / "answers")
+                for task in tasks:
+                    if task["type"] != "frontier_vendor_reconciliation":
+                        continue
+                    key = json.loads((out / "answers" /
+                                      f"{task['id']}_answer.json").read_text())
+                    got = solve(task, out / task["data_file"])
+                    # What a first/last-only reader can report for the
+                    # drawdown: the two-point path [1, final value].
+                    shortcut = min(0.0, got["reconciled_total_return"])
+                    if abs(shortcut - key["reconciled_max_drawdown"]) <= 1e-4:
+                        continue  # coincidentally right; not a shortcut win
+                    got["reconciled_max_drawdown"] = round(shortcut, 6)
+                    result = scorer.score_task(task["id"], json.dumps(got))
+                    assert not result["passed"], (seed, task["id"])
+                    checked += 1
+        assert checked > 0
+
+
 class TestCoreFieldRequired:
     """Correct codes with constant numbers must pass 0% (core is required)."""
 
-    CORE = ("mean_betas", "reconciled_total_return", "beta_market",
-            "beta_sector", "final_return")
+    CORE = ("mean_betas", "reconciled_total_return", "reconciled_max_drawdown",
+            "beta_market", "beta_sector", "final_return")
 
     def _core_values(self, expected):
         vals = []

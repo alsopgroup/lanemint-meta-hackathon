@@ -318,6 +318,54 @@ def categories_for_items(items):
     return found
 
 
+def _placeholder_digits(value: float) -> bool:
+    """True for sequential-digit decimals such as 1.023456 or 0.987654."""
+    if not isinstance(value, float) or value != value \
+            or value in (float('inf'), float('-inf')):
+        return False
+    text = repr(abs(value))
+    if 'e' in text or '.' not in text:
+        return False
+    frac = text.replace('.', '')  # 1.023456 -> digits 1023456 (run 23456)
+    if len(frac) < 5:
+        return False
+    best = run = 1
+    direction = 0
+    for prev, cur in zip(frac, frac[1:], strict=False):
+        step = int(cur) - int(prev)
+        if step == direction and step in (1, -1):
+            run += 1
+        elif step in (1, -1):
+            direction, run = step, 2
+        else:
+            direction, run = 0, 1
+        best = max(best, run)
+    return best >= 5
+
+
+def _is_no_attempt(parsed: dict) -> bool:
+    """Tag placeholder-style answers: sequential-digit numbers, or every
+    numeric answer identical (e.g. all zeros). Analysis only; the score
+    itself is unchanged."""
+    values = []
+
+    def collect(node):
+        if isinstance(node, dict):
+            for v in node.values():
+                collect(v)
+        elif isinstance(node, list):
+            for v in node:
+                collect(v)
+        elif isinstance(node, float):
+            values.append(node)
+
+    collect({k: v for k, v in parsed.items()
+             if k not in ('problems', 'problems_found')})
+    if any(_placeholder_digits(v) for v in values):
+        return True
+    return len(values) >= 3 and len(set(values)) == 1
+
+
 class TaskScorer:
     """Scores task responses with detailed feedback."""
 
@@ -457,8 +505,8 @@ class TaskScorer:
         # secondary fields (codes plus secondary fields alone could
         # otherwise reach 0.8 with the core value guessed as 0.0).
         core_ok = True
-        for field in ('reconciled_total_return', 'final_return',
-                      'beta_market', 'beta_sector'):
+        for field in ('reconciled_total_return', 'reconciled_max_drawdown',
+                      'final_return', 'beta_market', 'beta_sector'):
             if field in expected and scores.get(field, 0.0) < 1.0:
                 core_ok = False
         if 'mean_betas' in expected:
@@ -468,7 +516,9 @@ class TaskScorer:
         result = {'task_id': task_id,
                   'passed': overall >= 0.8 and problems_ok and core_ok,
                   'score': round(overall, 3), 'component_scores': scores,
-                  'feedback': '; '.join(feedback) if feedback else 'All checks passed'}
+                  'feedback': '; '.join(feedback) if feedback else 'All checks passed',
+                  'analysis_flags': ['no_attempt'] if _is_no_attempt(parsed)
+                  else []}
         # Frontier F4 checkpoint score: partial progress along the pipeline
         # (aligned days, first rebalance value, final return, drawdown).
         # Reported only; the pass rule above is unchanged.
@@ -490,7 +540,11 @@ class TaskScorer:
         return {'total_tasks': len(scores), 'passed': num_passed,
                 'failed': len(scores) - num_passed,
                 'pass_rate': round(num_passed / len(scores), 3) if scores else 0,
-                'average_score': round(avg, 3), 'scores': scores}
+                'average_score': round(avg, 3),
+                'no_attempt_tasks': sum(
+                    1 for s in scores
+                    if 'no_attempt' in s.get('analysis_flags', [])),
+                'scores': scores}
 
 
 def main():
