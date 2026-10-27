@@ -568,6 +568,21 @@ class TestNoAttemptFlag:
         result = self._score(tmp_path, {
             'problems': ['unit_change'], 'mean_return': 0.0,
             'std_return': 0.0, 'annualized_volatility': 0.0,
+            'num_clean_days': 0})
+        assert 'no_attempt' in result['analysis_flags']
+
+    def test_all_identical_integer_values_flagged(self, tmp_path):
+        # JSON integers (0, not 0.0) count toward the identical check too.
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 0,
+            'std_return': 0, 'annualized_volatility': 0,
+            'num_clean_days': 0})
+        assert 'no_attempt' in result['analysis_flags']
+
+    def test_integer_sequential_placeholder_flagged(self, tmp_path):
+        result = self._score(tmp_path, {
+            'problems': ['unit_change'], 'mean_return': 123456,
+            'std_return': 0.02, 'annualized_volatility': 0.3,
             'num_clean_days': 12})
         assert 'no_attempt' in result['analysis_flags']
 

@@ -319,12 +319,14 @@ def categories_for_items(items):
 
 
 def _placeholder_digits(value: float) -> bool:
-    """True for sequential-digit decimals such as 1.023456 or 0.987654."""
-    if not isinstance(value, float) or value != value \
-            or value in (float('inf'), float('-inf')):
+    """True for sequential-digit numbers such as 1.023456 or 0.987654."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or value != value or value in (float('inf'), float('-inf')):
         return False
     text = repr(abs(value))
-    if 'e' in text or '.' not in text:
+    if 'e' in text:
+        return False
+    if '.' not in text and not isinstance(value, int):
         return False
     frac = text.replace('.', '')  # 1.023456 -> digits 1023456 (run 23456)
     if len(frac) < 5:
@@ -356,7 +358,7 @@ def _is_no_attempt(parsed: dict) -> bool:
         elif isinstance(node, list):
             for v in node:
                 collect(v)
-        elif isinstance(node, float):
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
             values.append(node)
 
     collect({k: v for k, v in parsed.items()
