@@ -23,8 +23,7 @@ OFF_LIMITS = ["delist", "survivorship", "rename", "dividend", "stale",
               "repeated_price", "too_short", "insufficient_history"]
 
 FIELDS = {
-    "frontier_rolling_risk": ["mean_betas", "peak_correlation",
-                              "peak_correlation_asset", "peak_correlation_date",
+    "frontier_rolling_risk": ["mean_beta", "target_asset",
                               "final_window_volatility", "num_assets",
                               "num_aligned_days"],
     "frontier_vendor_reconciliation": ["mismatch_count", "first_conflict_date",
@@ -107,6 +106,17 @@ class TestGeneration:
             assert "A-for-B" in prompt and "A new shares for B old shares" in prompt
             assert "problems" in prompt
 
+    def test_f1_prompt_names_target_and_has_no_peak_search(self):
+        gen = FrontierTaskGenerator(seed=7, settings=SMALL)
+        task, _ = gen.generate_task_rolling_risk()
+        assert "peak" not in task["prompt"].lower()
+        assert f"target asset is {task['expected']['target_asset']}" in \
+            " ".join(task["prompt"].split())
+        assert task["expected"]["target_asset"] in ("AST1", "AST2", "AST3")
+        assert set(task["expected"]) == {
+            "mean_beta", "target_asset", "final_window_volatility",
+            "num_assets", "num_aligned_days", "problems_found"}
+
     def test_f3_prompt_states_split_table_convention(self):
         gen = FrontierTaskGenerator(seed=7, settings=SMALL)
         task, payload = gen.generate_task_factor_exposure()
@@ -148,8 +158,11 @@ class TestCli:
         assert all(t["id"].startswith("task_f_") for t in tasks)
 
 
-def _score_makers_default(seed, count):
-    """Generate ``count`` tasks at shipped defaults and score the solver."""
+def _score_makers_default(seed, count, tamper=None):
+    """Generate ``count`` tasks at shipped defaults and score the solver.
+
+    ``tamper(task, got)`` may rewrite the solver's answer before scoring
+    (gaming baselines); it runs after the answer key is written."""
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         (out / "answers").mkdir()
@@ -164,6 +177,8 @@ def _score_makers_default(seed, count):
             data = out / "data.csv"
             data.write_text(payload)
             got = solve(task, data)
+            if tamper is not None:
+                got = tamper(task, got)
             results.append((task, scorer.score_task(
                 task["id"], json.dumps(got))))
     return results
@@ -308,7 +323,7 @@ class TestF2ShortcutFails:
 class TestCoreFieldRequired:
     """Correct codes with constant numbers must pass 0% (core is required)."""
 
-    CORE = ("mean_betas", "reconciled_total_return", "reconciled_max_drawdown",
+    CORE = ("mean_beta", "reconciled_total_return", "reconciled_max_drawdown",
             "beta_market", "beta_sector", "final_return")
 
     def _core_values(self, expected):
@@ -387,23 +402,47 @@ class TestScorerFrontierFields:
         assert result["component_scores"]["reconciled_max_drawdown"] == 0.0
         assert not result["passed"]
 
-    def test_date_and_dict_fields_exact_and_toleranced(self, tmp_path):
-        answer = {"mean_betas": {"AST1": 1.0}, "peak_correlation": 0.5,
-                  "peak_correlation_asset": "AST1",
-                  "peak_correlation_date": "2024-01-31",
-                  "final_window_volatility": 0.2, "num_assets": 1,
+    def test_f3_beta_tolerance_is_1e_3(self, tmp_path):
+        # Pilot near-misses landed 3e-4-1e-3 off the exact OLS betas, so
+        # beta_market/beta_sector are scored at 1e-3; alpha/r_squared and
+        # other floats stay at 1e-4, and the betas remain core fields.
+        answer = {"alpha": 0.0002, "beta_market": 1.22116,
+                  "beta_sector": 0.41059, "r_squared": 0.83,
+                  "num_return_days": 100, "num_splits": 1,
+                  "problems_found": ["split_x"]}
+        (tmp_path / "task_f_2004_answer.json").write_text(json.dumps(answer))
+        scorer = TaskScorer(tmp_path)
+        good = {k: v for k, v in answer.items() if k != "problems_found"}
+        good["problems"] = ["split"]
+        close = {**good, "beta_market": 1.22148,  # 3.2e-4 off
+                 "beta_sector": 0.40963}          # 9.6e-4 off
+        assert scorer.score_task("task_f_2004", json.dumps(close))["passed"]
+        half_off = {**good, "beta_market": 1.22166}  # 5e-4 off
+        assert scorer.score_task(
+            "task_f_2004", json.dumps(half_off))["passed"]
+        far = {**good, "beta_market": 1.22316}  # 2e-3 off
+        result = scorer.score_task("task_f_2004", json.dumps(far))
+        assert result["component_scores"]["beta_market"] == 0.0
+        assert not result["passed"]
+
+    def test_f1_fields_exact_and_toleranced(self, tmp_path):
+        answer = {"mean_beta": 1.0, "target_asset": "AST1",
+                  "final_window_volatility": 0.2, "num_assets": 2,
                   "num_aligned_days": 50, "problems_found": ["missing_day_x"]}
         (tmp_path / "task_f_2002_answer.json").write_text(json.dumps(answer))
         scorer = TaskScorer(tmp_path)
         good = {k: v for k, v in answer.items() if k != "problems_found"}
         good["problems"] = ["missing"]
         assert scorer.score_task("task_f_2002", json.dumps(good))["passed"]
-        bad = {**good, "peak_correlation_date": "2024-02-01"}
+        # Ticker strings are exact: the wrong target scores 0 there.
+        bad = {**good, "target_asset": "AST2"}
         result = scorer.score_task("task_f_2002", json.dumps(bad))
-        assert result["component_scores"]["peak_correlation_date"] == 0.0
-        worse = {**good, "peak_correlation_date": "2024-02-01",
-                 "peak_correlation_asset": "AST2"}
-        assert not scorer.score_task("task_f_2002", json.dumps(worse))["passed"]
+        assert result["component_scores"]["target_asset"] == 0.0
+        # mean_beta is the F1 core field: wrong beyond 1e-4 cannot pass.
+        off = {**good, "mean_beta": 1.01}
+        result = scorer.score_task("task_f_2002", json.dumps(off))
+        assert result["component_scores"]["mean_beta"] == 0.0
+        assert not result["passed"]
 
 
 class TestGuessBaselines:
@@ -430,6 +469,40 @@ class TestGuessBaselines:
             total += len(sets)
         assert fixed / total <= 0.12
         assert paste == 0
+
+    def test_guess_beta_one_passes_zero(self):
+        """Answering beta = 1.0 (everything else exactly right) must fail.
+
+        F1's core is the target asset's mean_beta (tolerance 1e-4); F3's
+        cores are beta_market/beta_sector (tolerance 1e-3). A task whose
+        true beta happens to sit within tolerance of 1.0 is a correct
+        answer, not a guess win, and is skipped."""
+        applied = []
+
+        def tamper(task, got):
+            exp = task["expected"]
+            if task["type"] == "frontier_rolling_risk":
+                if abs(exp["mean_beta"] - 1.0) <= 1e-4:
+                    return got
+                got = {**got, "mean_beta": 1.0}
+            elif task["type"] == "frontier_factor_exposure":
+                if abs(exp["beta_market"] - 1.0) <= 1e-3 or \
+                        abs(exp["beta_sector"] - 1.0) <= 1e-3:
+                    return got
+                got = {**got, "beta_market": 1.0, "beta_sector": 1.0}
+            else:
+                return got
+            applied.append(task["id"])
+            return got
+
+        checked = 0
+        for seed in range(1, 21):
+            for task, result in _score_makers_default(seed, 25, tamper):
+                if task["id"] in applied:
+                    assert not result["passed"], \
+                        (seed, task["id"], result["feedback"])
+                    checked += 1
+        assert checked > 0
 
 
 class TestPromptSizeScript:

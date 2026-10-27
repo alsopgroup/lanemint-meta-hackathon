@@ -21,12 +21,14 @@ import pandas as pd
 
 FRONTIER_FAMILY_SETTINGS = {
     # F1: multi-asset rolling risk. Pilot calibration (Spark 1.3,
-    # seed 42, two pilots): at 500 rows/4 assets/60-day window and again
-    # at 250 rows/2 assets/20-day window the model emitted placeholders
-    # instead of computing (0/8 across pilots), so the shipped default is
-    # ~120 rows, 2 assets, 10-day window: difficulty lives in the data
-    # problems and exact rolling semantics, not volume. All three knobs
-    # can be raised again per family.
+    # seed 42, three pilots): at 500 rows/4 assets/60-day window, again
+    # at 250/2/20, and again at 120/2/10 the model emitted placeholders
+    # or wrong search results instead of computing (0/12), so the shipped
+    # default is ~120 rows, 2 assets, 10-day window and a single named
+    # target asset's mean rolling beta (the peak-correlation search was
+    # dropped after pilot 3: codes were right but the peak answer was
+    # always wrong). Difficulty lives in the data problems and exact
+    # rolling semantics, not volume. All knobs can be raised again.
     "rolling_risk": {"rows": 120, "assets": 2, "window": 10},
     # F2: two-vendor reconciliation (plan knobs: conflicts, rows,
     # unit difference between files -> Vendor B quotes cents).
@@ -326,21 +328,13 @@ class FrontierTaskGenerator:
         cov = rets.rolling(window).cov(rets["IDX"])
         var = rets["IDX"].rolling(window).var(ddof=1)
         beta_frame = cov.div(var, axis=0)
-        betas = {a: round(float(beta_frame[a].mean()), 6) for a in assets}
-        # Peak correlation: first maximum in (window-end date, asset order)
-        # order, matching the prompt's tie break (earliest date, then the
-        # asset order as listed).
-        corr_frame = rets.rolling(window).corr(rets["IDX"])[assets].dropna()
-        pos = int(np.argmax(corr_frame.to_numpy()))
-        wi, ai = np.unravel_index(pos, corr_frame.shape)
-        best = (float(corr_frame.to_numpy()[wi, ai]), str(corr_frame.index[wi]),
-                assets[ai])
+        # One named target asset (pilot 3 simplification): a single mean
+        # rolling beta to compute, no peak-correlation search.
+        target = random.choice(assets)
         ew = rets[assets].mean(axis=1)
         expected = {
-            "mean_betas": betas,
-            "peak_correlation": round(best[0], 6),
-            "peak_correlation_asset": best[2],
-            "peak_correlation_date": best[1],
+            "mean_beta": round(float(beta_frame[target].mean()), 6),
+            "target_asset": target,
             "final_window_volatility": round(
                 float(ew.iloc[-window:].std(ddof=1) * 252 ** 0.5), 6),
             "num_assets": n_assets, "num_aligned_days": len(prices),
@@ -349,24 +343,18 @@ class FrontierTaskGenerator:
         layout = ("One CSV block with header date,ticker,open,high,low,close,volume. "
                   f"Tickers: {', '.join(assets)} and the index IDX.")
         analytic = f"""Clean every ticker with the general rules and align on the
-inner join. Compute simple daily returns. For each asset and each window of
-{window} consecutive return observations (windows end at return observations
-{window}, {window + 1}, ..., N), beta = cov(asset, IDX, ddof=1) / var(IDX,
-ddof=1) and correlation = the sample correlation of asset and IDX returns in
-that window. mean_betas maps each asset ticker to the arithmetic mean of its
-window betas. The peak correlation is the largest window correlation over all
-assets and windows; report its value, the asset, and the window-end date (the
-date of the last return in that window; break ties by earliest date, then by
-asset ticker order as listed). The equal-weight portfolio return on a day is
-the mean of the assets' returns that day (IDX excluded);
+inner join. Compute simple daily returns. The target asset is {target}. For
+the target asset and each window of {window} consecutive return observations
+(windows end at return observations {window}, {window + 1}, ..., N), beta =
+cov(target, IDX, ddof=1) / var(IDX, ddof=1). mean_beta is the arithmetic
+mean of the target asset's window betas. The equal-weight portfolio return
+on a day is the mean of the assets' returns that day (IDX excluded);
 final_window_volatility is the annualised volatility of the last {window}
 equal-weight portfolio returns."""
         task = {"id": f"task_f_{self.task_id:03d}", "type": "frontier_rolling_risk",
                 "prompt": _prompt(layout, analytic,
-                                  "- mean_betas: JSON object mapping each asset ticker to its mean beta (6 decimals)\n"
-                                  "- peak_correlation: (6 decimals)\n"
-                                  "- peak_correlation_asset: ticker string\n"
-                                  "- peak_correlation_date: YYYY-MM-DD\n"
+                                  "- mean_beta: mean rolling beta of the target asset (6 decimals)\n"
+                                  "- target_asset: ticker string of the target asset\n"
                                   "- final_window_volatility: (6 decimals)\n"
                                   "- num_assets: number of asset tickers (IDX excluded)\n"
                                   "- num_aligned_days: dates kept by the inner join"),

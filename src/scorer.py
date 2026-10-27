@@ -464,7 +464,9 @@ class TaskScorer:
         # reconciled_max_drawdown (a path statistic accumulated over the
         # whole reconciled series; low-effort runs landed within ~3e-4 of
         # it while endpoint shortcuts are off by orders of magnitude more)
-        # and 1e-4 for everything else (returns, betas, volatility,
+        # and for the F3 factor betas beta_market/beta_sector (pilot
+        # near-misses landed 3e-4-1e-3 off the exact OLS values), and
+        # 1e-4 for everything else (returns, other betas, volatility,
         # correlations, values).
         for field, exp_val in expected.items():
             if field == 'problems_found':
@@ -494,7 +496,8 @@ class TaskScorer:
             elif isinstance(exp_val, float):
                 tolerance = 0.01 if field == 'final_price' \
                     or field.endswith('_price') else \
-                    1e-3 if field == 'reconciled_max_drawdown' else 1e-4
+                    1e-3 if field in ('reconciled_max_drawdown',
+                                      'beta_market', 'beta_sector') else 1e-4
                 actual_val = parsed.get(field)
                 if actual_val is None:
                     scores[field] = 0.0
@@ -534,10 +537,12 @@ class TaskScorer:
                       'final_return', 'beta_market', 'beta_sector'):
             if field in expected and scores.get(field, 0.0) < 1.0:
                 core_ok = False
-        if 'mean_betas' in expected:
-            core_ok = core_ok and all(
-                scores.get(f'mean_betas.{k}', 0.0) >= 1.0
-                for k in expected['mean_betas'])
+        # Frontier F1's core is the single target asset's mean beta
+        # (identified by the accompanying target_asset field; the hard
+        # tier's unrelated mean_beta tasks have no such field and keep
+        # their existing pass rule).
+        if 'mean_beta' in expected and 'target_asset' in expected:
+            core_ok = core_ok and scores.get('mean_beta', 0.0) >= 1.0
         result = {'task_id': task_id,
                   'passed': overall >= 0.8 and problems_ok and core_ok,
                   'score': round(overall, 3), 'component_scores': scores,
