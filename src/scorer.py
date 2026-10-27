@@ -467,10 +467,11 @@ class TaskScorer:
         # and for the F3 factor betas beta_market/beta_sector (pilot
         # near-misses landed 3e-4-1e-3 off the exact OLS values), 1e-3 for
         # frontier max_drawdown (same accumulated-path reasoning; the
-        # hard tier's max_drawdown tasks keep 1e-4), 1e-5 for r_squared
-        # (the simple-vs-log-returns discriminator: a regression run on
-        # log returns shifts R-squared by more than 1e-5 whenever its
-        # betas are close enough to pass at 1e-3, measured 0/400), and
+        # hard tier's max_drawdown tasks keep 1e-4), 5e-5 for r_squared
+        # (the simple-vs-log-returns discriminator: at 80 rows a
+        # log-return regression passes 0.33% at this tolerance, measured
+        # over seeds 1-200, while correct near-miss answers whose betas
+        # are exact but R-squared lands ~3.5e-5 off now pass), and
         # 1e-4 for everything else (returns, other betas, volatility,
         # correlations, values).
         for field, exp_val in expected.items():
@@ -501,7 +502,7 @@ class TaskScorer:
             elif isinstance(exp_val, float):
                 tolerance = 0.01 if field == 'final_price' \
                     or field.endswith('_price') else \
-                    1e-5 if field == 'r_squared' else \
+                    5e-5 if field == 'r_squared' else \
                     1e-3 if field in ('reconciled_max_drawdown',
                                       'beta_market', 'beta_sector') or (
                         field == 'max_drawdown'

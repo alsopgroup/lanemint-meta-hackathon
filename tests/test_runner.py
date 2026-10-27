@@ -58,9 +58,10 @@ def test_tier_flag_selects_tasks_dir(monkeypatch, tmp_path):
             pass
 
         def run_all_tasks(self, tasks_dir, output_dir, limit=None, resume=False,
-                          per_family=None):
+                          per_family=None, families=None):
             seen['tasks_dir'] = tasks_dir
             seen['per_family'] = per_family
+            seen['families'] = families
             return []
 
     monkeypatch.setattr(runner_mod, 'TaskRunner', FakeRunner)
@@ -360,6 +361,19 @@ def test_per_family_default_runs_everything(tmp_path):
     results = _runner_with_client(_StubClient()).run_all_tasks(
         tasks_dir, tmp_path / 'out')
     assert len(results) == 6  # default behaviour unchanged
+
+
+def test_family_filter_runs_only_named_types(tmp_path):
+    tasks_dir = _typed_tasks_dir(tmp_path / 'tasks')
+    results = _runner_with_client(_StubClient()).run_all_tasks(
+        tasks_dir, tmp_path / 'out1', families=['fam_b'])
+    assert results and all(r['task_type'] == 'fam_b' for r in results)
+    assert len(results) == 3
+    # Combined with --per-family: an 8-per-family-style F4-only pilot.
+    capped = _runner_with_client(_StubClient()).run_all_tasks(
+        tasks_dir, tmp_path / 'out2', families=['fam_b'], per_family=2)
+    assert len(capped) == 2
+    assert all(r['task_type'] == 'fam_b' for r in capped)
 
 
 def test_env_overrides_tier_default(monkeypatch):
