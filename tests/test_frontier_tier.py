@@ -219,6 +219,41 @@ class TestNoRepeatedPrices:
                 assert min(genuine) >= 4.5, (seed, min(genuine))
 
 
+class TestF2CentsConsistency:
+    """No A/B pair may differ by exactly 1 cent; conflicts use integer cents."""
+
+    def test_no_exactly_one_cent_pairs_seeds_1_to_200(self):
+        from tests.frontier_solver import _frames, clean, read_blocks
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data.csv"
+            for seed in range(1, 201):
+                gen = FrontierTaskGenerator(seed=seed)  # shipped defaults
+                task, payload = gen.generate_task_vendor_reconciliation()
+                data.write_text(payload)
+                blocks = read_blocks(data)
+                a_frames = _frames(blocks["VENDOR_A"])
+                for ticker, b_group in blocks["VENDOR_B"].groupby("ticker"):
+                    a = clean(a_frames[ticker])
+                    b = clean(b_group.assign(close=b_group["close"] / 100.0))
+                    for d in set(a.index) & set(b.index):
+                        diff = abs(round(float(a[d]) * 100)
+                                   - round(float(b[d]) * 100))
+                        assert diff != 1, (seed, ticker, d, diff)
+
+    @pytest.mark.parametrize(("seed", "task_id"), [
+        (72, "task_f_2018"), (119, "task_f_2006"),
+        (212, "task_f_2018"), (286, "task_f_2006")])
+    def test_flagged_seed_keys_are_correct(self, seed, task_id):
+        # The repeat nudge next to the shared missing day used to open an
+        # exact 1-cent A/B gap that float comparison counted as a conflict.
+        for task, result in _score_makers_default(seed, 25):
+            if task["id"] == task_id:
+                assert result["passed"] and result["score"] == 1.0, \
+                    (seed, task_id, result["feedback"])
+                return
+        raise AssertionError(f"{task_id} not generated for seed {seed}")
+
+
 class TestCoreFieldRequired:
     """Correct codes with constant numbers must pass 0% (core is required)."""
 
@@ -304,11 +339,14 @@ class TestGuessBaselines:
     """Fixed per-type guess and paste-all must stay near 0% on frontier."""
 
     def test_frontier_guess_baselines(self):
+        # Same method as the other tiers, at shipped defaults over the
+        # full default task count (25 tasks per seed).
         by_type = defaultdict(list)
-        for seed in range(1, 201):
-            gen = FrontierTaskGenerator(seed=seed, settings=SMALL)
-            for maker in gen.task_generators():
-                task, _ = maker()
+        for seed in range(1, 41):
+            gen = FrontierTaskGenerator(seed=seed)
+            gens = gen.task_generators()
+            for i in range(25):
+                task, _ = gens[i % len(gens)]()
                 by_type[task["type"]].append(frozenset(
                     categories_for_items(task["expected"]["problems_found"])))
         total = fixed = paste = 0

@@ -436,7 +436,10 @@ equal-weight portfolio returns."""
                     [a[d] if d in a.index else b[d] for d in dates_all],
                     index=dates_all, dtype=float)
                 for d in sorted(set(a.index) & set(b.index)):
-                    if abs(float(a[d]) - float(b[d])) > 0.01:
+                    # Compare in integer cents: a float difference of
+                    # exactly $0.01 is not "more than 0.01".
+                    if abs(round(float(a[d]) * 100)
+                           - round(float(b[d]) * 100)) > 1:
                         conflicts.append((d, ticker))
             return trusted, conflicts
 
@@ -444,6 +447,10 @@ equal-weight portfolio returns."""
             a = clean_series(a_frames[ticker])
             if date in a.index:  # trusted value comes from Vendor A
                 self._nudge_close(a_frames[ticker], date, 0.01)
+                # Move Vendor B by the same cent so the nudge cannot
+                # open an exact 1-cent A/B gap on this date.
+                if date in set(b_frames[ticker]["date"].astype(str)):
+                    self._nudge_close(b_frames[ticker], date, 1.0)
             else:  # from Vendor B: +1 stored cent = +$0.01 after conversion
                 self._nudge_close(b_frames[ticker], date, 1.0)
 

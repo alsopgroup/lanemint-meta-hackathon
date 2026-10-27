@@ -176,7 +176,9 @@ def solve(task, csv_path):
                 [a[d] if d in a.index else b[d] for d in union],
                 index=union, dtype=float)
             for d in sorted(set(a.index) & set(b.index)):
-                if abs(float(a[d]) - float(b[d])) > 0.01:
+                # Integer cents: exactly $0.01 apart is not "more than 0.01".
+                if abs(round(float(a[d]) * 100)
+                       - round(float(b[d]) * 100)) > 1:
                     conflicts.append(d)
         if conflicts:
             problems.add("source_conflict")

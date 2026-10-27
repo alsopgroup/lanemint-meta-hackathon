@@ -76,6 +76,42 @@ def test_easy_tier_defaults_to_16000(monkeypatch):
     assert fake.kwargs['max_tokens'] == 16000
 
 
+def test_run_task_logs_finish_reason_and_usage(monkeypatch):
+    from types import SimpleNamespace
+
+    runner, _fake = _runner_with_fake(monkeypatch)
+    usage = SimpleNamespace(prompt_tokens=111, completion_tokens=222,
+                            total_tokens=333)
+    choice = SimpleNamespace(
+        finish_reason='length',
+        message=SimpleNamespace(content='{"problems": []}'))
+    runner.client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(
+            create=lambda **kw: SimpleNamespace(choices=[choice], usage=usage))))
+    result = runner.run_task({'id': 'task_f_2001',
+                              'type': 'frontier_rolling_risk', 'prompt': 'p'}, 'd')
+    assert result['finish_reason'] == 'length'
+    assert result['prompt_tokens'] == 111
+    assert result['completion_tokens'] == 222
+    assert result['total_tokens'] == 333
+
+
+def test_client_never_retries_and_has_timeout(monkeypatch):
+    import openai
+
+    from src.runner import TaskRunner
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, 'OpenAI', FakeOpenAI)
+    TaskRunner(api_key='test-key')
+    assert captured['max_retries'] == 0
+    assert captured['timeout'] == 300.0
+
+
 def test_env_overrides_tier_default(monkeypatch):
     runner, fake = _runner_with_fake(monkeypatch)
     monkeypatch.setenv('META_MAX_TOKENS', '20000')

@@ -19,6 +19,7 @@ class StubModel:
         """Return a mock response."""
         return {
             'choices': [{
+                'finish_reason': 'stop',
                 'message': {
                     'content': json.dumps({
                         'problems': ['duplicate', 'bad_price'],
@@ -76,7 +77,12 @@ class TaskRunner:
 
             try:
                 from openai import OpenAI
-                self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+                # No SDK retries: a timed-out long request must never be
+                # silently re-sent (and billed) twice. The timeout is
+                # generous enough for 32k-token reasoning responses.
+                self.client = OpenAI(base_url=self.base_url,
+                                     api_key=self.api_key,
+                                     max_retries=0, timeout=300.0)
             except ImportError:
                 raise ImportError(
                     "openai package not installed. Run: pip install -r requirements.txt"
@@ -134,11 +140,31 @@ class TaskRunner:
                 **extra
             )
 
+        if self.dry_run:
+            choice = response['choices'][0]
+            content = choice['message']['content']
+            finish_reason = choice.get('finish_reason')
+            usage = response.get('usage') or {}
+            prompt_tokens = usage.get('prompt_tokens')
+            completion_tokens = usage.get('completion_tokens')
+            total_tokens = usage.get('total_tokens')
+        else:
+            choice = response.choices[0]
+            content = choice.message.content or ''
+            finish_reason = getattr(choice, 'finish_reason', None)
+            usage = getattr(response, 'usage', None)
+            prompt_tokens = getattr(usage, 'prompt_tokens', None)
+            completion_tokens = getattr(usage, 'completion_tokens', None)
+            total_tokens = getattr(usage, 'total_tokens', None)
+
         return {
             'task_id': task['id'],
             'task_type': task['type'],
-            'response': response['choices'][0]['message']['content'] if self.dry_run
-                       else (response.choices[0].message.content or '')
+            'response': content,
+            'finish_reason': finish_reason,
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens,
+            'total_tokens': total_tokens,
         }
 
     def run_all_tasks(
