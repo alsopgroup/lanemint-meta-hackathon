@@ -497,6 +497,7 @@ class TestGuessBaselines:
 
         checked = 0
         for seed in range(1, 21):
+            applied.clear()  # task ids restart at task_f_2001 every seed
             for task, result in _score_makers_default(seed, 25, tamper):
                 if task["id"] in applied:
                     assert not result["passed"], \
