@@ -144,10 +144,12 @@ def _tasks_dir(tmp_path):
     return tmp_path
 
 
-def _runner_with_client(client, model_name=None, reasoning_effort=None):
+def _runner_with_client(client, model_name=None, reasoning_effort=None,
+                        max_tokens=None):
     from src.runner import TaskRunner
     runner = TaskRunner(dry_run=True, model_name=model_name,
-                        reasoning_effort=reasoning_effort)
+                        reasoning_effort=reasoning_effort,
+                        max_tokens=max_tokens)
     runner.client = client
     runner.dry_run = True
     return runner
@@ -299,6 +301,27 @@ def test_resume_refuses_reasoning_effort_mismatch(tmp_path):
         _runner_with_client(client, reasoning_effort='high').run_all_tasks(
             tasks_dir, out, resume=True)
     assert client.calls == 0
+
+
+def test_resume_refuses_max_tokens_mismatch(tmp_path):
+    import pytest
+
+    tasks_dir = _tasks_dir(tmp_path / 'tasks')
+    out = tmp_path / 'out'
+    _runner_with_client(_StubClient(), max_tokens=32000).run_all_tasks(
+        tasks_dir, out)
+    # Same cap (e.g. re-running default effort at 65536 end-to-end):
+    # a cap recorded as 65536 resumes only under 65536.
+    client = _StubClient()
+    with pytest.raises(ValueError, match='--resume refused.*max_tokens'):
+        _runner_with_client(client, max_tokens=65536).run_all_tasks(
+            tasks_dir, out, resume=True)
+    assert client.calls == 0
+    # And the matching cap resumes without any new calls.
+    client2 = _StubClient()
+    _runner_with_client(client2, max_tokens=32000).run_all_tasks(
+        tasks_dir, out, resume=True)
+    assert client2.calls == 0
 
 
 def test_env_overrides_tier_default(monkeypatch):

@@ -230,7 +230,8 @@ class TaskRunner:
         failing task is recorded with only its error type and HTTP
         status. Every entry records the model and token cap used. With
         ``resume=True``, tasks already present without an error are
-        skipped (refused if they were made with a different model) and
+        skipped (refused if they were made with a different model,
+        reasoning effort, or token cap) and
         error entries are retried; without it, any previous
         ``results.jsonl``/``results.json`` in the output dir is removed
         first so a fresh run never appends to a stale one.
@@ -286,6 +287,18 @@ class TaskRunner:
                     f"--resume refused: {output_dir} contains results with "
                     f"reasoning_effort {sorted(prior_efforts, key=str)}, not "
                     f"{effort!r}; use a different --output-dir "
+                    "or omit --resume to start fresh")
+            task_by_id = {t['id']: t for t in tasks}
+            mismatched_caps = {e['max_tokens'] for e in done.values()
+                               if 'max_tokens' in e
+                               and e['task_id'] in task_by_id
+                               and e['max_tokens']
+                               != self._max_tokens_for(task_by_id[e['task_id']])}
+            if mismatched_caps:
+                raise ValueError(
+                    f"--resume refused: {output_dir} contains results with "
+                    f"max_tokens {sorted(mismatched_caps)}, not the current "
+                    "run's cap; use a different --output-dir "
                     "or omit --resume to start fresh")
         else:
             # Fresh run: never append to a previous run's output.

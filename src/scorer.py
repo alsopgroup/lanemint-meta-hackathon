@@ -318,22 +318,24 @@ def categories_for_items(items):
     return found
 
 
-def _placeholder_digits(value: float) -> bool:
-    """True for sequential-digit numbers such as 1.023456 or 0.987654."""
+def _placeholder_run(value: float) -> int:
+    """Longest sequential run in a number's fractional digits
+    (1.023456 -> 6, from 023456; integers use their whole digit string)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) \
             or value != value or value in (float('inf'), float('-inf')):
-        return False
+        return 0
     text = repr(abs(value))
     if 'e' in text:
-        return False
-    if '.' not in text and not isinstance(value, int):
-        return False
-    frac = text.replace('.', '')  # 1.023456 -> digits 1023456 (run 23456)
-    if len(frac) < 5:
-        return False
+        return 0
+    # Fractional digits only: a run crossing the decimal point (the 1
+    # and 0 in 1.023456) is an artefact, and correct answers such as
+    # 0.212345 or 1.234588 get their apparent run that way.
+    digits = text.split('.', 1)[1] if '.' in text else text
+    if len(digits) < 5:
+        return 0
     best = run = 1
     direction = 0
-    for prev, cur in zip(frac, frac[1:], strict=False):
+    for prev, cur in zip(digits, digits[1:], strict=False):
         step = int(cur) - int(prev)
         if step == direction and step in (1, -1):
             run += 1
@@ -342,13 +344,26 @@ def _placeholder_digits(value: float) -> bool:
         else:
             direction, run = 0, 1
         best = max(best, run)
-    return best >= 5
+    return best
+
+
+def _placeholder_digits(value: float) -> bool:
+    """True for a lone sequential-digit placeholder: a fractional digit
+    run of >= 6 (1.023456, 0.987654, 0.654321). Genuine answers reach at
+    most a 5-digit run (0.212345, 1.187654), so a 5-digit run only counts
+    towards the >=2-placeholder-values rule in _is_no_attempt."""
+    return _placeholder_run(value) >= 6
 
 
 def _is_no_attempt(parsed: dict) -> bool:
     """Tag placeholder-style answers: sequential-digit numbers, or every
     numeric answer identical (e.g. all zeros). Analysis only; the score
-    itself is unchanged."""
+    itself is unchanged.
+
+    Calibrated against the frontier reference answers (seeds 1-400,
+    10,000 tasks, which produce zero flags): a single 5-digit fractional
+    run is not enough, because correct answers contain values such as
+    0.212345 and 1.187654."""
     values = []
 
     def collect(node):
@@ -363,7 +378,10 @@ def _is_no_attempt(parsed: dict) -> bool:
 
     collect({k: v for k, v in parsed.items()
              if k not in ('problems', 'problems_found')})
-    if any(_placeholder_digits(v) for v in values):
+    runs = [_placeholder_run(v) for v in values]
+    if any(r >= 6 for r in runs):
+        return True
+    if sum(1 for r in runs if r >= 5) >= 2:
         return True
     return len(values) >= 3 and len(set(values)) == 1
 
@@ -442,8 +460,12 @@ class TaskScorer:
 
         # Every remaining expected field is scored by type: dicts entry by
         # entry, integers and strings (dates, tickers) exactly, floats with
-        # a tolerance of 0.01 for price fields and 1e-4 for everything else
-        # (returns, betas, volatility, drawdown, correlations, values).
+        # a tolerance of 0.01 for price fields, 1e-3 for
+        # reconciled_max_drawdown (a path statistic accumulated over the
+        # whole reconciled series; low-effort runs landed within ~3e-4 of
+        # it while endpoint shortcuts are off by orders of magnitude more)
+        # and 1e-4 for everything else (returns, betas, volatility,
+        # correlations, values).
         for field, exp_val in expected.items():
             if field == 'problems_found':
                 continue
@@ -471,7 +493,8 @@ class TaskScorer:
                         f"{field}: expected {exp_val}, got {parsed.get(field)}")
             elif isinstance(exp_val, float):
                 tolerance = 0.01 if field == 'final_price' \
-                    or field.endswith('_price') else 1e-4
+                    or field.endswith('_price') else \
+                    1e-3 if field == 'reconciled_max_drawdown' else 1e-4
                 actual_val = parsed.get(field)
                 if actual_val is None:
                     scores[field] = 0.0

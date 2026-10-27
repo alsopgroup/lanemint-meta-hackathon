@@ -21,19 +21,23 @@ import pandas as pd
 
 FRONTIER_FAMILY_SETTINGS = {
     # F1: multi-asset rolling risk. Pilot calibration (Spark 1.3,
-    # seed 42): at 500 rows/4 assets/60-day window the model emitted
-    # placeholders instead of computing, so the shipped default is
-    # ~250 rows, 2 assets, 20-day window: difficulty lives in the data
-    # problems and exact rolling semantics, not volume. All three
-    # knobs can be raised again per family.
-    "rolling_risk": {"rows": 250, "assets": 2, "window": 20},
+    # seed 42, two pilots): at 500 rows/4 assets/60-day window and again
+    # at 250 rows/2 assets/20-day window the model emitted placeholders
+    # instead of computing (0/8 across pilots), so the shipped default is
+    # ~120 rows, 2 assets, 10-day window: difficulty lives in the data
+    # problems and exact rolling semantics, not volume. All three knobs
+    # can be raised again per family.
+    "rolling_risk": {"rows": 120, "assets": 2, "window": 10},
     # F2: two-vendor reconciliation (plan knobs: conflicts, rows,
     # unit difference between files -> Vendor B quotes cents).
     "vendor_reconciliation": {"rows": 250, "assets": 3, "conflicts": 12},
     # F3: split-adjusted two-factor exposures (plan knobs: rows,
     # number of corporate actions, drawn per task as 1..actions;
-    # factors fixed at market + sector).
-    "factor_exposure": {"rows": 250, "actions": 2},
+    # factors fixed at market + sector). At 250 rows / 1-2 events the
+    # model still emitted placeholders (0/8 across pilots), so the
+    # shipped default is ~120 rows with exactly 1 explicit split-table
+    # event (actions=1).
+    "factor_exposure": {"rows": 120, "actions": 1},
     # F4: chained portfolio pipeline (plan knobs: assets, rebalances,
     # cost bps). Steps = rebalance interval in return observations.
     "portfolio_pipeline": {"rows": 300, "assets": 4,
@@ -524,7 +528,7 @@ the whole reconciled path, not only the first and last closes."""
         self.task_id += 1
         cfg = self.settings["factor_exposure"]
         rows = cfg["rows"]
-        n_actions = random.randint(1, max(1, cfg["actions"]))  # 1-2 events
+        n_actions = random.randint(1, max(1, cfg["actions"]))  # 1..actions events (exactly 1 at defaults)
         dates = _business_dates(rows)
         mkt = [random.gauss(0.0003, 0.010) for _ in range(rows - 1)]
         sec = [0.4 * m + random.gauss(0, 0.007) for m in mkt]
