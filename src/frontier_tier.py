@@ -44,7 +44,11 @@ FRONTIER_FAMILY_SETTINGS = {
     "factor_exposure": {"rows": 80, "actions": 1},
     # F4: chained portfolio pipeline (plan knobs: assets, rebalances,
     # cost bps). Steps = rebalance interval in return observations.
-    "portfolio_pipeline": {"rows": 300, "assets": 4,
+    # Pilot 6: 300 rows was long and every max_drawdown answer was too
+    # shallow (two matched a rebalance-dates-only drawdown), so rows
+    # drop to ~150 and the prompt states explicitly that max_drawdown
+    # is computed over EVERY daily portfolio value.
+    "portfolio_pipeline": {"rows": 150, "assets": 4,
                            "rebalance_every": 21, "cost_bps": 10},
 }
 
@@ -751,8 +755,10 @@ first_rebalance_value is the total value immediately after the first
 rebalance and its cost deduction. final_return is the final total value
 minus 1. max_drawdown is the minimum over all dates (including the first,
 value 1.0) of (value - running maximum value) / running maximum value,
-using the after-cost value on rebalance dates. num_rebalances counts the
-rebalances performed."""
+using the after-cost value on rebalance dates. Compute max_drawdown over
+EVERY daily portfolio value on the full daily path (including
+non-rebalance days), not only at rebalance dates. num_rebalances counts
+the rebalances performed."""
         task = {"id": f"task_f_{self.task_id:03d}",
                 "type": "frontier_portfolio_pipeline",
                 "prompt": _prompt(layout, analytic,

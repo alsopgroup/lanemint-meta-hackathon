@@ -66,6 +66,7 @@ class TestSettings:
         assert FRONTIER_FAMILY_SETTINGS["factor_exposure"] == \
             {"rows": 80, "actions": 1}
         assert FRONTIER_FAMILY_SETTINGS["portfolio_pipeline"]["rebalance_every"] == 21
+        assert FRONTIER_FAMILY_SETTINGS["portfolio_pipeline"]["rows"] == 150
 
     def test_f3_has_exactly_one_split_event(self):
         for seed in range(1, 41):
@@ -124,6 +125,13 @@ class TestGeneration:
         assert "not a full-sample regression" in flat
         # Window definitions are stated in terms of return indices.
         assert "window 1 is" in flat and "window 3 is" in flat
+
+    def test_f4_prompt_states_drawdown_over_every_daily_value(self):
+        gen = FrontierTaskGenerator(seed=7, settings=SMALL)
+        task, _ = gen.generate_task_portfolio_pipeline()
+        flat = " ".join(task["prompt"].split())
+        assert "EVERY daily portfolio value" in flat
+        assert "not only at rebalance dates" in flat
 
     def test_f3_prompt_states_split_table_convention(self):
         gen = FrontierTaskGenerator(seed=7, settings=SMALL)
@@ -195,6 +203,33 @@ def _f3_aligned(data, adjust=True):
     return pd.DataFrame(
         {"AST": ast, "MKT": clean(frames["MKT"]),
          "SEC": clean(frames["SEC"])}).sort_index().dropna()
+
+
+def _f4_daily_values(task, data):
+    """Daily portfolio values for an F4 data file (solver rules)."""
+    import re as _re
+
+    import numpy as np
+
+    from tests.frontier_solver import _aligned, _frames, read_blocks
+    blocks = read_blocks(data)
+    prices = _aligned(_frames(
+        blocks[""] if "" in blocks else blocks["PRICES"]))
+    every = int(_re.search(r"observations\s+(\d+),", task["prompt"]).group(1))
+    bps = float(_re.search(r"cost of\s+(\d+(?:\.\d+)?)\s+basis points",
+                           task["prompt"]).group(1))
+    vals = prices.to_numpy(dtype=float)
+    n = prices.shape[1]
+    holdings = np.full(n, 1.0 / n)
+    values = [1.0]
+    for step in range(1, len(vals)):
+        holdings = holdings * vals[step] / vals[step - 1]
+        total = float(holdings.sum())
+        if step % every == 0 and step < len(vals) - 1:
+            total *= 1.0 - bps / 10000.0
+            holdings = np.full(n, total / n)
+        values.append(total)
+    return values, every
 
 
 def _score_makers_default(seed, count, tamper=None):
@@ -449,7 +484,7 @@ class TestScorerFrontierFields:
     def test_f3_beta_tolerance_is_1e_3(self, tmp_path):
         # Pilot near-misses landed 3e-4-1e-3 off the exact OLS betas, so
         # beta_market/beta_sector are scored at 1e-3; alpha stays at
-        # 1e-4, r_squared is a core field at 1e-5 (log-returns
+        # 1e-4, r_squared is a core field at 5e-5 (log-returns
         # discriminator), and the betas remain core fields.
         answer = {"alpha": 0.0002, "beta_market": 1.22116,
                   "beta_sector": 0.41059, "r_squared": 0.83,
@@ -468,6 +503,26 @@ class TestScorerFrontierFields:
         far = {**good, "beta_market": 1.22316}  # 2e-3 off
         result = scorer.score_task("task_f_2004", json.dumps(far))
         assert result["component_scores"]["beta_market"] == 0.0
+        assert not result["passed"]
+
+    def test_r_squared_tolerance_is_5e_5(self, tmp_path):
+        # r_squared is the simple-vs-log discriminator, but correct
+        # near-miss answers land ~3.5e-5 off it, so its tolerance is
+        # 5e-5 (log regressions pass 0.33% at 80 rows, measured): 3e-5
+        # off passes, 1e-4 off scores 0 and fails the core check.
+        answer = {"alpha": 0.0002, "beta_market": 1.22116,
+                  "beta_sector": 0.41059, "r_squared": 0.83,
+                  "num_return_days": 100, "num_splits": 1,
+                  "problems_found": ["split_x"]}
+        (tmp_path / "task_f_2006_answer.json").write_text(json.dumps(answer))
+        scorer = TaskScorer(tmp_path)
+        good = {k: v for k, v in answer.items() if k != "problems_found"}
+        good["problems"] = ["split"]
+        close = {**good, "r_squared": 0.83003}  # 3e-5 off
+        assert scorer.score_task("task_f_2006", json.dumps(close))["passed"]
+        far = {**good, "r_squared": 0.8301}  # 1e-4 off
+        result = scorer.score_task("task_f_2006", json.dumps(far))
+        assert result["component_scores"]["r_squared"] == 0.0
         assert not result["passed"]
 
     def test_f1_fields_exact_and_toleranced(self, tmp_path):
@@ -712,6 +767,27 @@ class TestGuessBaselines:
             wrong = 0.0 if abs(task["expected"]["max_drawdown"]) > 1e-3 \
                 else -0.9
             return {**got, "max_drawdown": wrong}
+
+        self._assert_baseline_fails(tamper)
+
+    def test_rebalance_only_drawdown_passes_zero(self):
+        """F4: a drawdown sampled only at rebalance dates (plus the
+        starting value) misses the intra-period path and must fail the
+        core check at 1e-3, even though pilot answers of exactly this
+        shape matched the sampled statistic to within 4e-6."""
+        def tamper(task, got, data):
+            if task["type"] != "frontier_portfolio_pipeline":
+                return None
+            values, every = _f4_daily_values(task, data)
+            sampled = [values[0]] + [values[s] for s in range(
+                1, len(values)) if s % every == 0 and s < len(values) - 1]
+            peak, worst = sampled[0], 0.0
+            for v in sampled:
+                peak = max(peak, v)
+                worst = min(worst, (v - peak) / peak)
+            if abs(worst - task["expected"]["max_drawdown"]) <= 1e-3:
+                return None  # sampled path coincides; not a gaming win
+            return {**got, "max_drawdown": round(float(worst), 6)}
 
         self._assert_baseline_fails(tamper)
 

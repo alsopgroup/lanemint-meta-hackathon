@@ -220,7 +220,8 @@ class TaskRunner:
         output_dir: Path,
         limit: int | None = None,
         resume: bool = False,
-        per_family: int | None = None
+        per_family: int | None = None,
+        families: list[str] | None = None
     ) -> list[dict]:
         """
         Run all tasks and save results.
@@ -243,12 +244,17 @@ class TaskRunner:
             limit: Optional limit on number of tasks to run
             per_family: Optional cap of tasks per task type (first N of
                 each type in file order), for balanced pilot selection
+            families: Optional list of task types to run (only tasks
+                whose type is listed); default runs every type
             resume: Skip tasks already successfully present in the output
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         tasks = self.load_tasks(tasks_dir)
+        if families:
+            wanted = set(families)
+            tasks = [t for t in tasks if t.get('type') in wanted]
         if per_family is not None:
             # Deterministic balanced pilot selection: the first
             # per_family tasks of each type, in file order. With a
@@ -399,6 +405,16 @@ def main():
         help='Limit number of tasks to run'
     )
     parser.add_argument(
+        '--family',
+        action='append',
+        dest='families',
+        default=None,
+        metavar='TYPE',
+        help='Only run tasks whose type is TYPE (repeatable, e.g. '
+             '--family frontier_portfolio_pipeline for an F4-only pilot). '
+             'Default: run all types.'
+    )
+    parser.add_argument(
         '--per-family',
         type=int,
         default=None,
@@ -469,7 +485,8 @@ def main():
         output_dir=args.output_dir,
         limit=args.limit,
         resume=args.resume,
-        per_family=args.per_family
+        per_family=args.per_family,
+        families=args.families
     )
 
     print(f"\n✓ Completed {len(results)} tasks")
