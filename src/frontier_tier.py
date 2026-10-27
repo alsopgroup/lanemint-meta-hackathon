@@ -21,24 +21,27 @@ import pandas as pd
 
 FRONTIER_FAMILY_SETTINGS = {
     # F1: multi-asset rolling risk. Pilot calibration (Spark 1.3,
-    # seed 42, four pilots): larger/rolling-search variants scored 0/16
-    # (placeholders, fabricated betas, peak-correlation always wrong),
-    # so the shipped default is ~120 rows, 2 assets, 10-day window and
-    # ONE statistic per core field over the LAST window only: the target
-    # asset's beta vs IDX over the final 10 return observations, plus
-    # the final-window volatility. Difficulty lives in the data problems
-    # and exact semantics, not volume. All knobs can be raised again.
+    # seed 42, five pilots): larger/rolling-search variants scored
+    # 0/16, then a single last-window beta scored 4/4 (too easy), so
+    # the shipped default is ~120 rows, 2 assets, 10-day window and the
+    # target asset's betas over the LAST THREE non-overlapping 10-day
+    # windows, plus the final-window volatility. Difficulty lives in
+    # the data problems and exact semantics, not volume.
     "rolling_risk": {"rows": 120, "assets": 2, "window": 10},
     # F2: two-vendor reconciliation (plan knobs: conflicts, rows,
-    # unit difference between files -> Vendor B quotes cents).
-    "vendor_reconciliation": {"rows": 250, "assets": 3, "conflicts": 12},
+    # unit difference between files -> Vendor B quotes cents). Pilot 5:
+    # only reconciled_max_drawdown missed (always too shallow), so the
+    # series is shortened to ~120 rows to make the path computation
+    # tractable; conflict mechanics and the 1e-3 drawdown core stay.
+    "vendor_reconciliation": {"rows": 120, "assets": 3, "conflicts": 12},
     # F3: split-adjusted two-factor exposures (plan knobs: rows,
     # number of corporate actions, drawn per task as 1..actions;
-    # factors fixed at market + sector). At 250 rows / 1-2 events the
-    # model still emitted placeholders (0/8 across pilots), so the
-    # shipped default is ~120 rows with exactly 1 explicit split-table
-    # event (actions=1).
-    "factor_exposure": {"rows": 120, "actions": 1},
+    # factors fixed at market + sector). Pilot sizes fell 250 -> 120
+    # -> 80 rows with exactly 1 explicit split-table event: at 60 rows
+    # a log-return regression already passed 1/200 measured tasks, at
+    # 80 it passed 0/200, so 80 is the smallest size that keeps the
+    # simple-vs-log discriminator (r_squared core at 1e-5) at ~0%.
+    "factor_exposure": {"rows": 80, "actions": 1},
     # F4: chained portfolio pipeline (plan knobs: assets, rebalances,
     # cost bps). Steps = rebalance interval in return observations.
     "portfolio_pipeline": {"rows": 300, "assets": 4,
@@ -324,16 +327,22 @@ class FrontierTaskGenerator:
 
         prices = aligned_prices(frames)
         rets = prices.pct_change().dropna()
-        # One named target asset, LAST window only (pilot 4): a single
-        # beta over the final `window` return observations, no rolling
-        # search and no full-sample regression.
+        # One named target asset, LAST THREE non-overlapping windows
+        # (pilot 5: a single last-window beta was too easy at 4/4).
+        # With N return observations r_1..r_N and window w, window 1 is
+        # r_{N-3w+1}..r_{N-2w}, window 2 is r_{N-2w+1}..r_{N-w} and
+        # window 3 is r_{N-w+1}..r_N (the most recent).
         target = random.choice(assets)
-        last = rets.iloc[-window:]
-        last_beta = float(last[target].cov(last["IDX"])
-                          / last["IDX"].var(ddof=1))
+        w = window
+        blocks = [rets.iloc[-3 * w:-2 * w], rets.iloc[-2 * w:-w],
+                  rets.iloc[-w:]]
+        betas = [float(b[target].cov(b["IDX"]) / b["IDX"].var(ddof=1))
+                 for b in blocks]
         ew = rets[assets].mean(axis=1)
         expected = {
-            "last_window_beta": round(last_beta, 6),
+            "window_beta_1": round(betas[0], 6),
+            "window_beta_2": round(betas[1], 6),
+            "window_beta_3": round(betas[2], 6),
             "target_asset": target,
             "final_window_volatility": round(
                 float(ew.iloc[-window:].std(ddof=1) * 252 ** 0.5), 6),
@@ -344,18 +353,26 @@ class FrontierTaskGenerator:
                   f"Tickers: {', '.join(assets)} and the index IDX.")
         analytic = f"""Clean every ticker with the general rules and align on the
 inner join. Compute simple daily returns. The target asset is {target}.
-Consider only the last window: the final {window} consecutive return
-observations. last_window_beta is the beta of the target asset against IDX
-over those {window} returns only: cov(target, IDX, ddof=1) / var(IDX,
-ddof=1), using the simple returns of the target and of IDX on the aligned
-dates of that last window (not a full-sample regression and not an average
-over windows). The equal-weight portfolio return on a day is the mean of
-the assets' returns that day (IDX excluded); final_window_volatility is
-the annualised volatility of the last {window} equal-weight portfolio
+Let the aligned simple returns be r_1, ..., r_N in date order. Consider
+only the last three non-overlapping windows of {window} consecutive
+return observations each: window 1 is r_{{N-{3 * window - 1}}} ..
+r_{{N-{2 * window}}} (the oldest of the three), window 2 is
+r_{{N-{2 * window - 1}}} .. r_{{N-{window}}}, and window 3 is
+r_{{N-{window - 1}}} .. r_N (the most recent {window} returns).
+window_beta_1, window_beta_2 and window_beta_3 are the betas of the
+target asset against IDX within window 1, 2 and 3 respectively, where a
+window beta is cov(target, IDX, ddof=1) / var(IDX, ddof=1) computed on
+the simple returns of the target and of IDX inside that window only
+(not a full-sample regression and not an average over windows). The
+equal-weight portfolio return on a day is the mean of the assets'
+returns that day (IDX excluded); final_window_volatility is the
+annualised volatility of the last {window} equal-weight portfolio
 returns."""
         task = {"id": f"task_f_{self.task_id:03d}", "type": "frontier_rolling_risk",
                 "prompt": _prompt(layout, analytic,
-                                  "- last_window_beta: beta of the target asset vs IDX over the last window only (6 decimals)\n"
+                                  "- window_beta_1: target asset beta vs IDX in window 1, the oldest of the last three windows (6 decimals)\n"
+                                  "- window_beta_2: target asset beta vs IDX in window 2 (6 decimals)\n"
+                                  "- window_beta_3: target asset beta in window 3, the most recent window (6 decimals)\n"
                                   "- target_asset: ticker string of the target asset\n"
                                   "- final_window_volatility: (6 decimals)\n"
                                   "- num_assets: number of asset tickers (IDX excluded)\n"
@@ -542,8 +559,12 @@ the whole reconciled path, not only the first and last closes."""
         reserved = used.get("AST", set())
 
         def _pick_positions():
+            # Keep split dates away from both ends (a shorter history on
+            # either side at small row counts); 40 at the old sizes.
+            margin = min(40, max(12, len(raw) // 4))
             for _ in range(200):
-                cand = sorted(random.sample(range(40, len(raw) - 40), n_actions))
+                cand = sorted(random.sample(
+                    range(margin, len(raw) - margin), n_actions))
                 if all(str(raw.iloc[p]["date"]) not in reserved for p in cand) \
                         and all(b - a >= 30 for a, b in
                                 zip(cand, cand[1:], strict=False)):

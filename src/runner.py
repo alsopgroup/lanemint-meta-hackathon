@@ -219,7 +219,8 @@ class TaskRunner:
         tasks_dir: Path,
         output_dir: Path,
         limit: int | None = None,
-        resume: bool = False
+        resume: bool = False,
+        per_family: int | None = None
     ) -> list[dict]:
         """
         Run all tasks and save results.
@@ -240,12 +241,26 @@ class TaskRunner:
             tasks_dir: Directory containing tasks and data
             output_dir: Directory to save results
             limit: Optional limit on number of tasks to run
+            per_family: Optional cap of tasks per task type (first N of
+                each type in file order), for balanced pilot selection
             resume: Skip tasks already successfully present in the output
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         tasks = self.load_tasks(tasks_dir)
+        if per_family is not None:
+            # Deterministic balanced pilot selection: the first
+            # per_family tasks of each type, in file order. With a
+            # frontier set generated --count 32 (8 of each family by
+            # construction) this selects exactly 8 per family.
+            kept, counts = [], {}
+            for task in tasks:
+                kind = task.get('type')
+                if counts.get(kind, 0) < per_family:
+                    kept.append(task)
+                    counts[kind] = counts.get(kind, 0) + 1
+            tasks = kept
         if limit:
             tasks = tasks[:limit]
         task_ids = {t['id'] for t in tasks}
@@ -384,6 +399,16 @@ def main():
         help='Limit number of tasks to run'
     )
     parser.add_argument(
+        '--per-family',
+        type=int,
+        default=None,
+        help='Run at most this many tasks per task type (the first N of '
+             'each type, in file order; default: run all tasks). A '
+             'frontier set generated with --count 32 contains exactly 8 '
+             'tasks per family, so --per-family 8 selects that balanced '
+             '32-task pilot reproducibly.'
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Use stub model instead of real API'
@@ -443,7 +468,8 @@ def main():
         tasks_dir=args.tasks_dir,
         output_dir=args.output_dir,
         limit=args.limit,
-        resume=args.resume
+        resume=args.resume,
+        per_family=args.per_family
     )
 
     print(f"\n✓ Completed {len(results)} tasks")

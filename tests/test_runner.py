@@ -57,8 +57,10 @@ def test_tier_flag_selects_tasks_dir(monkeypatch, tmp_path):
         def __init__(self, **kwargs):
             pass
 
-        def run_all_tasks(self, tasks_dir, output_dir, limit=None, resume=False):
+        def run_all_tasks(self, tasks_dir, output_dir, limit=None, resume=False,
+                          per_family=None):
             seen['tasks_dir'] = tasks_dir
+            seen['per_family'] = per_family
             return []
 
     monkeypatch.setattr(runner_mod, 'TaskRunner', FakeRunner)
@@ -139,6 +141,19 @@ def _tasks_dir(tmp_path):
     for i in range(1, 4):
         (tmp_path / f'data_{i}.csv').write_text('date,close\n2024-01-01,1\n')
         tasks.append({'id': f'task_{i:03d}', 'type': 'return_calculation',
+                      'prompt': 'p', 'data_file': f'data_{i}.csv'})
+    (tmp_path / 'tasks.json').write_text(_json.dumps(tasks))
+    return tmp_path
+
+
+def _typed_tasks_dir(tmp_path, types=("fam_a", "fam_b")):
+    """Tasks dir with interleaved types: id i has type types[i % len]."""
+    import json as _json
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tasks = []
+    for i in range(1, 7):
+        (tmp_path / f'data_{i}.csv').write_text('date,close\n2024-01-01,1\n')
+        tasks.append({'id': f'task_{i:03d}', 'type': types[i % len(types)],
                       'prompt': 'p', 'data_file': f'data_{i}.csv'})
     (tmp_path / 'tasks.json').write_text(_json.dumps(tasks))
     return tmp_path
@@ -322,6 +337,29 @@ def test_resume_refuses_max_tokens_mismatch(tmp_path):
     _runner_with_client(client2, max_tokens=32000).run_all_tasks(
         tasks_dir, out, resume=True)
     assert client2.calls == 0
+
+
+def test_per_family_selects_first_n_of_each_type_reproducibly(tmp_path):
+    from collections import Counter
+    tasks_dir = _typed_tasks_dir(tmp_path / 'tasks')
+    runner = _runner_with_client(_StubClient())
+    results = runner.run_all_tasks(tasks_dir, tmp_path / 'out1',
+                                   per_family=2)
+    assert [r['task_id'] for r in results] == \
+        ['task_001', 'task_002', 'task_003', 'task_004']
+    assert Counter(r['task_type'] for r in results) == \
+        {'fam_a': 2, 'fam_b': 2}
+    # Same selection again: deterministic, file order.
+    again = _runner_with_client(_StubClient()).run_all_tasks(
+        tasks_dir, tmp_path / 'out2', per_family=2)
+    assert [r['task_id'] for r in again] == [r['task_id'] for r in results]
+
+
+def test_per_family_default_runs_everything(tmp_path):
+    tasks_dir = _typed_tasks_dir(tmp_path / 'tasks')
+    results = _runner_with_client(_StubClient()).run_all_tasks(
+        tasks_dir, tmp_path / 'out')
+    assert len(results) == 6  # default behaviour unchanged
 
 
 def test_env_overrides_tier_default(monkeypatch):

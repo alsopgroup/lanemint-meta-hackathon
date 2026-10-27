@@ -23,7 +23,8 @@ OFF_LIMITS = ["delist", "survivorship", "rename", "dividend", "stale",
               "repeated_price", "too_short", "insufficient_history"]
 
 FIELDS = {
-    "frontier_rolling_risk": ["last_window_beta", "target_asset",
+    "frontier_rolling_risk": ["window_beta_1", "window_beta_2",
+                              "window_beta_3", "target_asset",
                               "final_window_volatility", "num_assets",
                               "num_aligned_days"],
     "frontier_vendor_reconciliation": ["mismatch_count", "first_conflict_date",
@@ -60,9 +61,10 @@ class TestSettings:
         # difficulty in the data problems and rolling semantics.
         assert FRONTIER_FAMILY_SETTINGS["rolling_risk"] == \
             {"rows": 120, "assets": 2, "window": 10}
+        assert FRONTIER_FAMILY_SETTINGS["vendor_reconciliation"]["rows"] == 120
         assert FRONTIER_FAMILY_SETTINGS["vendor_reconciliation"]["conflicts"] == 12
         assert FRONTIER_FAMILY_SETTINGS["factor_exposure"] == \
-            {"rows": 120, "actions": 1}
+            {"rows": 80, "actions": 1}
         assert FRONTIER_FAMILY_SETTINGS["portfolio_pipeline"]["rebalance_every"] == 21
 
     def test_f3_has_exactly_one_split_event(self):
@@ -74,7 +76,7 @@ class TestSettings:
     def test_settings_override_reaches_prompt(self):
         gen = FrontierTaskGenerator(seed=1, settings=SMALL)
         task, _ = gen.generate_task_rolling_risk()
-        assert "final 15 consecutive" in " ".join(task["prompt"].split())
+        assert "windows of 15 consecutive" in " ".join(task["prompt"].split())
 
 
 class TestGeneration:
@@ -114,11 +116,14 @@ class TestGeneration:
             " ".join(task["prompt"].split())
         assert task["expected"]["target_asset"] in ("AST1", "AST2", "AST3")
         assert set(task["expected"]) == {
-            "last_window_beta", "target_asset", "final_window_volatility",
+            "window_beta_1", "window_beta_2", "window_beta_3",
+            "target_asset", "final_window_volatility",
             "num_assets", "num_aligned_days", "problems_found"}
         flat = " ".join(task["prompt"].split())
-        assert "Consider only the last window" in flat
+        assert "last three non-overlapping windows" in flat
         assert "not a full-sample regression" in flat
+        # Window definitions are stated in terms of return indices.
+        assert "window 1 is" in flat and "window 3 is" in flat
 
     def test_f3_prompt_states_split_table_convention(self):
         gen = FrontierTaskGenerator(seed=7, settings=SMALL)
@@ -159,6 +164,37 @@ class TestCli:
         tasks = json.loads((out / "tasks.json").read_text())
         assert len(tasks) == 4
         assert all(t["id"].startswith("task_f_") for t in tasks)
+
+
+def _f1_returns(data):
+    """Cleaned, aligned simple returns for an F1 data file (solver rules)."""
+    from tests.frontier_solver import _aligned, _frames, read_blocks
+    blocks = read_blocks(data)
+    prices = _aligned(_frames(
+        blocks[""] if "" in blocks else blocks["PRICES"]))
+    return prices.pct_change().dropna()
+
+
+def _f3_aligned(data, adjust=True):
+    """Aligned AST/MKT/SEC closes for an F3 data file, with the split
+    table applied to AST unless ``adjust`` is False."""
+    import re as _re
+
+    import pandas as pd
+
+    from tests.frontier_solver import _frames, clean, read_blocks
+    blocks = read_blocks(data)
+    frames = _frames(blocks["PRICES"])
+    ast = clean(frames["AST"])
+    if adjust:
+        for _, row in blocks["SPLIT_TABLE"].iterrows():
+            m = _re.fullmatch(r"(\d+(?:\.\d+)?)-for-(\d+(?:\.\d+)?)",
+                              str(row["ratio"]))
+            ast.loc[ast.index < str(row["date"])] *= \
+                (float(m.group(2)) / float(m.group(1)))
+    return pd.DataFrame(
+        {"AST": ast, "MKT": clean(frames["MKT"]),
+         "SEC": clean(frames["SEC"])}).sort_index().dropna()
 
 
 def _score_makers_default(seed, count, tamper=None):
@@ -330,8 +366,8 @@ class TestF2ShortcutFails:
 class TestCoreFieldRequired:
     """Correct codes with constant numbers must pass 0% (core is required)."""
 
-    CORE = ("last_window_beta", "reconciled_total_return",
-            "reconciled_max_drawdown",
+    CORE = ("window_beta_1", "window_beta_2", "window_beta_3",
+            "reconciled_total_return", "reconciled_max_drawdown",
             "beta_market", "beta_sector", "final_return", "max_drawdown")
 
     def _core_values(self, expected):
@@ -435,7 +471,8 @@ class TestScorerFrontierFields:
         assert not result["passed"]
 
     def test_f1_fields_exact_and_toleranced(self, tmp_path):
-        answer = {"last_window_beta": 1.0, "target_asset": "AST1",
+        answer = {"window_beta_1": 0.9, "window_beta_2": 1.0,
+                  "window_beta_3": 1.1, "target_asset": "AST1",
                   "final_window_volatility": 0.2, "num_assets": 2,
                   "num_aligned_days": 50, "problems_found": ["missing_day_x"]}
         (tmp_path / "task_f_2002_answer.json").write_text(json.dumps(answer))
@@ -447,11 +484,13 @@ class TestScorerFrontierFields:
         bad = {**good, "target_asset": "AST2"}
         result = scorer.score_task("task_f_2002", json.dumps(bad))
         assert result["component_scores"]["target_asset"] == 0.0
-        # last_window_beta is an F1 core field: wrong beyond 1e-4 fails.
-        off = {**good, "last_window_beta": 1.01}
-        result = scorer.score_task("task_f_2002", json.dumps(off))
-        assert result["component_scores"]["last_window_beta"] == 0.0
-        assert not result["passed"]
+        # Each window beta is a core field: any one wrong beyond 1e-4
+        # cannot pass.
+        for field in ("window_beta_1", "window_beta_2", "window_beta_3"):
+            off = {**good, field: good[field] + 0.01}
+            result = scorer.score_task("task_f_2002", json.dumps(off))
+            assert result["component_scores"][field] == 0.0
+            assert not result["passed"], field
         # final_window_volatility is also core (pilot: a wrong value
         # previously still passed on overall score alone).
         off_vol = {**good, "final_window_volatility": 0.9}
@@ -533,16 +572,18 @@ class TestGuessBaselines:
     def test_guess_beta_one_passes_zero(self):
         """Answering beta = 1.0 (everything else exactly right) must fail.
 
-        F1's core is the target asset's last_window_beta (tolerance
-        1e-4); F3's cores are beta_market/beta_sector (tolerance 1e-3).
-        A task whose true beta happens to sit within tolerance of 1.0 is
-        a correct answer, not a guess win, and is skipped."""
+        F1's cores are the three window betas (tolerance 1e-4); F3's
+        cores are beta_market/beta_sector (tolerance 1e-3). A task whose
+        true beta happens to sit within tolerance of 1.0 is a correct
+        answer, not a guess win, and is skipped."""
         def tamper(task, got, data):
             exp = task["expected"]
             if task["type"] == "frontier_rolling_risk":
-                if abs(exp["last_window_beta"] - 1.0) <= 1e-4:
+                if any(abs(exp[f"window_beta_{i}"] - 1.0) <= 1e-4
+                       for i in (1, 2, 3)):
                     return None
-                return {**got, "last_window_beta": 1.0}
+                return {**got, "window_beta_1": 1.0, "window_beta_2": 1.0,
+                        "window_beta_3": 1.0}
             if task["type"] == "frontier_factor_exposure":
                 if abs(exp["beta_market"] - 1.0) <= 1e-3 or \
                         abs(exp["beta_sector"] - 1.0) <= 1e-3:
@@ -552,23 +593,61 @@ class TestGuessBaselines:
 
         self._assert_baseline_fails(tamper)
 
-    def test_full_sample_beta_passes_zero(self):
-        """F1: a full-sample beta (all returns) is not the last-window
-        beta and must fail the core check."""
+    def test_single_window_beta_passes_zero(self):
+        """F1: submitting the most recent window's beta for all three
+        windows (the pilot-4 single-window answer) must fail."""
         def tamper(task, got, data):
             if task["type"] != "frontier_rolling_risk":
                 return None
-            from tests.frontier_solver import _aligned, _frames, read_blocks
-            blocks = read_blocks(data)
-            prices = _aligned(_frames(
-                blocks[""] if "" in blocks else blocks["PRICES"]))
-            rets = prices.pct_change().dropna()
+            exp = task["expected"]
+            if abs(exp["window_beta_1"] - exp["window_beta_3"]) <= 1e-4 \
+                    and abs(exp["window_beta_2"] - exp["window_beta_3"]) <= 1e-4:
+                return None  # all three coincide; not a shortcut win
+            return {**got, "window_beta_1": got["window_beta_3"],
+                    "window_beta_2": got["window_beta_3"]}
+
+        self._assert_baseline_fails(tamper)
+
+    def test_mean_rolling_beta_passes_zero(self):
+        """F1: the mean of all rolling window betas, submitted for each
+        of the three windows, must fail."""
+        def tamper(task, got, data):
+            if task["type"] != "frontier_rolling_risk":
+                return None
+            import re as _re
+            window = int(_re.search(r"windows of\s+(\d+) consecutive",
+                                    task["prompt"]).group(1))
+            rets = _f1_returns(data)
+            target = got["target_asset"]
+            rolling = (rets.rolling(window).cov(rets["IDX"])[target]
+                       / rets["IDX"].rolling(window).var(ddof=1))
+            mean_beta = round(float(rolling.mean()), 6)
+            exp = task["expected"]
+            if all(abs(exp[f"window_beta_{i}"] - mean_beta) <= 1e-4
+                   for i in (1, 2, 3)):
+                return None
+            return {**got, "window_beta_1": mean_beta,
+                    "window_beta_2": mean_beta, "window_beta_3": mean_beta}
+
+        self._assert_baseline_fails(tamper)
+
+    def test_full_sample_beta_passes_zero(self):
+        """F1: a full-sample beta (all returns) submitted for each of
+        the three windows must fail the core check."""
+        def tamper(task, got, data):
+            if task["type"] != "frontier_rolling_risk":
+                return None
+            rets = _f1_returns(data)
             target = got["target_asset"]
             full = float(rets[target].cov(rets["IDX"])
                          / rets["IDX"].var(ddof=1))
-            if abs(full - task["expected"]["last_window_beta"]) <= 1e-4:
+            exp = task["expected"]
+            if all(abs(full - exp[f"window_beta_{i}"]) <= 1e-4
+                   for i in (1, 2, 3)):
                 return None  # coincidentally the same; not a shortcut win
-            return {**got, "last_window_beta": round(full, 6)}
+            return {**got, "window_beta_1": round(full, 6),
+                    "window_beta_2": round(full, 6),
+                    "window_beta_3": round(full, 6)}
 
         self._assert_baseline_fails(tamper)
 
@@ -581,24 +660,34 @@ class TestGuessBaselines:
         def tamper(task, got, data):
             if task["type"] != "frontier_factor_exposure":
                 return None
-            import re as _re
-
             import numpy as np
-            import pandas as pd
 
-            from tests.frontier_solver import _frames, clean, read_blocks
-            blocks = read_blocks(data)
-            frames = _frames(blocks["PRICES"])
-            ast = clean(frames["AST"])
-            for _, row in blocks["SPLIT_TABLE"].iterrows():
-                m = _re.fullmatch(r"(\d+(?:\.\d+)?)-for-(\d+(?:\.\d+)?)",
-                                  str(row["ratio"]))
-                ast.loc[ast.index < str(row["date"])] *= \
-                    (float(m.group(2)) / float(m.group(1)))
-            aligned = pd.DataFrame(
-                {"AST": ast, "MKT": clean(frames["MKT"]),
-                 "SEC": clean(frames["SEC"])}).sort_index().dropna()
+            aligned = _f3_aligned(data, adjust=True)
             rets = np.log(aligned / aligned.shift(1)).dropna()
+            x = np.column_stack([np.ones(len(rets)), rets["MKT"],
+                                 rets["SEC"]])
+            coef, *_ = np.linalg.lstsq(x, rets["AST"].to_numpy(),
+                                       rcond=None)
+            resid = rets["AST"].to_numpy() - x @ coef
+            ss_tot = float(((rets["AST"] - rets["AST"].mean()) ** 2).sum())
+            return {**got, "alpha": round(float(coef[0]), 6),
+                    "beta_market": round(float(coef[1]), 6),
+                    "beta_sector": round(float(coef[2]), 6),
+                    "r_squared": round(
+                        1.0 - float((resid ** 2).sum()) / ss_tot, 6)}
+
+        self._assert_baseline_fails(tamper)
+
+    def test_unadjusted_price_answers_pass_zero(self):
+        """F3: a regression on the raw (split-unadjusted) AST prices
+        must fail: the split date's price-basis change wrecks it."""
+        def tamper(task, got, data):
+            if task["type"] != "frontier_factor_exposure":
+                return None
+            import numpy as np
+
+            aligned = _f3_aligned(data, adjust=False)
+            rets = aligned.pct_change().dropna()
             x = np.column_stack([np.ones(len(rets)), rets["MKT"],
                                  rets["SEC"]])
             coef, *_ = np.linalg.lstsq(x, rets["AST"].to_numpy(),
