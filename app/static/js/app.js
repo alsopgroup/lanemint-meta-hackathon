@@ -8,7 +8,7 @@
 const STEPS = [['read', 'Reading file', 0.16], ['dups', 'Checking duplicates', 0.18], ['gaps', 'Checking gaps', 0.2], ['prices', 'Checking prices', 0.24], ['splits', 'Checking splits', 0.22]];
 const TYPES = { dups: ['Duplicate', 'var(--violet-500)'], gaps: ['Gap', 'var(--warning-500)'], prices: ['Bad price', 'var(--error-500)'], splits: ['Split', 'var(--lime-500)'] };
 
-const state = { sid: 's1', step: 'data', stage: 'idle', elapsed: 0, view: 'raw', active: -1, drag: false, upload: null, live: null, err: null, runMode: null };
+const state = { sid: 's1', step: 'data', stage: 'idle', elapsed: 0, view: 'raw', active: -1, drag: false, upload: null, live: null, err: null, runMode: null, liveAttempted: false };
 let appConfig = { live: false, mode: 'simulated', model: 'muse-spark' };
 let timer = null;
 let pendingLive = false;
@@ -173,8 +173,11 @@ function run() {
   cancelInFlight();
   const runId = currentRunId;
   const s = cur(), live = serverLive(), t0 = performance.now();
-  Object.assign(state, { step: 'analyze', stage: 'running', elapsed: 0, live: null, err: null, limitHit: false, active: -1, view: 'raw', runMode: live ? 'live' : 'simulated' });
+  Object.assign(state, { step: 'analyze', stage: 'running', elapsed: 0, live: null, err: null, limitHit: false, liveAttempted: false, active: -1, view: 'raw', runMode: live ? 'live' : 'simulated' });
   if (live) {
+    // Only set this when a request actually goes out, so a late
+    // /api/config "live" flip cannot claim a failed live call.
+    state.liveAttempted = true;
     pendingLive = true;
     const controller = new AbortController();
     currentAbort = controller;
@@ -222,11 +225,11 @@ function run() {
     else if (el >= s.ms) fin(s.ms); else { state.elapsed = el; renderAnalyze(); renderStepper(); }
   }, 40);
 }
-function trySample() { clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: 's1', upload: null, stage: 'idle', step: 'data', live: null, err: null, limitHit: false, runMode: null }); render(); scrollToApp(); setTimeout(run, 500); }
+function trySample() { clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: 's1', upload: null, stage: 'idle', step: 'data', live: null, err: null, limitHit: false, liveAttempted: false, runMode: null }); render(); scrollToApp(); setTimeout(run, 500); }
 function pickFile() { const f = $('fileInput'); if (f) f.click(); }
 function loadFile(file) {
   if (!file) return; const rd = new FileReader();
-  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, limitHit: false, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
+  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, limitHit: false, liveAttempted: false, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
   rd.readAsText(file);
 }
 
@@ -240,8 +243,8 @@ function badge(tone, label, sm) {
 function currentFindings() { return state.stage === 'done' ? (state.live ? state.live.findings : cur().findings) : []; }
 
 function renderMode() {
-  const fallback = state.runMode === 'simulated' && serverLive();
-  const live = serverLive() && !fallback;
+  const fallback = state.runMode === 'simulated' && state.liveAttempted;
+  const live = (state.runMode === 'live') || (!state.runMode && serverLive());
   $('modeDot').style.background = live ? 'var(--accent)' : 'var(--warning-500)';
   $('modeText').textContent = live
     ? 'live · /api/check · ' + (appConfig.model || 'muse-spark')
@@ -326,7 +329,7 @@ function renderAnalyze() {
   const logLines = [];
   if (st.stage !== 'idle') {
     if (simulated) {
-      if (serverLive()) {
+      if (state.liveAttempted) {
         // A live request was actually sent (or blocked); don't claim none was.
         logLines.push({ t: `→ POST /api/check  model=${appConfig.model || 'muse-spark'}`, c: 'var(--text-2)' });
         logLines.push({ t: `  file=${s.file}  rows=${s.rows.length}  cols=${s.cols.length}`, c: 'var(--text-3)' });
@@ -362,7 +365,7 @@ function renderAnalyze() {
       <div class="analyze-status">${badge(statusTone, statusLabel, true)}${st.err ? `<span class="form-error" style="font-size:13px">${esc(st.err)}</span>` : ''}</div>
     </div>
     <div class="stream-card">
-      <div class="stream-head"><span>${simulated ? (serverLive() ? 'simulated stream — live request failed' : 'simulated stream — no request sent') : 'response stream'}</span><span>${done ? currentFindings().length + ' findings' : running ? 'streaming' : ''}</span></div>
+      <div class="stream-head"><span>${simulated ? (state.liveAttempted ? 'simulated stream — live request failed' : 'simulated stream — no request sent') : 'response stream'}</span><span>${done ? currentFindings().length + ' findings' : running ? 'streaming' : ''}</span></div>
       <div class="stream-log">${logLines.map(ln => `<span style="color:${ln.c}">${esc(ln.t)}</span>`).join('')}</div>
       ${done ? '<div class="stream-foot"><button class="btn btn-primary btn-sm" data-action="go" data-step="findings" type="button">See findings →</button></div>' : ''}
     </div></div>`;
@@ -516,12 +519,12 @@ document.addEventListener('click', (e) => {
   const t = e.target.closest('[data-action]'); if (!t) return;
   const a = t.dataset.action; if (!a) return;
   if (a === 'go') { state.step = t.dataset.step; render(); }
-  else if (a === 'sample') { const id = t.dataset.id; if (id === 'upload') return; clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: id, upload: null, stage: 'idle', step: 'data', live: null, err: null, active: -1, runMode: null }); render(); }
+  else if (a === 'sample') { const id = t.dataset.id; if (id === 'upload') return; clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: id, upload: null, stage: 'idle', step: 'data', live: null, err: null, limitHit: false, liveAttempted: false, active: -1, runMode: null }); render(); }
   else if (a === 'pick-file') pickFile();
   else if (a === 'run') run();
   else if (a === 'card') { const i = Number(t.dataset.index); state.active = state.active === i ? -1 : i; render(); }
   else if (a === 'view') { state.view = t.dataset.view; render(); }
-  else if (a === 'restart') { clearInterval(timer); cancelInFlight(); Object.assign(state, { step: 'data', stage: 'idle', active: -1, live: null, runMode: null }); render(); scrollToApp(); }
+  else if (a === 'restart') { clearInterval(timer); cancelInFlight(); Object.assign(state, { step: 'data', stage: 'idle', active: -1, live: null, err: null, limitHit: false, liveAttempted: false, runMode: null }); render(); scrollToApp(); }
 });
 $('fileInput').addEventListener('change', (e) => { loadFile(e.target.files && e.target.files[0]); e.target.value = ''; });
 $('heroTrySample').addEventListener('click', trySample);
