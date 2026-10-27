@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="LaneMint">
+  <rect width="48" height="48" rx="10" fill="#0F0E0E"/>
+  <g fill="none" stroke-linecap="round" stroke-width="3.6">
+    <path d="M6 15 Q15 7 24 15 T42 15" stroke="#009D5E"/>
+    <path d="M6 24 Q15 16 24 24 T42 24" stroke="#009D5E"/>
+    <path d="M6 33 Q15 25 24 33 T42 33" stroke="#DDFF00"/>
+  </g>
+</svg>
