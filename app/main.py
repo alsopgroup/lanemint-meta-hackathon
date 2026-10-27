@@ -11,6 +11,7 @@ call/spend limits apply, and cross-origin browser calls are rejected.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,12 +29,12 @@ except ImportError:  # pragma: no cover
     pass
 
 from muse_client import (
-    MAX_CSV_CHARS,
     MuseBadRequest,
     MuseNotConfigured,
     MuseUpstreamError,
     check_csv,
     live_config,
+    validate_csv,
 )
 from rate_limit import guard
 
@@ -84,31 +85,52 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+async def _read_json_payload(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Read the request body with a hard size bound, then parse JSON.
+
+    Streaming the body (rather than trusting Content-Length) means
+    chunked/header-less requests cannot bypass the cap and balloon
+    memory. Returns (payload, None) or (None, error_response).
+    """
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+        return None, JSONResponse({"error": "Request body too large"}, status_code=413)
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            return None, JSONResponse({"error": "Request body too large"}, status_code=413)
+        chunks.append(chunk)
+    try:
+        payload = json.loads(b"".join(chunks))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return None, JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
+    return payload, None
+
+
 @app.post("/api/check")
 async def api_check(request: Request) -> JSONResponse:
     if not _origin_allowed(request):
         return JSONResponse({"error": "Cross-origin calls are not allowed"}, status_code=403)
 
-    content_length = request.headers.get("content-length")
-    if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
-        return JSONResponse({"error": "Request body too large"}, status_code=413)
-
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
-    if not isinstance(payload, dict):
-        return JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
+    payload, error = await _read_json_payload(request)
+    if error is not None:
+        return error
+    assert payload is not None
 
     filename = str(payload.get("filename") or "upload.csv")[:200]
     csv_text = payload.get("csv")
     if not isinstance(csv_text, str) or not csv_text.strip():
         return JSONResponse({"error": "Field 'csv' must be a non-empty string"}, status_code=400)
-    if len(csv_text) > MAX_CSV_CHARS:
-        return JSONResponse(
-            {"error": f"CSV is too large (max {MAX_CSV_CHARS} characters)"},
-            status_code=413,
-        )
+    # Validate the CSV shape before taking any live quota, so malformed
+    # uploads rejected with 413 never consume rate/budget capacity.
+    try:
+        validate_csv(csv_text)
+    except MuseBadRequest as exc:
+        return JSONResponse({"error": str(exc)}, status_code=413)
     # Any client-supplied "model" is ignored: the model is pinned by
     # META_MODEL_NAME on the server so callers cannot pick a pricier one.
 

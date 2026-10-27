@@ -178,6 +178,35 @@ def test_check_daily_budget_cap(monkeypatch):
     assert "budget" in second.json()["error"]
 
 
+def test_check_chunked_oversized_body_413():
+    # A generator body makes httpx use chunked encoding (no
+    # Content-Length), which must not bypass the body size cap.
+    def oversized():
+        yield b'{"filename": "x.csv", "csv": "date,close\n'
+        yield b"1" * (80_000 + 1)
+        yield b'"}'
+
+    resp = client.post(
+        "/api/check", content=oversized(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 413
+
+
+def test_invalid_csv_does_not_consume_quota(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "1")
+    monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
+    _stub_openai(monkeypatch, _live_ok_create)
+    rows = "date,close\n" + "".join(
+        f"2026-01-{(i % 28) + 1:02d},1\n" for i in range(501))
+    bad = client.post("/api/check", json={"filename": "x.csv", "csv": rows})
+    assert bad.status_code == 413
+    # The 413 above must not have taken the single per-minute slot.
+    ok = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    assert ok.status_code == 200
+
+
 def test_parse_findings_scalar_rows():
     content = (
         '{"findings": ['

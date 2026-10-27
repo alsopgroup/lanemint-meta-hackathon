@@ -57,7 +57,7 @@ def live_config() -> dict:
     return {"live": bool(api_key), "mode": "live" if api_key else "simulated", "model": model}
 
 
-def _validate_csv(csv_text: str) -> tuple[str, int]:
+def validate_csv(csv_text: str) -> tuple[str, int]:
     """Enforce hard input caps; returns (csv, data_row_count)."""
     if len(csv_text) > MAX_CSV_CHARS:
         raise MuseBadRequest(
@@ -153,7 +153,7 @@ def check_csv(filename: str, csv_text: str) -> dict:
 
     base_url = os.getenv("META_BASE_URL", "https://api.meta.ai/v1")
     model_name = os.getenv("META_MODEL_NAME", "muse-spark-1.3")
-    truncated, num_rows = _validate_csv(csv_text)
+    truncated, num_rows = validate_csv(csv_text)
 
     try:
         from openai import OpenAI
