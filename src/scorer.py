@@ -546,13 +546,14 @@ class TaskScorer:
                       'r_squared'):
             if field in expected and scores.get(field, 0.0) < 1.0:
                 core_ok = False
-        # Frontier F1's cores are the last-window beta and the
-        # final-window volatility (both identified by last_window_beta;
-        # the hard tier's unrelated mean_beta tasks are unaffected).
-        if 'last_window_beta' in expected:
-            core_ok = core_ok and \
-                scores.get('last_window_beta', 0.0) >= 1.0 and \
-                scores.get('final_window_volatility', 0.0) >= 1.0
+        # Frontier F1's cores are the three last-window betas and the
+        # final-window volatility (identified by window_beta_1; the
+        # hard tier's unrelated beta tasks are unaffected).
+        if 'window_beta_1' in expected:
+            core_ok = core_ok and all(
+                scores.get(f, 0.0) >= 1.0 for f in (
+                    'window_beta_1', 'window_beta_2', 'window_beta_3',
+                    'final_window_volatility'))
         # Frontier F4's max_drawdown is core too (identified by the
         # accompanying first_rebalance_value; pilot passes had it wrong
         # while reaching 0.8 overall). The hard tier's standalone
