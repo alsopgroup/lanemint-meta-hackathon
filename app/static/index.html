@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Muse Data Check — LaneMint</title>
+<meta name="description" content="Muse Spark reads a CSV of market data, flags duplicates, gaps, bad prices and unadjusted splits, and explains each one in plain English. A deterministic scorer then checks its answer.">
+<link rel="stylesheet" href="/static/css/typography.css">
+<link rel="stylesheet" href="/static/css/colors.css">
+<link rel="stylesheet" href="/static/css/spacing.css">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="icon" href="/static/assets/meta-ai.png">
+</head>
+<body>
+<input type="file" id="fileInput" accept=".csv,text/csv" hidden>
+
+<header class="site-header">
+  <div class="header-inner">
+    <div class="brand">
+      <span class="wordmark" aria-label="LaneMint">
+        <svg width="25" height="25" viewBox="0 0 48 48" role="img" aria-label="LaneMint" style="display:block;flex-shrink:0">
+          <g fill="none" stroke-linecap="round" stroke-width="3.6">
+            <path d="M6 15 Q15 7 24 15 T42 15" stroke="var(--mint-500)"/>
+            <path d="M6 24 Q15 16 24 24 T42 24" stroke="var(--mint-500)"/>
+            <path d="M6 33 Q15 25 24 33 T42 33" stroke="var(--lime-500)"/>
+          </g>
+        </svg>
+        <span class="wordmark-text">Lane<span class="wordmark-accent">Mint</span></span>
+      </span>
+      <span class="brand-divider"></span>
+      <span class="brand-sub">Muse data check</span>
+    </div>
+    <nav class="main-nav">
+      <a href="#app">Try it</a>
+      <a href="#benchmark">Benchmark</a>
+      <a href="#how">How it works</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <canvas id="waveCanvas" class="wave-lines" aria-hidden="true"></canvas>
+  <div class="hero-fade"></div>
+  <div class="hero-inner">
+    <h1>Market data is never clean. <span class="accent">Can Muse catch it?</span></h1>
+    <p>Muse Spark reads a CSV of market data, flags duplicates, gaps, bad prices and unadjusted splits, and explains each one in plain English. A deterministic scorer then checks its answer.</p>
+    <div class="hero-actions">
+      <button class="btn btn-primary btn-lg" id="heroTrySample" type="button">Try a sample →</button>
+      <button class="btn btn-secondary btn-lg" id="heroUpload" type="button">Upload CSV</button>
+    </div>
+    <div class="hero-meta"><span>Built with</span><img class="meta-wordmark" src="/static/assets/meta-ai-logo.png" alt="Meta AI"><span>Muse models</span></div>
+  </div>
+</section>
+
+<section id="app" class="app-section">
+  <div class="app-heading">
+    <h2>Run a check</h2>
+    <div class="mode-indicator"><span class="mode-dot" id="modeDot"></span><span class="mode-text" id="modeText">simulated responses · set mode to live to call Muse</span></div>
+  </div>
+
+  <div class="panel app-panel">
+    <div class="demo-banner" id="demoBanner">
+      <strong>Demo mode</strong>
+      <span id="demoBannerText">No Meta API key is configured on the server, so no model is called. Findings, timings, and scores below are simulated for illustration — set <span class="mono">META_API_KEY</span> on the server for live Muse Spark runs.</span>
+    </div>
+    <div class="stepper" id="stepper"></div>
+
+    <div id="stepData"></div>
+    <div id="stepAnalyze" hidden></div>
+    <div id="stepFindings" hidden></div>
+    <div id="stepScore" hidden></div>
+  </div>
+</section>
+
+<section id="benchmark" class="benchmark-section">
+  <div class="section-inner">
+    <div class="benchmark-head">
+      <div class="benchmark-intro">
+        <span class="eyebrow">Benchmark · seed 42 · 25 easy + 25 hard tasks</span>
+        <h2>Easy is close to solved. Hard separates the models.</h2>
+        <p>A task passes only when the problem set is exactly right (F1 = 1.0) and the overall score is ≥ 0.8, with numeric fields within tolerance.</p>
+      </div>
+      <span class="badge badge-md badge-mono"><span class="badge-dot" style="background:var(--status-info)"></span>v4 run · 2026-10-26</span>
+    </div>
+    <div class="bench-overall" id="benchOverall"></div>
+    <div class="bench-baselines">
+      <span><span class="baseline-tick"></span>Fixed-guess baseline: <span class="mono">17/25</span> easy, <span class="mono">2/25</span> hard</span>
+      <span>Solver reference: <span class="mono">25/25</span> both tiers</span>
+      <span>Total run cost: <span class="mono">$4.48</span></span>
+    </div>
+    <div class="panel bench-types-panel">
+      <div class="bench-types-head">
+        <span class="card-label">Pass rate by task type</span>
+        <div class="bench-legend" id="benchLegend"></div>
+      </div>
+      <div id="benchTiers"></div>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="how-section">
+  <div class="section-inner">
+    <div class="how-intro">
+      <span class="eyebrow">How it works</span>
+      <h2>Generate, test, score</h2>
+    </div>
+    <div>
+      <div class="how-grid">
+        <div class="panel how-card">
+          <div class="how-card-top"><span class="mono accent">1</span><span class="mono muted">generator.py</span></div>
+          <h3>Generate messy data</h3>
+          <p>A seeded random walk produces clean prices. Known problems are planted at recorded rows, which becomes the answer key.</p>
+        </div>
+        <div class="panel how-card">
+          <div class="how-card-top"><span class="mono accent">2</span><span class="mono muted">muse-spark · muse-glimmer</span></div>
+          <h3>Test the model</h3>
+          <p>The CSV goes to a Muse model, which returns each problem it finds with the affected rows and an explanation.</p>
+        </div>
+        <div class="panel how-card">
+          <div class="how-card-top"><span class="mono accent">3</span><span class="mono muted">scorer.py</span></div>
+          <h3>Score it</h3>
+          <p>The scorer counts caught, missed and falsely flagged problems against the answer key and returns one number.</p>
+        </div>
+      </div>
+      <div class="how-loop-line"><div></div></div>
+      <div class="how-loop-label"><span>score → training reward for fine-tuning Glimmer</span></div>
+    </div>
+    <div class="how-links">
+      <a class="btn btn-secondary btn-md" href="https://github.com/alsopgroup/lanemint-meta-hackathon" target="_blank" rel="noopener">GitHub repo →</a>
+      <a class="btn btn-ghost btn-md" href="https://lanemint.com" target="_blank" rel="noopener">lanemint.com →</a>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <span class="wordmark" aria-label="LaneMint">
+      <svg width="23" height="23" viewBox="0 0 48 48" role="img" aria-label="LaneMint" style="display:block;flex-shrink:0">
+        <g fill="none" stroke-linecap="round" stroke-width="3.6">
+          <path d="M6 15 Q15 7 24 15 T42 15" stroke="var(--mint-500)"/>
+          <path d="M6 24 Q15 16 24 24 T42 24" stroke="var(--mint-500)"/>
+          <path d="M6 33 Q15 25 24 33 T42 33" stroke="var(--lime-500)"/>
+        </g>
+      </svg>
+      <span class="wordmark-text wordmark-text-sm">Lane<span class="wordmark-accent">Mint</span></span>
+    </span>
+    <div class="footer-links">
+      <span>Built for the Meta hackathon</span>
+      <span>Track: Build for Your World</span>
+      <a href="mailto:hi@lanemint.com">hi@lanemint.com</a>
+    </div>
+  </div>
+</footer>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

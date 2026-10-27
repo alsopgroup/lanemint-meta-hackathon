@@ -1,0 +1,12 @@
+/* Spacing, radii, borders, elevation, motion — values from UIKit.fig auto-layout */
+:root{
+--space-1:6px;--space-2:8px;--space-3:10px;--space-4:12px;--space-5:14px;--space-6:16px;--space-7:20px;--space-8:24px;--space-9:32px;--space-10:36px;--space-11:40px;--space-12:48px;--space-13:56px;--space-14:64px;--space-15:84px;--space-16:96px;--space-17:100px;
+--radius-xs:8px;--radius-sm:11px;--radius-md:12px;--radius-lg:20px;--radius-xl:24px;--radius-2xl:48px;--radius-pill:85px;
+--border-hair:1px;--border-thick:2px;
+--shadow-inset-line:inset 0 0 0 1px var(--line-1);
+--shadow-pop:0 12px 32px rgba(0,0,0,0.45);
+--blur-glass:24px;/* @kind other */
+--ease-out:cubic-bezier(.2,.7,.2,1);/* @kind other */--ease-inout:cubic-bezier(.65,0,.35,1);/* @kind other */
+--dur-fast:120ms;/* @kind other */--dur-base:200ms;/* @kind other */--dur-slow:420ms;/* @kind other */
+--grid-max:1280px;/* @kind spacing */--grid-gutter:24px;/* @kind spacing */
+}
