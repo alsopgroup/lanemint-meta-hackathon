@@ -27,7 +27,7 @@ graph LR
     A[Generate Tasks] --> B[Run Model]
     B --> C[Score Results]
     A --> D[Prepare Fine-tuning Data]
-    D --> E[Fine-tune Model Locally]
+    D --> E[Fine-tune on Fireworks]
     E --> B
     C --> F[Deterministic Reward]
     F --> E
@@ -193,39 +193,56 @@ Shows pass/fail for each task with detailed feedback.
 
 ### 4. Prepare Fine-Tuning Data
 
-Split tasks into training and validation sets for local fine-tuning:
+Build a Fireworks SFT dataset with `src/finetune_prep.py`. Tasks are generated in-process per seed (`--tier`/`--seeds`) or loaded from one or more task directories (`--tasks-dir`, repeatable; declare a directory's generation seed as `PATH@SEED`).
+
+**Seed-disjointness rule (mandatory):** training and validation data must be disjoint by generation seed from each other and from the locked eval seeds **42, 1001 and 1002**. The split is by whole seed (`--val-seeds`), never by shuffling tasks from the same seed across the split. `--exclude-seeds` (default `42,1001,1002`) refuses any dataset seed in the locked set, and `--eval-dirs` adds a SHA-256 check: if any training CSV or answer matches an eval task's, the run refuses before writing anything. All randomness uses a local `random.Random`, and every run writes a `manifest.json` (generator commit, seeds, per-family counts, token stats, SHA-256 of each output file).
 
 ```bash
-python -m src.finetune_prep
+# Planned dataset: frontier seeds 2001-2040, 32 tasks per seed;
+# train on 2001-2036, validate on 2037-2040. Eval sets (seeds
+# 42/1001/1002, generated separately) guard against contamination.
+python -m src.finetune_prep --tier frontier --seeds 2001-2040 --count 32 \
+    --val-seeds 2037-2040 --eval-dirs tasks_eval_42 --eval-dirs tasks_eval_1001 --eval-dirs tasks_eval_1002 \
+    --target trace --output-dir finetune_data
 ```
 
 Creates:
-- `finetune_data/train.jsonl` - SFT training examples (80%)
-- `finetune_data/validation.jsonl` - Validation examples (20%)
-- `finetune_data/validation_task_ids.json` - Held-out task IDs
+- `finetune_data/train.jsonl` - SFT training examples
+- `finetune_data/validation.jsonl` - Held-out validation examples (the SFT evaluation dataset)
+- `finetune_data/validation_task_ids.json` - Held-out task IDs (seed-qualified)
+- `finetune_data/manifest.json` - Provenance, counts, token stats, output hashes
 
-The JSONL format is compatible with TRL (Hugging Face) and Axolotl for QLoRA fine-tuning.
+`--target {answer,trace}` selects the assistant target: `answer` is the final JSON only; `trace` adds a deterministic worked solution from `src/trace.py` (cleaning log, aligned counts, per-window/per-step intermediates, final values; capped by `--trace-max-tokens`). Fireworks SFT supports thinking traces as `reasoning_content` on the assistant message, so traces are stored in that field and `content` remains the final JSON — no trace text is embedded in `content`. `--families` restricts task types and `--mix` (e.g. `--mix hard=0.15,frontier=0.85`) downsamples groups to target proportions.
 
-### 5. Fine-Tune Locally (Planned)
+### 5. Fine-Tune on Fireworks
 
-Fine-tune **Muse Glimmer** (30B dense, Apache 2.0) locally using the prepared data:
-
-**Target model**: `meta-models/Muse-Glimmer-30B` (Hugging Face) or `meta-models/Muse-Glimmer-30B-GGUF`
-
-**Approaches**:
-- **Supervised Fine-Tuning (SFT)**: Use `train.jsonl` with TRL's `SFTTrainer` or Axolotl for QLoRA
-- **GRPO (Group Relative Policy Optimization)**: Use `src/scorer.py` as a deterministic reward function with TRL's `GRPOTrainer` or Meta's TitanRL data-analyst recipe
+Fine-tune **Muse Glimmer 30B** with a LoRA adapter on Fireworks (managed SFT). `src/finetune.py` validates the dataset against the Fireworks SFT rules — 3 to 3,000,000 rows, valid message roles with a non-empty assistant message, and every row within `--max-context-length` tokens (default 32768; rows over the limit **fail** validation instead of being silently truncated by the platform) — and then prints, but never runs, the `firectl` commands:
 
 ```bash
-# Estimate data size and check format (dry-run, no training)
+# Validate and print the plan (dry-run; nothing is executed)
 python -m src.finetune --dry-run
 
-# For actual fine-tuning, see TRL or Axolotl documentation
-# Optional: install fine-tuning dependencies
-# pip install -e ".[finetune]"
+# Printed plan (run manually after review; these are paid operations):
+# firectl dataset create glimmer-sft finetune_data/train.jsonl
+# firectl dataset create glimmer-sft-eval finetune_data/validation.jsonl
+# firectl sftj create --base-model accounts/fireworks/models/muse-glimmer-30b \
+#     --dataset glimmer-sft --evaluation-dataset glimmer-sft-eval \
+#     --lora-rank 16 --epochs 2 --output-model muse-glimmer-30b-lora
 ```
 
-**Note**: Fine-tuning requires GPU resources. The scorer provides deterministic rewards for reinforcement learning approaches.
+**Evaluation protocol:** after training, evaluate the LoRA model on the locked held-out frontier set — 96 tasks (seeds 42, 1001 and 1002 at `--count 32`) that were never trained or validated on — with the runner at **low reasoning effort** (the same setting as the frontier pilots), and report pass rates with Wilson score intervals. **Deployment teardown is mandatory:** delete the dedicated deployment (or unload the LoRA addon) as soon as evaluation finishes, so no fine-tuned endpoint is left running.
+
+**Runner model strings for the LoRA model** (the runner takes `--model` / `META_MODEL_NAME`, with `META_BASE_URL` pointed at the Fireworks OpenAI-compatible endpoint `https://api.fireworks.ai/inference/v1`):
+
+- Dedicated deployment of the tuned model: `--model accounts/<your-account>/models/muse-glimmer-30b-lora` (the output model resource name).
+- Multi-LoRA deployment routing: `--model <model_name>#<deployment_name>` (the `#` form routes the request to that LoRA adapter on the named deployment; quote it in the shell).
+
+```bash
+META_BASE_URL=https://api.fireworks.ai/inference/v1 \
+META_MODEL_NAME='accounts/<your-account>/models/muse-glimmer-30b-lora' \
+python -m src.runner --tier frontier --reasoning-effort low --output-dir output/glimmer_lora
+python -m src.scorer output/glimmer_lora/results.json tasks_frontier_eval/answers
+```
 
 ### 6. Running Real Model Evaluation
 
@@ -238,8 +255,8 @@ python -m src.runner --output-dir output/baseline
 # Score baseline
 python -m src.scorer output/baseline/results.json
 
-# After local fine-tuning, point to your fine-tuned model endpoint
-# Update META_BASE_URL and META_MODEL_NAME in .env, then:
+# After Fireworks fine-tuning, evaluate the LoRA deployment (see
+# 'Fine-Tune on Fireworks' above for the model string forms), then:
 python -m src.runner --output-dir output/finetuned
 
 # Score fine-tuned results
@@ -262,8 +279,9 @@ python -m src.scorer output/finetuned/results.json
 │   ├── frontier_tier.py          # Frontier tier task generator (F1-F4)
 │   ├── scorer.py                 # Deterministic scoring engine (also usable as reward function)
 │   ├── runner.py                 # Model runner with dry-run mode
-│   ├── finetune_prep.py          # Fine-tuning data preparation (SFT/GRPO)
-│   └── finetune.py               # Fine-tuning configuration and validation
+│   ├── finetune_prep.py          # Seed-disjoint Fireworks SFT data preparation
+│   ├── trace.py                  # Deterministic worked-solution traces
+│   └── finetune.py               # Fireworks SFT validation + printed firectl plan
 ├── tests/
 │   ├── __init__.py
 │   ├── test_generate_tasks.py    # Easy tier tests
@@ -435,7 +453,7 @@ Market data is never clean in the real world. Duplicate rows, missing trading da
 1. **Synthetic benchmark**: Generate realistic market data with known quality issues
 2. **Test Muse Spark**: Evaluate Meta's Muse models on data quality detection
 3. **Deterministic scoring**: Validate responses with precise, reproducible grading
-4. **Local fine-tuning**: Use the same scorer as a reward function for fine-tuning Muse Glimmer (30B, open-weights) with GRPO
+4. **Fireworks fine-tuning**: LoRA SFT of Muse Glimmer 30B on seed-disjoint generated data (with the deterministic scorer available as a reward function for later RL)
 
 The deterministic scorer enables both evaluation and reinforcement learning, closing the loop from detection to improvement.
 
