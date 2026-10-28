@@ -89,23 +89,25 @@ def _valid_ip(value: str) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    # Trust model: the app sits behind one trusted proxy (Railway's
-    # edge), which *appends* the address it observed to X-Forwarded-For.
-    # Earlier hops are client-supplied and can be forged to mint fresh
-    # rate-limit buckets, so only the last hop is used. X-Real-IP (also
-    # proxy-set on Railway) is the fallback for proxies that send only
-    # that header, then the TCP peer. Header values that are not valid
-    # IPs are ignored. If the service were reached directly with no
-    # proxy, forwarded headers would be forgeable — the global daily
-    # caps in rate_limit.py are the backstop for that case.
+    # Trust model on Railway: the edge proxy sets X-Real-IP to the
+    # visitor address it observed, overwriting any client-supplied
+    # value on the way through, so that header — not a forwarded-for
+    # hop — identifies the visitor. The last X-Forwarded-For hop can
+    # be Railway's own edge/internal address, which would bucket every
+    # visitor together, so it is never used. Without X-Real-IP, fall
+    # back to the first forwarded hop (the claimed original client),
+    # then the TCP peer. Header values that are not valid IPs are
+    # ignored. If the service were reached directly with no proxy,
+    # forwarded headers would be forgeable — the global daily caps in
+    # rate_limit.py are the backstop for that case.
+    real_ip = _valid_ip((request.headers.get("x-real-ip") or "").strip())
+    if real_ip:
+        return real_ip
     forwarded = request.headers.get("x-forwarded-for", "")
     hops = [_valid_ip(hop.strip()) for hop in forwarded.split(",")]
     hops = [hop for hop in hops if hop]
     if hops:
-        return hops[-1]
-    real_ip = _valid_ip((request.headers.get("x-real-ip") or "").strip())
-    if real_ip:
-        return real_ip
+        return hops[0]
     return request.client.host if request.client else "unknown"
 
 

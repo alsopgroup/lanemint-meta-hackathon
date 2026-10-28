@@ -50,11 +50,13 @@
       "name": "Muse Glimmer 30B (base)",
       "provider": "Fireworks",
       "status": "complete",
-      "scope": "seed 42 only",
-      "total": {"passed": 0, "total": 32},
-      "notes": [
-        "Seed 42 only (32 tasks); not pooled over the held-out seeds."
-      ]
+      "families": {
+        "F1": {"passed": 0, "total": 24},
+        "F2": {"passed": 0, "total": 24},
+        "F3": {"passed": 0, "total": 24},
+        "F4": {"passed": 0, "total": 24}
+      },
+      "notes": []
     },
     {
       "id": "muse-glimmer-30b-lora",

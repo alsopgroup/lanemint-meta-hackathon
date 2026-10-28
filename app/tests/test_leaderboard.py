@@ -48,10 +48,14 @@ def test_published_results_and_recomputed_totals():
     assert any("API errors" in n for n in opened["notes"])
 
     glimmer = entries["muse-glimmer-30b-base"]
-    assert glimmer["scope"] == "seed 42 only"
-    assert glimmer["families"] is None
+    assert "scope" not in glimmer  # pooled over all held-out seeds now
+    assert {f: (v["passed"], v["total"])
+            for f, v in glimmer["families"].items()} == {
+        "F1": (0, 24), "F2": (0, 24), "F3": (0, 24), "F4": (0, 24)}
     assert glimmer["total"]["passed"] == 0
-    assert glimmer["total"]["total"] == 32
+    assert glimmer["total"]["total"] == 96
+    assert glimmer["total"]["pct"] == 0
+    assert glimmer["total"]["ci95"] == [0, 4]
 
     lora = entries["muse-glimmer-30b-lora"]
     assert lora["status"] == "coming_soon"
