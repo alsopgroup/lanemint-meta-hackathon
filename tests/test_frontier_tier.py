@@ -24,7 +24,7 @@ OFF_LIMITS = ["delist", "survivorship", "rename", "dividend", "stale",
 
 FIELDS = {
     "frontier_rolling_risk": ["window_beta_1", "window_beta_2",
-                              "window_beta_3", "target_asset",
+                              "window_beta_3", "window_beta_4", "target_asset",
                               "final_window_volatility", "num_assets",
                               "num_aligned_days"],
     "frontier_vendor_reconciliation": ["mismatch_count", "first_conflict_date",
@@ -118,10 +118,10 @@ class TestGeneration:
         assert task["expected"]["target_asset"] in ("AST1", "AST2", "AST3")
         assert set(task["expected"]) == {
             "window_beta_1", "window_beta_2", "window_beta_3",
-            "target_asset", "final_window_volatility",
+            "window_beta_4", "target_asset", "final_window_volatility",
             "num_assets", "num_aligned_days", "problems_found"}
         flat = " ".join(task["prompt"].split())
-        assert "last three non-overlapping windows" in flat
+        assert "last four non-overlapping windows" in flat
         assert "not a full-sample regression" in flat
         # Window definitions are stated in terms of return indices.
         assert "window 1 is" in flat and "window 3 is" in flat
@@ -284,6 +284,18 @@ class TestIndependentSolver:
                 assert not _is_no_attempt(task["expected"]), \
                     (seed, task["id"], task["expected"])
 
+    def test_no_attempt_regression_f2_seed_8516(self):
+        # The correct reconciled_total_return for this task is exactly
+        # 0.012345; a 6-digit sequential run below magnitude 0.1 is a
+        # natural rounding collision, not a placeholder (found by the
+        # 10,000-per-family false-positive sweep, seeds 1-10000).
+        from src.scorer import _is_no_attempt
+        gen = FrontierTaskGenerator(seed=8516)
+        task, _ = gen.generate_task_vendor_reconciliation()
+        assert task["expected"]["reconciled_total_return"] == 0.012345
+        assert not _is_no_attempt(task["expected"])
+        assert not _is_no_attempt(task["expected"], task["expected"])
+
     @pytest.mark.parametrize(("seed", "count"), [(184, 3), (334, 7)])
     def test_injector_collision_regressions(self, seed, count):
         # Seed 184: a missing day deleted one copy of a duplicate.
@@ -402,6 +414,7 @@ class TestCoreFieldRequired:
     """Correct codes with constant numbers must pass 0% (core is required)."""
 
     CORE = ("window_beta_1", "window_beta_2", "window_beta_3",
+            "window_beta_4",
             "reconciled_total_return", "reconciled_max_drawdown",
             "beta_market", "beta_sector", "final_return", "max_drawdown")
 
@@ -527,7 +540,8 @@ class TestScorerFrontierFields:
 
     def test_f1_fields_exact_and_toleranced(self, tmp_path):
         answer = {"window_beta_1": 0.9, "window_beta_2": 1.0,
-                  "window_beta_3": 1.1, "target_asset": "AST1",
+                  "window_beta_3": 1.1, "window_beta_4": 0.8,
+                  "target_asset": "AST1",
                   "final_window_volatility": 0.2, "num_assets": 2,
                   "num_aligned_days": 50, "problems_found": ["missing_day_x"]}
         (tmp_path / "task_f_2002_answer.json").write_text(json.dumps(answer))
@@ -541,7 +555,8 @@ class TestScorerFrontierFields:
         assert result["component_scores"]["target_asset"] == 0.0
         # Each window beta is a core field: any one wrong beyond 1e-4
         # cannot pass.
-        for field in ("window_beta_1", "window_beta_2", "window_beta_3"):
+        for field in ("window_beta_1", "window_beta_2", "window_beta_3",
+                      "window_beta_4"):
             off = {**good, field: good[field] + 0.01}
             result = scorer.score_task("task_f_2002", json.dumps(off))
             assert result["component_scores"][field] == 0.0
@@ -635,10 +650,10 @@ class TestGuessBaselines:
             exp = task["expected"]
             if task["type"] == "frontier_rolling_risk":
                 if any(abs(exp[f"window_beta_{i}"] - 1.0) <= 1e-4
-                       for i in (1, 2, 3)):
+                       for i in (1, 2, 3, 4)):
                     return None
-                return {**got, "window_beta_1": 1.0, "window_beta_2": 1.0,
-                        "window_beta_3": 1.0}
+                return {**got, **{f"window_beta_{i}": 1.0
+                                   for i in (1, 2, 3, 4)}}
             if task["type"] == "frontier_factor_exposure":
                 if abs(exp["beta_market"] - 1.0) <= 1e-3 or \
                         abs(exp["beta_sector"] - 1.0) <= 1e-3:
@@ -649,23 +664,23 @@ class TestGuessBaselines:
         self._assert_baseline_fails(tamper)
 
     def test_single_window_beta_passes_zero(self):
-        """F1: submitting the most recent window's beta for all three
+        """F1: submitting the most recent window's beta for all four
         windows (the pilot-4 single-window answer) must fail."""
         def tamper(task, got, data):
             if task["type"] != "frontier_rolling_risk":
                 return None
             exp = task["expected"]
-            if abs(exp["window_beta_1"] - exp["window_beta_3"]) <= 1e-4 \
-                    and abs(exp["window_beta_2"] - exp["window_beta_3"]) <= 1e-4:
-                return None  # all three coincide; not a shortcut win
-            return {**got, "window_beta_1": got["window_beta_3"],
-                    "window_beta_2": got["window_beta_3"]}
+            if all(abs(exp[f"window_beta_{i}"] - exp["window_beta_4"])
+                   <= 1e-4 for i in (1, 2, 3)):
+                return None  # all four coincide; not a shortcut win
+            return {**got, **{f"window_beta_{i}": got["window_beta_4"]
+                               for i in (1, 2, 3)}}
 
         self._assert_baseline_fails(tamper)
 
     def test_mean_rolling_beta_passes_zero(self):
         """F1: the mean of all rolling window betas, submitted for each
-        of the three windows, must fail."""
+        of the four windows, must fail."""
         def tamper(task, got, data):
             if task["type"] != "frontier_rolling_risk":
                 return None
@@ -679,16 +694,16 @@ class TestGuessBaselines:
             mean_beta = round(float(rolling.mean()), 6)
             exp = task["expected"]
             if all(abs(exp[f"window_beta_{i}"] - mean_beta) <= 1e-4
-                   for i in (1, 2, 3)):
+                   for i in (1, 2, 3, 4)):
                 return None
-            return {**got, "window_beta_1": mean_beta,
-                    "window_beta_2": mean_beta, "window_beta_3": mean_beta}
+            return {**got, **{f"window_beta_{i}": mean_beta
+                               for i in (1, 2, 3, 4)}}
 
         self._assert_baseline_fails(tamper)
 
     def test_full_sample_beta_passes_zero(self):
         """F1: a full-sample beta (all returns) submitted for each of
-        the three windows must fail the core check."""
+        the four windows must fail the core check."""
         def tamper(task, got, data):
             if task["type"] != "frontier_rolling_risk":
                 return None
@@ -698,11 +713,102 @@ class TestGuessBaselines:
                          / rets["IDX"].var(ddof=1))
             exp = task["expected"]
             if all(abs(full - exp[f"window_beta_{i}"]) <= 1e-4
-                   for i in (1, 2, 3)):
+                   for i in (1, 2, 3, 4)):
                 return None  # coincidentally the same; not a shortcut win
-            return {**got, "window_beta_1": round(full, 6),
-                    "window_beta_2": round(full, 6),
-                    "window_beta_3": round(full, 6)}
+            return {**got, **{f"window_beta_{i}": round(full, 6)
+                               for i in (1, 2, 3, 4)}}
+
+        self._assert_baseline_fails(tamper)
+
+    def test_overlapping_window_betas_pass_zero(self):
+        """F1: the last four OVERLAPPING rolling betas (windows ending
+        at N-3..N, sharing 9 of 10 returns) are not the four
+        non-overlapping window betas and must fail."""
+        def tamper(task, got, data):
+            if task["type"] != "frontier_rolling_risk":
+                return None
+            import re as _re
+            window = int(_re.search(r"windows of\s+(\d+) consecutive",
+                                    task["prompt"]).group(1))
+            rets = _f1_returns(data)
+            target = got["target_asset"]
+            rolling = (rets.rolling(window).cov(rets["IDX"])[target]
+                       / rets["IDX"].rolling(window).var(ddof=1)).dropna()
+            last4 = [round(float(v), 6) for v in rolling.iloc[-4:]]
+            exp = task["expected"]
+            if all(abs(exp[f"window_beta_{i}"] - last4[i - 1]) <= 1e-4
+                   for i in (1, 2, 3, 4)):
+                return None
+            return {**got, **{f"window_beta_{i}": last4[i - 1]
+                               for i in (1, 2, 3, 4)}}
+
+        self._assert_baseline_fails(tamper)
+
+    def test_ddof0_answer_passes_zero(self):
+        """F1 with ddof=0 throughout: the window betas are unchanged
+        (the (n-1)/n factor cancels in cov/var), so the discriminator
+        is final_window_volatility, whose ddof=0 value is off by
+        sqrt((w-1)/w) and must fail the core check."""
+        def tamper(task, got, data):
+            if task["type"] != "frontier_rolling_risk":
+                return None
+            import re as _re
+
+            import numpy as np
+            window = int(_re.search(r"windows of\s+(\d+) consecutive",
+                                    task["prompt"]).group(1))
+            rets = _f1_returns(data)
+            target = got["target_asset"]
+            blocks = [rets.iloc[-4 * window:-3 * window],
+                      rets.iloc[-3 * window:-2 * window],
+                      rets.iloc[-2 * window:-window], rets.iloc[-window:]]
+            assets = [c for c in rets.columns if c != "IDX"]
+            ew = rets[assets].mean(axis=1)
+            return {**got,
+                    **{f"window_beta_{i}": round(float(
+                        b[target].cov(b["IDX"], ddof=0)
+                        / b["IDX"].var(ddof=0)), 6)
+                       for i, b in enumerate(blocks, 1)},
+                    "final_window_volatility": round(float(
+                        ew.iloc[-window:].std(ddof=0) * np.sqrt(252)), 6)}
+
+        self._assert_baseline_fails(tamper)
+
+    def test_f1_log_return_betas_pass_zero(self):
+        """F1: window betas computed on log returns instead of simple
+        returns must fail (and the log-return volatility with them)."""
+        def tamper(task, got, data):
+            if task["type"] != "frontier_rolling_risk":
+                return None
+            import re as _re
+
+            import numpy as np
+
+            from tests.frontier_solver import _aligned, _frames, read_blocks
+            blocks = read_blocks(data)
+            prices = _aligned(_frames(
+                blocks[""] if "" in blocks else blocks["PRICES"]))
+            window = int(_re.search(r"windows of\s+(\d+) consecutive",
+                                    task["prompt"]).group(1))
+            target = got["target_asset"]
+            rets = np.log(prices / prices.shift(1)).dropna()
+            wblocks = [rets.iloc[-4 * window:-3 * window],
+                       rets.iloc[-3 * window:-2 * window],
+                       rets.iloc[-2 * window:-window], rets.iloc[-window:]]
+            assets = [c for c in rets.columns if c != "IDX"]
+            ew = rets[assets].mean(axis=1)
+            exp = task["expected"]
+            betas = [float(b[target].cov(b["IDX"]) / b["IDX"].var(ddof=1))
+                     for b in wblocks]
+            vol = float(ew.iloc[-window:].std(ddof=1) * np.sqrt(252))
+            if all(abs(exp[f"window_beta_{i}"] - betas[i - 1]) <= 1e-4
+                   for i in (1, 2, 3, 4)) and \
+                    abs(exp["final_window_volatility"] - vol) <= 1e-4:
+                return None
+            return {**got,
+                    **{f"window_beta_{i}": round(betas[i - 1], 6)
+                       for i in (1, 2, 3, 4)},
+                    "final_window_volatility": round(vol, 6)}
 
         self._assert_baseline_fails(tamper)
 

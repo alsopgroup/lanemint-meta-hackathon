@@ -333,6 +333,16 @@ def _placeholder_run(value: float) -> int:
     digits = text.split('.', 1)[1] if '.' in text else text
     if len(digits) < 5:
         return 0
+    # Magnitudes below 0.1 (0.012345, 0.0456789) reach a 6-digit run
+    # naturally when a correct small return rounds onto a sequential
+    # pattern -- measured on the frontier reference answers (F2 seed
+    # 8516: reconciled_total_return is exactly 0.012345). The typed
+    # placeholders this hunts (0.123456, 1.023456, 0.987654) all sit at
+    # magnitude >= 0.1 or carry a nonzero integer part, so runs below
+    # 0.1 are never counted.
+    if '.' in text and text.split('.', 1)[0] == '0' \
+            and digits.startswith('0'):
+        return 0
     best = run = 1
     direction = 0
     for prev, cur in zip(digits, digits[1:], strict=False):
@@ -355,26 +365,69 @@ def _placeholder_digits(value: float) -> bool:
     return _placeholder_run(value) >= 6
 
 
-def _is_no_attempt(parsed: dict) -> bool:
-    """Tag placeholder-style answers: sequential-digit numbers, or every
-    numeric answer identical (e.g. all zeros). Analysis only; the score
-    itself is unchanged.
+# Numeric fields that carry a family's headline computation; used only
+# by the no_attempt analysis flag (never by scoring).
+_CORE_NUMERIC_FIELDS = (
+    'window_beta_1', 'window_beta_2', 'window_beta_3', 'window_beta_4',
+    'last_window_beta', 'mean_beta', 'final_window_volatility',
+    'reconciled_total_return', 'reconciled_max_drawdown',
+    'beta_market', 'beta_sector', 'r_squared', 'final_return',
+    'max_drawdown', 'first_rebalance_value')
 
-    Calibrated against the frontier reference answers (seeds 1-400,
-    10,000 tasks, which produce zero flags): a single 5-digit fractional
-    run is not enough, because correct answers contain values such as
-    0.212345 and 1.187654."""
+
+def _field_tolerance(field: str, expected: dict) -> float:
+    """Scoring tolerance for a float field (mirrors TaskScorer.score_task;
+    the frontier max_drawdown case is keyed off first_rebalance_value
+    in the expected answer instead of the task id)."""
+    if field == 'final_price' or field.endswith('_price'):
+        return 0.01
+    if field == 'r_squared':
+        return 5e-5
+    if field in ('reconciled_max_drawdown', 'beta_market', 'beta_sector'):
+        return 1e-3
+    if field == 'max_drawdown' and 'first_rebalance_value' in expected:
+        return 1e-3
+    return 1e-4
+
+
+def _is_no_attempt(parsed: dict, expected: dict | None = None) -> bool:
+    """Tag placeholder-style answers: sequential-digit numbers, every
+    numeric answer identical, or core fields left at exactly zero.
+    Analysis only; the score itself is unchanged.
+
+    Calibrated against the frontier reference answers (seeds 1-10000,
+    10,000 correct answers per family, which produce zero flags): a
+    single 5-digit fractional run is not enough, because correct
+    answers contain values such as 0.212345 and 1.187654. The core-zero
+    rules target answers that never attempted the headline computation:
+    every core numeric field exactly 0, or at least two of them
+    exactly 0 alongside a placeholder-style value (a >= 5-digit
+    sequential run).
+
+    When the expected answer is known (the scorer path), a numeric
+    value that scores correct for its field is credited computation,
+    not placeholder evidence, and is excluded from every rule below:
+    a correct unrounded answer can itself carry a long sequential run
+    (1.2345678 against a 1.234567 key)."""
+    def credited(field, value):
+        return expected is not None \
+            and isinstance(expected.get(field), (int, float)) \
+            and not isinstance(expected.get(field), bool) \
+            and abs(value - expected[field]) \
+            < _field_tolerance(field, expected)
+
     values = []
 
-    def collect(node):
+    def collect(node, field=None):
         if isinstance(node, dict):
-            for v in node.values():
-                collect(v)
+            for k, v in node.items():
+                collect(v, k)
         elif isinstance(node, list):
             for v in node:
                 collect(v)
         elif isinstance(node, (int, float)) and not isinstance(node, bool):
-            values.append(node)
+            if field is None or not credited(field, node):
+                values.append(node)
 
     collect({k: v for k, v in parsed.items()
              if k not in ('problems', 'problems_found')})
@@ -383,7 +436,20 @@ def _is_no_attempt(parsed: dict) -> bool:
         return True
     if sum(1 for r in runs if r >= 5) >= 2:
         return True
-    return len(values) >= 3 and len(set(values)) == 1
+    if len(values) >= 3 and len(set(values)) == 1:
+        return True
+    core_fields = [f for f in _CORE_NUMERIC_FIELDS
+                   if isinstance(parsed.get(f), (int, float))
+                   and not isinstance(parsed.get(f), bool)
+                   and (expected is None or f in expected)]
+    if core_fields:
+        zeros = sum(1 for f in core_fields
+                    if parsed[f] == 0 and not credited(f, parsed[f]))
+        if zeros == len(core_fields):
+            return True
+        if zeros >= 2 and any(r >= 5 for r in runs):
+            return True
+    return False
 
 
 class TaskScorer:
@@ -407,9 +473,16 @@ class TaskScorer:
             end = response.find('```', start)
             response = response[start:end].strip()
         try:
-            return json.loads(response.strip())
+            result = json.loads(response.strip())
         except json.JSONDecodeError as e:
             return {'error': f'Failed to parse JSON: {e}'}
+        if not isinstance(result, dict):
+            # A top-level list/string/number/null is a parse failure for
+            # scoring purposes (one model's whole answer was a
+            # one-element list): score 0 for this task, never crash.
+            return {'error': 'Failed to parse JSON: top-level value is '
+                             f'{type(result).__name__}, not an object'}
+        return result
 
     def compare_float(self, actual: float, expected: float, tolerance: float = 1e-5) -> bool:
         return abs(actual - expected) < tolerance
@@ -547,14 +620,14 @@ class TaskScorer:
                       'r_squared'):
             if field in expected and scores.get(field, 0.0) < 1.0:
                 core_ok = False
-        # Frontier F1's cores are the three last-window betas and the
+        # Frontier F1's cores are the four window betas and the
         # final-window volatility (identified by window_beta_1; the
         # hard tier's unrelated beta tasks are unaffected).
         if 'window_beta_1' in expected:
             core_ok = core_ok and all(
                 scores.get(f, 0.0) >= 1.0 for f in (
                     'window_beta_1', 'window_beta_2', 'window_beta_3',
-                    'final_window_volatility'))
+                    'window_beta_4', 'final_window_volatility'))
         # Frontier F4's max_drawdown is core too (identified by the
         # accompanying first_rebalance_value; pilot passes had it wrong
         # while reaching 0.8 overall). The hard tier's standalone
@@ -566,8 +639,8 @@ class TaskScorer:
                   'passed': overall >= 0.8 and problems_ok and core_ok,
                   'score': round(overall, 3), 'component_scores': scores,
                   'feedback': '; '.join(feedback) if feedback else 'All checks passed',
-                  'analysis_flags': ['no_attempt'] if _is_no_attempt(parsed)
-                  else []}
+                  'analysis_flags': ['no_attempt']
+                  if _is_no_attempt(parsed, expected) else []}
         # Frontier F4 checkpoint score: partial progress along the pipeline
         # (aligned days, first rebalance value, final return, drawdown).
         # Reported only; the pass rule above is unchanged.

@@ -21,12 +21,13 @@ import pandas as pd
 
 FRONTIER_FAMILY_SETTINGS = {
     # F1: multi-asset rolling risk. Pilot calibration (Spark 1.3,
-    # seed 42, five pilots): larger/rolling-search variants scored
-    # 0/16, then a single last-window beta scored 4/4 (too easy), so
-    # the shipped default is ~120 rows, 2 assets, 10-day window and the
-    # target asset's betas over the LAST THREE non-overlapping 10-day
-    # windows, plus the final-window volatility. Difficulty lives in
-    # the data problems and exact semantics, not volume.
+    # seed 42, six pilots): larger/rolling-search variants scored
+    # 0/16, a single last-window beta scored 4/4 (too easy) and three
+    # window betas 5/8, so the shipped default is ~120 rows, 2 assets,
+    # 10-day window and the target asset's betas over the LAST FOUR
+    # non-overlapping 10-day windows, plus the final-window
+    # volatility. Difficulty lives in the data problems and exact
+    # semantics, not volume.
     "rolling_risk": {"rows": 120, "assets": 2, "window": 10},
     # F2: two-vendor reconciliation (plan knobs: conflicts, rows,
     # unit difference between files -> Vendor B quotes cents). Pilot 5:
@@ -331,15 +332,17 @@ class FrontierTaskGenerator:
 
         prices = aligned_prices(frames)
         rets = prices.pct_change().dropna()
-        # One named target asset, LAST THREE non-overlapping windows
-        # (pilot 5: a single last-window beta was too easy at 4/4).
-        # With N return observations r_1..r_N and window w, window 1 is
-        # r_{N-3w+1}..r_{N-2w}, window 2 is r_{N-2w+1}..r_{N-w} and
-        # window 3 is r_{N-w+1}..r_N (the most recent).
+        # One named target asset, LAST FOUR non-overlapping windows
+        # (pilot 6: three windows still let Spark reach 5/8-8/8; four
+        # raises the computation just past the easy band). With N
+        # return observations r_1..r_N and window w, window 1 is
+        # r_{N-4w+1}..r_{N-3w}, window 2 is r_{N-3w+1}..r_{N-2w},
+        # window 3 is r_{N-2w+1}..r_{N-w} and window 4 is
+        # r_{N-w+1}..r_N (the most recent).
         target = random.choice(assets)
         w = window
-        blocks = [rets.iloc[-3 * w:-2 * w], rets.iloc[-2 * w:-w],
-                  rets.iloc[-w:]]
+        blocks = [rets.iloc[-4 * w:-3 * w], rets.iloc[-3 * w:-2 * w],
+                  rets.iloc[-2 * w:-w], rets.iloc[-w:]]
         betas = [float(b[target].cov(b["IDX"]) / b["IDX"].var(ddof=1))
                  for b in blocks]
         ew = rets[assets].mean(axis=1)
@@ -347,6 +350,7 @@ class FrontierTaskGenerator:
             "window_beta_1": round(betas[0], 6),
             "window_beta_2": round(betas[1], 6),
             "window_beta_3": round(betas[2], 6),
+            "window_beta_4": round(betas[3], 6),
             "target_asset": target,
             "final_window_volatility": round(
                 float(ew.iloc[-window:].std(ddof=1) * 252 ** 0.5), 6),
@@ -358,25 +362,27 @@ class FrontierTaskGenerator:
         analytic = f"""Clean every ticker with the general rules and align on the
 inner join. Compute simple daily returns. The target asset is {target}.
 Let the aligned simple returns be r_1, ..., r_N in date order. Consider
-only the last three non-overlapping windows of {window} consecutive
-return observations each: window 1 is r_{{N-{3 * window - 1}}} ..
-r_{{N-{2 * window}}} (the oldest of the three), window 2 is
-r_{{N-{2 * window - 1}}} .. r_{{N-{window}}}, and window 3 is
+only the last four non-overlapping windows of {window} consecutive
+return observations each: window 1 is r_{{N-{4 * window - 1}}} ..
+r_{{N-{3 * window}}} (the oldest of the four), window 2 is
+r_{{N-{3 * window - 1}}} .. r_{{N-{2 * window}}}, window 3 is
+r_{{N-{2 * window - 1}}} .. r_{{N-{window}}}, and window 4 is
 r_{{N-{window - 1}}} .. r_N (the most recent {window} returns).
-window_beta_1, window_beta_2 and window_beta_3 are the betas of the
-target asset against IDX within window 1, 2 and 3 respectively, where a
-window beta is cov(target, IDX, ddof=1) / var(IDX, ddof=1) computed on
-the simple returns of the target and of IDX inside that window only
-(not a full-sample regression and not an average over windows). The
-equal-weight portfolio return on a day is the mean of the assets'
-returns that day (IDX excluded); final_window_volatility is the
-annualised volatility of the last {window} equal-weight portfolio
-returns."""
+window_beta_1, window_beta_2, window_beta_3 and window_beta_4 are the
+betas of the target asset against IDX within windows 1, 2, 3 and 4
+respectively, where a window beta is cov(target, IDX, ddof=1) /
+var(IDX, ddof=1) computed on the simple returns of the target and of
+IDX inside that window only (not a full-sample regression and not an
+average over windows). The equal-weight portfolio return on a day is
+the mean of the assets' returns that day (IDX excluded);
+final_window_volatility is the annualised volatility of the last
+{window} equal-weight portfolio returns."""
         task = {"id": f"task_f_{self.task_id:03d}", "type": "frontier_rolling_risk",
                 "prompt": _prompt(layout, analytic,
-                                  "- window_beta_1: target asset beta vs IDX in window 1, the oldest of the last three windows (6 decimals)\n"
+                                  "- window_beta_1: target asset beta vs IDX in window 1, the oldest of the last four windows (6 decimals)\n"
                                   "- window_beta_2: target asset beta vs IDX in window 2 (6 decimals)\n"
-                                  "- window_beta_3: target asset beta in window 3, the most recent window (6 decimals)\n"
+                                  "- window_beta_3: target asset beta vs IDX in window 3 (6 decimals)\n"
+                                  "- window_beta_4: target asset beta in window 4, the most recent window (6 decimals)\n"
                                   "- target_asset: ticker string of the target asset\n"
                                   "- final_window_volatility: (6 decimals)\n"
                                   "- num_assets: number of asset tickers (IDX excluded)\n"

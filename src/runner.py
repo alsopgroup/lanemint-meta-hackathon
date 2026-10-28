@@ -254,7 +254,13 @@ class TaskRunner:
         tasks = self.load_tasks(tasks_dir)
         if families:
             wanted = set(families)
+            present = sorted({t.get('type') for t in tasks})
             tasks = [t for t in tasks if t.get('type') in wanted]
+            if not tasks:
+                raise ValueError(
+                    f"--family matched 0 tasks: none of {sorted(wanted)} "
+                    f"is a task type in {tasks_dir} (types present: "
+                    f"{present}); check the --family spelling")
         if per_family is not None:
             # Deterministic balanced pilot selection: the first
             # per_family tasks of each type, in file order. With a
@@ -480,14 +486,20 @@ def main():
         reasoning_effort=args.reasoning_effort
     )
 
-    results = runner.run_all_tasks(
-        tasks_dir=args.tasks_dir,
-        output_dir=args.output_dir,
-        limit=args.limit,
-        resume=args.resume,
-        per_family=args.per_family,
-        families=args.families
-    )
+    try:
+        results = runner.run_all_tasks(
+            tasks_dir=args.tasks_dir,
+            output_dir=args.output_dir,
+            limit=args.limit,
+            resume=args.resume,
+            per_family=args.per_family,
+            families=args.families
+        )
+    except ValueError as exc:
+        # Selection problems (e.g. --family matched 0 tasks) and
+        # --resume refusals: warn and exit non-zero, no traceback.
+        print(f"Error: {exc}")
+        return 1
 
     print(f"\n✓ Completed {len(results)} tasks")
     print("\nNext step: Score the results")
