@@ -5,7 +5,7 @@
 
 > A synthetic benchmark for evaluating language models on financial data quality tasks
 
-![LaneMint x Meta: synthetic market-data benchmark built with Meta's Muse models](docs/assets/banner.png)
+![LaneMint x Meta: synthetic market-data benchmark built with Meta's Muse models](assets/banner.png)
 
 Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [LaneMint](https://lanemint.com).
 
@@ -488,7 +488,7 @@ The initial scaffold (repo structure, data generator, runner, and the easy tier)
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
 
 ---
 
