@@ -28,6 +28,7 @@ try:  # Local development convenience; Railway uses real env vars.
 except ImportError:  # pragma: no cover
     pass
 
+from leaderboard import load_leaderboard
 from muse_client import (
     MuseBadRequest,
     MuseNotConfigured,
@@ -182,6 +183,21 @@ async def api_check(request: Request) -> JSONResponse:
         guard.release()
     guard.settle(reserve_usd, float(result.pop("estimated_cost_usd", 0.0) or 0.0))
     return JSONResponse(result)
+
+
+@app.get("/api/leaderboard")
+def leaderboard() -> JSONResponse:
+    """Held-out frontier leaderboard (data/leaderboard.json).
+
+    Totals and Wilson intervals are recomputed server-side from the
+    per-family counts in the data file, so the JSON file is the only
+    place numbers are edited.
+    """
+    try:
+        return JSONResponse(load_leaderboard())
+    except ValueError:
+        return JSONResponse(
+            {"error": "Leaderboard data is unavailable"}, status_code=500)
 
 
 @app.get("/")

@@ -52,6 +52,15 @@ def test_index_serves_page():
     assert "Run a check" in resp.text
 
 
+def test_config_simulated_without_key(monkeypatch):
+    monkeypatch.delenv("META_API_KEY", raising=False)
+    monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    resp = client.get("/api/config")
+    assert resp.status_code == 200
+    assert resp.json() == {"live": False, "mode": "simulated",
+                           "model": "muse-spark-1.3"}
+
+
 def test_check_without_key_falls_back(monkeypatch):
     monkeypatch.delenv("META_API_KEY", raising=False)
     monkeypatch.delenv("MODEL_API_KEY", raising=False)

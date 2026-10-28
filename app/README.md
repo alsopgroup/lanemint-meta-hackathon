@@ -24,6 +24,21 @@ Railway service** — it does not import anything from the repo root.
   If the live call fails, that run completes as clearly-labelled
   simulated demo results instead of hanging or faking a live run.
 
+## Leaderboard
+
+The page's Leaderboard section shows held-out **frontier** results
+(pooled over seeds 42/1001/1002, 96 tasks; Glimmer base is seed-42-only
+and marked as such; the fine-tuned Glimmer LoRA slot shows
+"Coming soon"). All numbers live in the single data file
+`data/leaderboard.json` — the frontend hard-codes nothing. To publish
+new results, edit that file only: per-family pass counts are summed
+server-side by `leaderboard.py`, which also recomputes the pass rate
+and Wilson 95% interval and validates the file's shape on load
+(`GET /api/leaderboard` returns 500 rather than serving bad data).
+No run-cost or spend figures are shown anywhere in the public app;
+the daily budget below is an internal server guard only and is never
+returned to the browser.
+
 ## Live endpoint abuse limits
 
 `POST /api/check` spends real Meta credits, so it is guarded
@@ -108,7 +123,8 @@ Alternatively, from this directory with the Railway CLI:
 
 ## Layout
 
-- `main.py` — FastAPI app: static page, `/healthz`, `/api/config`, `/api/check`
+- `main.py` — FastAPI app: static page, `/healthz`, `/api/config`, `/api/check`, `/api/leaderboard`
+- `leaderboard.py` + `data/leaderboard.json` — held-out frontier results (single data file, validated on load)
 - `muse_client.py` — server-side Muse client + findings validation
 - `rate_limit.py` — in-memory per-IP rate limit, daily call/spend budget, concurrency cap
 - `static/` — page, LaneMint design tokens (`css/`), ported demo logic (`js/app.js`)

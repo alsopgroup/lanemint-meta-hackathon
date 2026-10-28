@@ -448,22 +448,49 @@ function renderScore() {
   $('stepScore').innerHTML = html;
 }
 
-function renderBenchmark() {
-  const BM = [
-    { name: 'muse-spark-1.3', sub: 'Meta API', col: 'var(--chart-3)', easy: [25, 1.0], hard: [20, 0.880] },
-    { name: 'muse-spark-open', sub: 'Fireworks serverless', col: 'var(--chart-1)', easy: [24, 1.0], hard: [15, 0.941] },
-    { name: 'muse-glimmer-30b', sub: 'Fireworks on-demand, 1× H200', col: 'var(--chart-4)', easy: [6, 0.960], hard: [6, 0.886] }];
-  const BT = [['Easy tier · 25 tasks', [['volatility', 13, [[13, 1], [13, 1], [0, .923]]], ['return_calculation', 8, [[8, 1], [7, 1], [2, 1]]], ['backtest', 4, [[4, 1], [4, 1], [4, 1]]]]],
-    ['Hard tier · 25 tasks', [['multi_asset_portfolio', 5, [[5, 1], [2, 1], [0, .931]]], ['max_drawdown', 5, [[5, 1], [4, .971], [3, .8]]], ['rolling_beta', 5, [[0, .4], [0, .8], [0, .9]]], ['dst_intraday', 5, [[5, 1], [5, 1], [3, .867]]], ['single_asset_volatility', 5, [[5, 1], [4, .933], [0, .933]]]]]];
-  const pct = (a, b) => Math.round(a / b * 100), f3 = x => x.toFixed(3);
-  $('benchLegend').innerHTML = BM.map(m => `<span class="bench-legend-item"><span class="bench-swatch" style="background:${m.col}"></span>${esc(m.name)}</span>`).join('');
-  $('benchOverall').innerHTML = BM.map(m => `<div class="panel bench-model-card">
-    <div class="bench-model-head"><div class="bench-model-name-row"><span class="bench-swatch" style="background:${m.col}"></span><span class="bench-model-name">${esc(m.name)}</span></div><span class="bench-model-sub">${esc(m.sub)}</span></div>
-    ${[['Easy', m.easy, 17], ['Hard', m.hard, 2]].map(([label, [p, f], bl]) => `<div class="bench-tier"><div class="bench-tier-top"><span class="bench-tier-label">${label}</span><span class="bench-tier-frac">${p}/25 · F1 ${f3(f)}</span></div><span class="bench-pct">${pct(p, 25)}<small>%</small></span><div class="bench-bar-track"><div class="bench-bar-fill" style="width:${pct(p, 25)}%;background:${m.col}"></div><div class="bench-baseline-mark" title="Fixed-guess baseline" style="left:${pct(bl, 25)}%"></div></div></div>`).join('')}
-  </div>`).join('');
-  $('benchTiers').innerHTML = BT.map(([label, types]) => `<div class="bench-tier-block"><div class="bench-tier-block-label">${esc(label)}</div>
-    ${types.map(([l, n, v]) => `<div class="bench-type-row"><div class="bench-type-info"><span class="bench-type-name">${esc(l)}</span><span class="bench-type-n">${n} tasks</span></div><div class="bench-type-bars">${v.map(([p, f], i) => `<div class="bench-type-bar-row"><div class="bench-type-bar-track"><div class="bench-type-bar-fill" style="width:${Math.max(pct(p, n), 1)}%;background:${BM[i].col}"></div></div><span class="bench-type-bar-frac">${p}/${n}<span> · F1 ${f3(f)}</span></span></div>`).join('')}</div></div>`).join('')}
-  </div>`).join('');
+/* ---------------- Leaderboard (held-out frontier results) ----------------
+   All numbers come from GET /api/leaderboard, which serves the single
+   data file app/data/leaderboard.json (totals and Wilson intervals are
+   recomputed server-side). Nothing is hard-coded here. */
+function renderLeaderboard(data) {
+  const fams = (data.benchmark && data.benchmark.families) || [];
+  const famPct = f => Math.round(100 * f.passed / f.total);
+  const pctTxt = t => (Number.isInteger(t.pct) ? t.pct : t.pct.toFixed(1)) + '%';
+  const rows = data.entries.map(e => {
+    const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
+    if (e.status === 'coming_soon') {
+      return `<div class="lb-row lb-pending">${nameCell}` +
+        fams.map(() => '<div class="lb-cell lb-dim">—</div>').join('') +
+        `<div class="lb-cell lb-dim">—</div><div class="lb-cell"><span class="lb-chip lb-chip-soon">Coming soon</span></div></div>`;
+    }
+    const famCells = fams.map(f => {
+      const v = e.families && e.families[f.id];
+      if (!v) return '<div class="lb-cell lb-dim">—</div>';
+      return `<div class="lb-cell"><span class="lb-frac">${v.passed}/${v.total}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(v), v.passed ? 2 : 0)}%"></div></div></div>`;
+    }).join('');
+    const t = e.total;
+    return `<div class="lb-row">${nameCell}${famCells}` +
+      `<div class="lb-cell"><span class="lb-frac lb-total">${t.passed}/${t.total}</span></div>` +
+      `<div class="lb-cell lb-rate"><span class="lb-pct">${pctTxt(t)}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(Math.round(t.pct), t.passed ? 2 : 0)}%"></div></div><span class="lb-ci">95% CI ${t.ci95[0]}–${t.ci95[1]}%</span></div></div>`;
+  }).join('');
+  $('leaderboardBody').innerHTML =
+    `<div class="lb-row lb-head"><div class="lb-model">Model</div>` +
+    fams.map(f => `<div class="lb-cell"><span class="lb-fam">${esc(f.id)} · ${esc(f.label)}</span><span class="lb-fam-type">${esc(f.type)}</span></div>`).join('') +
+    `<div class="lb-cell">Total</div><div class="lb-cell">Pass rate</div></div>` + rows;
+  const seeds = (data.benchmark && data.benchmark.seeds) || [];
+  if (seeds.length) $('lbEyebrow').textContent = 'Leaderboard · frontier tier · held-out seeds ' + seeds.join(' / ');
+  if (data.updated) $('lbUpdated').textContent = 'held-out run · ' + data.updated;
+  const notes = [];
+  if (data.benchmark && data.benchmark.note) notes.push(data.benchmark.note);
+  data.entries.forEach(e => (e.notes || []).forEach(n => notes.push(e.name + ': ' + n)));
+  $('leaderboardNotes').innerHTML = notes.map(n => `<p>${esc(n)}</p>`).join('');
+}
+
+function loadLeaderboard() {
+  fetch('/api/leaderboard').then(r => r.ok ? r.json() : null).then(data => {
+    if (data && data.entries) renderLeaderboard(data);
+    else $('leaderboardBody').innerHTML = '<p class="lb-loading">Leaderboard unavailable right now.</p>';
+  }).catch(() => { $('leaderboardBody').innerHTML = '<p class="lb-loading">Leaderboard unavailable right now.</p>'; });
 }
 
 function render() {
@@ -536,7 +563,7 @@ document.addEventListener('dragleave', (e) => { const z = e.target.closest && e.
 document.addEventListener('drop', (e) => { const z = e.target.closest && e.target.closest('#dropZone'); if (z) { e.preventDefault(); z.classList.remove('dragging'); loadFile(e.dataTransfer.files && e.dataTransfer.files[0]); } });
 
 /* ---------------- boot ---------------- */
-renderBenchmark();
 render();
 initWaves();
 fetch('/api/config').then(r => r.ok ? r.json() : null).then(cfg => { if (cfg) { appConfig = cfg; render(); } }).catch(() => {});
+loadLeaderboard();
