@@ -482,6 +482,7 @@ function renderLeaderboard(data) {
   if (data.updated) $('lbUpdated').textContent = 'held-out run · ' + data.updated;
   const notes = [];
   if (data.benchmark && data.benchmark.note) notes.push(data.benchmark.note);
+  if (data.benchmark && data.benchmark.notes) data.benchmark.notes.forEach(n => notes.push(n));
   data.entries.forEach(e => (e.notes || []).forEach(n => notes.push(e.name + ': ' + n)));
   $('leaderboardNotes').innerHTML = notes.map(n => `<p>${esc(n)}</p>`).join('');
 }

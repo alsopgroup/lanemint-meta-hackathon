@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -80,17 +81,33 @@ def _origin_allowed(request: Request) -> bool:
     return bool(origin_host) and origin_host == (request.headers.get("host") or "")
 
 
+def _valid_ip(value: str) -> str:
+    try:
+        return str(ip_address(value))
+    except ValueError:
+        return ""
+
+
 def _client_ip(request: Request) -> str:
-    # X-Real-IP is set by Railway's edge proxy and is the trustworthy
-    # client address there; X-Forwarded-For's first hop is the fallback.
-    # Neither header is trustworthy if the service is reached directly,
-    # which is why the global daily caps exist alongside per-IP limits.
-    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    # Trust model on Railway: the edge proxy sets X-Real-IP to the
+    # visitor address it observed, overwriting any client-supplied
+    # value on the way through, so that header — not a forwarded-for
+    # hop — identifies the visitor. The last X-Forwarded-For hop can
+    # be Railway's own edge/internal address, which would bucket every
+    # visitor together, so it is never used. Without X-Real-IP, fall
+    # back to the first forwarded hop (the claimed original client),
+    # then the TCP peer. Header values that are not valid IPs are
+    # ignored. If the service were reached directly with no proxy,
+    # forwarded headers would be forgeable — the global daily caps in
+    # rate_limit.py are the backstop for that case.
+    real_ip = _valid_ip((request.headers.get("x-real-ip") or "").strip())
     if real_ip:
         return real_ip
     forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip() or "unknown"
+    hops = [_valid_ip(hop.strip()) for hop in forwarded.split(",")]
+    hops = [hop for hop in hops if hop]
+    if hops:
+        return hops[0]
     return request.client.host if request.client else "unknown"
 
 

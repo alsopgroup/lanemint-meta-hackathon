@@ -11,7 +11,10 @@
       {"id": "F3", "type": "frontier_factor_exposure", "label": "Factor exposure"},
       {"id": "F4", "type": "frontier_portfolio_pipeline", "label": "Portfolio pipeline"}
     ],
-    "note": "Pooled over the held-out seeds 42, 1001 and 1002 (32 tasks per seed, 24 per family). A task passes only when the problem set is exactly right and the core numeric fields are within tolerance. Pass rates are shown with 95% Wilson score intervals."
+    "note": "Pooled over the held-out seeds 42, 1001 and 1002 (32 tasks per seed, 24 per family). A task passes only when the problem set is exactly right and the core numeric fields are within tolerance. Pass rates are shown with 95% Wilson score intervals.",
+    "notes": [
+      "Spark Open's and Glimmer 30B (base)'s seed-42 F1 results used the earlier 3-window version of F1; all other runs use the 4-window version."
+    ]
   },
   "entries": [
     {
@@ -47,11 +50,13 @@
       "name": "Muse Glimmer 30B (base)",
       "provider": "Fireworks",
       "status": "complete",
-      "scope": "seed 42 only",
-      "total": {"passed": 0, "total": 32},
-      "notes": [
-        "Seed 42 only (32 tasks); not pooled over the held-out seeds."
-      ]
+      "families": {
+        "F1": {"passed": 0, "total": 24},
+        "F2": {"passed": 0, "total": 24},
+        "F3": {"passed": 0, "total": 24},
+        "F4": {"passed": 0, "total": 24}
+      },
+      "notes": []
     },
     {
       "id": "muse-glimmer-30b-lora",
@@ -59,7 +64,7 @@
       "provider": "Fireworks",
       "status": "coming_soon",
       "notes": [
-        "LoRA fine-tune trained on seed-disjoint frontier data (seeds 2001–2036); held-out evaluation pending."
+        "LoRA fine-tune on seed-disjoint frontier data (train seeds 2001–2036) — results pending."
       ]
     }
   ]

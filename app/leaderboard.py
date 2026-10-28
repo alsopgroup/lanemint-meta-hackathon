@@ -45,8 +45,10 @@ def _check_count(value: object, where: str) -> tuple[int, int]:
 
 def _summarise(passed: int, total: int) -> dict:
     low, high = wilson_interval(passed, total)
+    # Headline percentages are whole-percent for every model, so the
+    # displayed rates are directly comparable (e.g. 2/96 shows as 2%).
     return {"passed": passed, "total": total,
-            "pct": round(100 * passed / total, 1) if total else 0.0,
+            "pct": round(100 * passed / total) if total else 0,
             "ci95": [low, high]}
 
 

@@ -36,21 +36,26 @@ def test_published_results_and_recomputed_totals():
         "F1": (13, 24), "F2": (17, 24), "F3": (14, 24), "F4": (4, 24)}
     assert spark["total"]["passed"] == 48
     assert spark["total"]["total"] == 96
-    assert spark["total"]["pct"] == 50.0
+    assert spark["total"]["pct"] == 50
     assert spark["total"]["ci95"] == [40, 60]
 
     opened = entries["muse-spark-open"]
     assert opened["total"]["passed"] == 2
     assert opened["total"]["total"] == 96
-    assert opened["total"]["pct"] == 2.1
+    # Headline percentages use whole-percent rounding for every model.
+    assert opened["total"]["pct"] == 2
     assert opened["total"]["ci95"] == [1, 7]
     assert any("API errors" in n for n in opened["notes"])
 
     glimmer = entries["muse-glimmer-30b-base"]
-    assert glimmer["scope"] == "seed 42 only"
-    assert glimmer["families"] is None
+    assert "scope" not in glimmer  # pooled over all held-out seeds now
+    assert {f: (v["passed"], v["total"])
+            for f, v in glimmer["families"].items()} == {
+        "F1": (0, 24), "F2": (0, 24), "F3": (0, 24), "F4": (0, 24)}
     assert glimmer["total"]["passed"] == 0
-    assert glimmer["total"]["total"] == 32
+    assert glimmer["total"]["total"] == 96
+    assert glimmer["total"]["pct"] == 0
+    assert glimmer["total"]["ci95"] == [0, 4]
 
     lora = entries["muse-glimmer-30b-lora"]
     assert lora["status"] == "coming_soon"
@@ -63,6 +68,11 @@ def test_benchmark_metadata():
     bench = data["benchmark"]
     assert bench["seeds"] == [42, 1001, 1002]
     assert bench["tasks"] == 96
+    # Footnote: seed-42 F1 for Spark Open / Glimmer base predates the
+    # current 4-window F1; everything else uses the 4-window version.
+    notes = " ".join(bench.get("notes", []))
+    assert "3-window" in notes and "4-window" in notes
+    assert "Spark Open" in notes and "Glimmer 30B" in notes
     assert [f["id"] for f in bench["families"]] == ["F1", "F2", "F3", "F4"]
     assert [f["type"] for f in bench["families"]] == [
         "frontier_rolling_risk", "frontier_vendor_reconciliation",
@@ -128,7 +138,7 @@ def test_leaderboard_endpoint():
         "muse-spark-1.3", "muse-spark-open", "muse-glimmer-30b-base",
         "muse-glimmer-30b-lora"]
     assert body["entries"][0]["total"] == {
-        "passed": 48, "total": 96, "pct": 50.0, "ci95": [40, 60]}
+        "passed": 48, "total": 96, "pct": 50, "ci95": [40, 60]}
     assert body["entries"][3]["status"] == "coming_soon"
     assert "api_key" not in resp.text.lower()
 
