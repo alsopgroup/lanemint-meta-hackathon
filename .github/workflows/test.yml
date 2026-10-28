@@ -25,7 +25,7 @@ jobs:
     
     - name: Run ruff linting
       run: |
-        ruff check src/ tests/
+        ruff check src/ tests/ app/
         echo "✓ Linting passed"
   
   test:
@@ -47,7 +47,15 @@ jobs:
     - name: Run tests
       run: |
         pytest tests/ -v --tb=short
-    
+
+    - name: Install app dependencies
+      run: |
+        pip install -r app/requirements.txt pytest httpx
+
+    - name: Run app tests
+      run: |
+        pytest app/tests -v --tb=short
+
     - name: Test task generation (dry run)
       run: |
         python -m src.generate_tasks --seed 3001 --output-dir tasks3001

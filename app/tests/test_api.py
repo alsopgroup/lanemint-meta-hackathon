@@ -277,26 +277,48 @@ def test_zero_budget_is_a_hard_block(monkeypatch):
     assert "budget" in resp.json()["error"]
 
 
-def test_client_ip_prefers_x_real_ip(monkeypatch):
+def test_client_ip_uses_last_forwarded_hop(monkeypatch):
+    # Only the last X-Forwarded-For hop — appended by Railway's edge
+    # proxy — keys the per-IP bucket. Forged earlier hops (or a forged
+    # X-Real-IP) must not mint a fresh bucket.
     monkeypatch.setenv("META_API_KEY", "test-key")
     monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "1")
     monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
     _stub_openai(monkeypatch, _live_ok_create)
     first = client.post(
         "/api/check", json={"filename": "x.csv", "csv": CSV},
-        headers={"X-Real-IP": "203.0.113.7", "X-Forwarded-For": "198.51.100.1"},
+        headers={"X-Real-IP": "203.0.113.7",
+                 "X-Forwarded-For": "198.51.100.1, 192.0.2.10"},
     )
     second = client.post(
         "/api/check", json={"filename": "x.csv", "csv": CSV},
-        headers={"X-Real-IP": "203.0.113.7", "X-Forwarded-For": "198.51.100.2"},
+        headers={"X-Real-IP": "203.0.113.99",
+                 "X-Forwarded-For": "198.51.100.2, 192.0.2.10"},
     )
     third = client.post(
         "/api/check", json={"filename": "x.csv", "csv": CSV},
-        headers={"X-Real-IP": "203.0.113.8", "X-Forwarded-For": "198.51.100.1"},
+        headers={"X-Forwarded-For": "198.51.100.1, 192.0.2.11"},
     )
     assert first.status_code == 200
-    assert second.status_code == 429  # same X-Real-IP bucket despite new XFF
-    assert third.status_code == 200  # different X-Real-IP, fresh bucket
+    assert second.status_code == 429  # same last hop despite forged headers
+    assert third.status_code == 200  # different last hop, fresh bucket
+
+
+def test_client_ip_falls_back_to_x_real_ip(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "1")
+    monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
+    _stub_openai(monkeypatch, _live_ok_create)
+    first = client.post(
+        "/api/check", json={"filename": "x.csv", "csv": CSV},
+        headers={"X-Real-IP": "203.0.113.7"},
+    )
+    second = client.post(
+        "/api/check", json={"filename": "x.csv", "csv": CSV},
+        headers={"X-Real-IP": "203.0.113.7"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 429  # same X-Real-IP bucket, no XFF sent
 
 
 def test_check_chunked_oversized_body_413():

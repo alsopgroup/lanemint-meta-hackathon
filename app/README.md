@@ -50,7 +50,9 @@ which fits a single Railway replica but is not a distributed limiter):
 - Hard caps: 80 KB request body, 64,000-char CSV, 500 rows, 20 columns;
   `max_tokens` defaults to 4,096 and `META_MAX_TOKENS` is capped at
   8,192; upstream timeout 30s; at most 2 concurrent live calls.
-- Per-IP limits (`X-Real-IP`, else first `X-Forwarded-For` hop):
+- Per-IP limits keyed on the **last** `X-Forwarded-For` hop (the one
+  Railway's edge proxy appends; earlier hops are client-supplied and
+  ignored), falling back to `X-Real-IP`, then the TCP peer:
   5/min, 30/hour. Global daily caps: 300 live calls and an estimated
   $5/day spend. Before each call the worst-case cost (full prompt +
   max output tokens at $1.25/$4.25 per 1M) is **reserved** against
