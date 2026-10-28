@@ -84,6 +84,43 @@ class TestSeedSplit:
         out = capsys.readouterr().out
         assert 'WARNING' in out and '--allow-eval-seeds' in out
 
+    def test_no_args_refused_even_with_default_tasks_dir(self, tmp_path,
+                                                         monkeypatch):
+        # The implicit tasks/ default was generated at locked seed 42
+        # by generate_tasks; finetune_prep with no arguments must
+        # refuse rather than train on it sight-unseen.
+        import sys
+
+        from src.finetune_prep import main
+        from src.generate_tasks import TaskGenerator
+        TaskGenerator(seed=42).generate_all_tasks(tmp_path / 'tasks',
+                                                  num_tasks=8)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, 'argv', ['prep'])
+        assert main() == 1
+        assert not (tmp_path / 'finetune_data').exists()
+
+    def test_split_and_prepare_requires_declared_seed(self, tmp_path):
+        from src.generate_tasks import TaskGenerator
+        tasks_dir = tmp_path / 'tasks3001'
+        TaskGenerator(seed=3001).generate_all_tasks(tasks_dir,
+                                                    num_tasks=8)
+        with pytest.raises(ValueError, match='generation seed'):
+            FineTunePrep().split_and_prepare(tasks_dir, tmp_path / 'no')
+        assert not (tmp_path / 'no').exists()
+        result = FineTunePrep().split_and_prepare(
+            tasks_dir, tmp_path / 'yes', seed=3001)
+        assert result['num_train'] == 8
+
+    def test_allow_eval_seeds_silent_when_lock_intact(self, tmp_path,
+                                                      capsys):
+        # The override warning only fires when a locked seed is
+        # actually dropped from the exclusion list.
+        FineTunePrep().prepare(tmp_path / 'out', tier='frontier',
+                               seeds=[2001], count=4,
+                               allow_eval_seeds=True)
+        assert 'WARNING' not in capsys.readouterr().out
+
     def test_parse_seed_list(self):
         assert parse_seed_list('2001-2003,2007') == [2001, 2002, 2003,
                                                      2007]
@@ -231,8 +268,10 @@ class TestTracePrecision:
         steps, answer = build_trace_parts(
             task, payload, task['expected'], max_tokens=None)
         pairs = re.findall(
-            r"cov=([-\d.e+]+), var=([-\d.e+]+), beta=([-\d.e+]+)", steps)
+            r"cov=([-\d.]+), var=([-\d.]+), beta=([-\d.]+)", steps)
         assert len(pairs) == 4
+        # Fixed-point intermediates: no scientific notation anywhere.
+        assert not re.search(r"\d[eE][+-]\d", steps)
         for i, (cov, var, beta) in enumerate(pairs, 1):
             expected = task['expected'][f'window_beta_{i}']
             assert float(cov) / float(var) == pytest.approx(
@@ -319,6 +358,27 @@ class TestFireworksValidation:
         assert 'firectl dataset create glimmer-sft-trace' in out
         assert '--evaluation-dataset glimmer-sft-trace-eval' in out
         assert '--output-model muse-glimmer-30b-lora-trace' in out
+
+    def test_target_manifest_mismatch_refused(self, tmp_path,
+                                              monkeypatch):
+        import sys
+
+        from src.finetune import main
+        train = tmp_path / 'train.jsonl'
+        val = tmp_path / 'validation.jsonl'
+        for path in (train, val):
+            path.write_text("".join(json.dumps(r) + "\n"
+                                    for r in self._rows()))
+        (tmp_path / 'manifest.json').write_text(
+            json.dumps({'target': 'trace'}))
+        monkeypatch.setattr(sys, 'argv', [
+            'finetune', '--train-file', str(train),
+            '--validation-file', str(val), '--target', 'answer'])
+        assert main() == 1
+        monkeypatch.setattr(sys, 'argv', [
+            'finetune', '--train-file', str(train),
+            '--validation-file', str(val), '--target', 'trace'])
+        assert main() == 0
 
     def test_main_rejects_overlong_rows(self, tmp_path, monkeypatch):
         import sys

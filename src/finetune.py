@@ -217,6 +217,21 @@ def main():
         print("Run: python -m src.finetune_prep first")
         return 1
 
+    manifest_path = args.train_file.parent / 'manifest.json'
+    if manifest_path.exists():
+        try:
+            manifest_target = json.loads(
+                manifest_path.read_text()).get('target')
+        except (json.JSONDecodeError, OSError):
+            manifest_target = None
+        if manifest_target and manifest_target != args.target:
+            print(f"Error: --target {args.target} does not match "
+                  f"the dataset manifest target {manifest_target!r} "
+                  f"in {manifest_path}; pass --target "
+                  f"{manifest_target} so the printed Fireworks names "
+                  f"match the data that was actually built")
+            return 1
+
     validator = FineTuneValidator(
         max_context_length=args.max_context_length)
     result = validator.check_fine_tuning_data(

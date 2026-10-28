@@ -236,7 +236,7 @@ class FineTunePrep:
                 f"{sorted(excluded)} would unlock locked eval seed(s) "
                 f"{missing_locked}; pass --allow-eval-seeds to "
                 f"override the lock explicitly")
-        if allow_eval_seeds:
+        if allow_eval_seeds and missing_locked:
             print("WARNING: --allow-eval-seeds in effect; the locked "
                   "eval-seed protection (42, 1001, 1002) is "
                   "overridden for this run")
@@ -259,21 +259,20 @@ class FineTunePrep:
                 f"locked eval seeds (excluded: {sorted(excluded)}); "
                 f"training or validating on them would contaminate "
                 f"the held-out evaluation")
+        undeclared = [r for r in records if r['seed'] is None]
+        if undeclared:
+            raise ValueError(
+                f"refusing to build dataset: {len(undeclared)} task(s) "
+                f"have no declared generation seed; declare each "
+                f"tasks directory as PATH@SEED (or generate with "
+                f"--seeds) so the locked eval-seed refusal can see "
+                f"them")
         train_records = [r for r in records if r['seed'] not in val_seeds]
         val_records = [r for r in records if r['seed'] in val_seeds]
-        seeded = [r for r in records if r['seed'] is not None]
-        if not val_records and seeded and val_seeds:
+        if not val_records and val_seeds:
             raise ValueError(
                 f"validation seeds {sorted(val_seeds)} produced no "
                 f"tasks; check --val-seeds against --seeds/--tasks-dir")
-        if not seeded:
-            # Legacy undeclared-seed directories: deterministic local
-            # split by task (the only option without seed labels).
-            idx = list(range(len(records)))
-            self.rng.shuffle(idx)
-            cut = int(len(idx) * train_ratio)
-            train_records = [records[i] for i in sorted(idx[:cut])]
-            val_records = [records[i] for i in sorted(idx[cut:])]
 
         if families:
             keep = set(families)
@@ -390,9 +389,26 @@ class FineTunePrep:
 
     # ------------------------------------------------------------ legacy
     def split_and_prepare(self, tasks_dir: Path, output_dir: Path,
-                          train_ratio: float = 0.8):
-        """Backwards-compatible single-directory entry point."""
-        return self.prepare(output_dir, tasks_dirs=[(Path(tasks_dir), None)],
+                          train_ratio: float = 0.8, seed: int = None):
+        """Single-directory entry point.
+
+        The directory's generation seed must be declared via ``seed``
+        (the CLI equivalent of ``--tasks-dir PATH@SEED``); an
+        undeclared directory is refused, because its seed is unknown
+        and locked eval-seed tasks could otherwise pass the exclusion
+        check unseen. ``train_ratio`` is accepted for compatibility
+        but the split is by seed (all of this directory's tasks land
+        in training unless their seed is a validation seed in
+        :meth:`prepare` terms; here they are training records).
+        """
+        if seed is None:
+            raise ValueError(
+                "split_and_prepare requires the directory's "
+                "generation seed (seed=<seed>, CLI: --tasks-dir "
+                "PATH@SEED); undeclared directories would bypass "
+                "the locked eval-seed refusal")
+        return self.prepare(output_dir,
+                            tasks_dirs=[(Path(tasks_dir), seed)],
                             train_ratio=train_ratio)
 
 
@@ -470,8 +486,8 @@ def main():
                         default=Path('finetune_data'),
                         help='Output directory (default: finetune_data/)')
     parser.add_argument('--train-ratio', type=float, default=0.8,
-                        help='Legacy fallback split for undeclared-seed '
-                             'tasks dirs (default: 0.8)')
+                        help='Accepted for compatibility; the split '
+                             'is by seed, not ratio')
 
     args = parser.parse_args()
     tasks_dirs = _parse_tasks_dir(args.tasks_dir)
@@ -484,7 +500,12 @@ def main():
                   f"would bypass the locked eval-seed refusal")
             return 1
     if not tasks_dirs and not args.seeds:
-        tasks_dirs = [(Path('tasks'), None)]
+        print("Error: no dataset source: pass --seeds with --tier to "
+              "generate tasks, or --tasks-dir PATH@SEED with a "
+              "declared generation seed. There is no implicit tasks/ "
+              "default: generate_tasks builds it at seed 42, a locked "
+              "eval seed, so training on it sight-unseen is refused")
+        return 1
     for path, _seed in tasks_dirs:
         if not path.exists():
             print(f"Error: Tasks directory not found: {path}")
