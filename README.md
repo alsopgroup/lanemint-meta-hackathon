@@ -11,10 +11,11 @@ Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [Lane
 
 ---
 
-**LaneMint × Meta Benchmark is a benchmark of hard quant-finance coding and data tasks, graded on hidden, procedurally generated synthetic market data.** Every task is generated from a seed, so the evaluation set is effectively unlimited and no model can have memorised it; the graded frontier tier asks a model to clean messy multi-asset price data and carry out long chains of exact numeric work — rolling risk, vendor reconciliation, factor exposure, and a full portfolio pipeline — where one wrong intermediate step fails the task. It exists to push Meta's Muse models to their frontier: the strongest model we ran passes only half of it. The whole project — generator, scorer, runner, fine-tuning pipeline, and demo app — was built with Meta's **Muse Wonder** model in Cursor.
+**LaneMint × Meta Benchmark is a benchmark of hard quant-finance coding and data tasks, graded on hidden, procedurally generated synthetic market data.** Every task is generated from a seed, so the evaluation set is effectively unlimited and unseen by any model; the graded frontier tier asks a model to clean messy multi-asset price data and carry out long chains of exact numeric work — rolling risk, vendor reconciliation, factor exposure, and a full portfolio pipeline — where one wrong intermediate step fails the task. It exists to push Meta's Muse models to their frontier: the strongest model we ran passes only half of it. The project was built predominantly with Meta's **Muse Wonder** model in Cursor: after an initial scaffold (repo structure, data generator, runner, easy tier), all development from the hard tier onward was done with Muse Wonder.
 
 **Live demo:** https://meta.lanemint.com
-**Demo video:** TODO — demo video link to be added here before judging.
+**Demo video:** coming Nov 3 <!-- TODO: replace this placeholder with the demo video link -->
+**Full technical reference:** the previous long-form README is preserved at [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Headline results
 
@@ -39,7 +40,7 @@ Honest footnotes (also shown in the app):
 - **Meta API — Muse Spark 1.3.** The flagship model is evaluated through Meta's OpenAI-compatible API (`https://api.meta.ai/v1`) by the runner (`src/runner.py`) and powers the live mode of the demo app.
 - **Fireworks — Muse Spark Open and Muse Glimmer 30B.** The open Muse models are evaluated through Fireworks (serverless for Spark Open; Glimmer 30B served on an H200), using the same runner pointed at Fireworks' OpenAI-compatible endpoint.
 - **Glimmer LoRA SFT pipeline.** `src/finetune_prep.py` + `src/finetune.py` build a seed-disjoint supervised fine-tuning dataset for Muse Glimmer 30B and validate it against Fireworks' SFT rules. The locked evaluation seeds (42/1001/1002) are refused as training seeds **by construction** — training uses separate seeds (planned: 2001–2040), directories must declare their seed, and an optional hash check against the built eval sets refuses the run on any overlap.
-- **Muse Wonder in Cursor.** The project itself — generator, scorer, runner, fine-tuning pipeline, demo app, tests, and this README — was built iteratively with Meta's Muse Wonder model in Cursor, including the pilot-driven recalibration of the frontier families.
+- **Muse Wonder in Cursor.** After an initial scaffold (repo structure, data generator, runner, easy tier), all development from the hard tier onward was done with Meta's Muse Wonder model in Cursor — the hard and frontier tiers, scorer hardening, fine-tuning pipeline, demo app, tests, and this README — including the pilot-driven recalibration of the frontier families.
 
 ## How it works
 
@@ -112,6 +113,7 @@ Run the tests:
 
 ```bash
 pytest tests/ -q          # benchmark, scorer, runner, fine-tune prep
+pip install -r app/requirements.txt httpx
 pytest app/tests -q       # demo app API, leaderboard, live/demo fallback
 ```
 
@@ -124,13 +126,16 @@ The fine-tuning path is designed so the headline evaluation can never leak into 
 - **Validated, never auto-executed.** `src/finetune.py` validates the JSONL against Fireworks SFT rules (row/token limits, message shape) and then **prints** the `firectl dataset create` / `firectl sftj create` commands (LoRA rank 16, 2 epochs, base `muse-glimmer-30b`) for a human to review and run. Nothing in this repo calls Fireworks training APIs automatically.
 
 ```bash
-# Build seed-disjoint SFT data (small verified example)
-python -m src.finetune_prep --tier frontier --seeds 3001-3002 --count 4 --val-seeds 3002 --output-dir finetune_data
+# Build seed-disjoint SFT data (small verified example). --eval-dirs
+# turns on the hash-level guard against the locked eval set built in
+# 'Reproduce' above (repeat --eval-dirs for tasks_eval_1001/1002 in a
+# full run): any CSV/answer hash collision refuses the run.
+python -m src.finetune_prep --tier frontier --seeds 3001-3002 --count 4 --val-seeds 3002 --eval-dirs tasks_eval_42 --output-dir finetune_data
 # Validate and print the Fireworks plan (executes nothing)
 python -m src.finetune --train-file finetune_data/train.jsonl --validation-file finetune_data/validation.jsonl --dry-run
 ```
 
-**Status:** LoRA results are **pending** — a Fireworks dataset-upload outage blocked the training run, so the fine-tuned row of the leaderboard stays "Coming soon" rather than showing placeholder numbers. After training, the protocol is to evaluate on the same locked 96-task set at low reasoning effort and tear the deployment down immediately afterwards.
+**Status:** LoRA results are **pending** — training now runs through Fireworks' Serverless Training API, and the fine-tuned row of the leaderboard stays "Coming soon" rather than showing placeholder numbers. After training, the protocol is to evaluate on the same locked 96-task set at low reasoning effort and tear the deployment down immediately afterwards.
 
 ## The demo app
 
@@ -142,11 +147,11 @@ The app in `app/` (deployed at https://meta.lanemint.com) lets judges try the ea
 - **API failures count as failures.** Spark Open's 2% includes 5 tasks lost to API errors (dropped connections, 1 timeout) on the serving side, not wrong answers.
 - **F1 changed mid-flight.** Spark Open's and Glimmer base's seed-42 F1 results predate the current 4-window F1 (they used a 3-window version); all other results use the current version. Pooled totals mix the two only for those two models' seed-42 slice.
 - **One run per model.** Headline numbers are single pooled runs at low reasoning effort, not averages over repeated runs; the Wilson intervals are the honest precision statement.
-- **Fine-tune pending.** Glimmer + LoRA has not been evaluated yet (Fireworks dataset-upload outage), so the central open question — how much of the Spark/Glimmer gap is trainable — is still open.
+- **Fine-tune pending.** Glimmer + LoRA has not been evaluated yet — training runs through Fireworks' Serverless Training API and results are pending — so the central open question, how much of the Spark/Glimmer gap is trainable, is still open.
 - **Demo vs benchmark.** The interactive demo exercises the easy-tier checker for accessibility; the graded frontier tier is run through the CLI pipeline above, not in the browser.
 
 ## License and credits
 
 No open-source license has been attached to this repository yet — all rights are reserved by LaneMint; please ask before reusing the code outside this hackathon.
 
-Credits: built by [LaneMint](https://lanemint.com) for the Meta AI Developer Hackathon. Models: Meta Muse Spark 1.3 (Meta API), Muse Spark Open and Muse Glimmer 30B (Fireworks). Built with Meta's Muse Wonder model in Cursor. The benchmark contains only procedurally generated synthetic data — no private LaneMint data, tasks, or grading assets.
+Credits: built by [LaneMint](https://lanemint.com) for the Meta AI Developer Hackathon. Models: Meta Muse Spark 1.3 (Meta API), Muse Spark Open and Muse Glimmer 30B (Fireworks). After an initial scaffold (repo structure, data generator, runner, easy tier), all development from the hard tier onward was done with Meta's Muse Wonder model in Cursor. The benchmark contains only procedurally generated synthetic data — no private LaneMint data, tasks, or grading assets.

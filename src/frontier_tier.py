@@ -4,7 +4,7 @@ Settings per family live in FRONTIER_FAMILY_SETTINGS (rows, assets,
 window / conflicts / actions / rebalance steps, cost) and can be
 overridden per family via ``FrontierTaskGenerator(settings=...)``.
 
-Design constraints (see README): no dividends, delistings/survivorship,
+Design constraints (see docs/BENCHMARK.md): no dividends, delistings/survivorship,
 ticker renames, stale or repeated prices, or too-short histories. Splits
 appear ONLY as explicit split-table events in F3; F1/F2/F4 price series
 contain no split or unit-change level shifts at all. Every rule the
