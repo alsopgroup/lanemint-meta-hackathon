@@ -64,7 +64,7 @@
       "provider": "Fireworks",
       "status": "coming_soon",
       "notes": [
-        "LoRA fine-tune trained on seed-disjoint frontier data (seeds 2001–2036); held-out evaluation pending."
+        "LoRA fine-tune on seed-disjoint frontier data (train seeds 2001–2036) — results pending."
       ]
     }
   ]
