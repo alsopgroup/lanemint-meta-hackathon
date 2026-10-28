@@ -139,7 +139,8 @@ def solve(task, csv_path):
                                prompt).group(1))
         target = re.search(r"target asset is (\w+)", prompt).group(1)
         rets = prices.pct_change().dropna()
-        blocks = [rets.iloc[-3 * window:-2 * window],
+        blocks = [rets.iloc[-4 * window:-3 * window],
+                  rets.iloc[-3 * window:-2 * window],
                   rets.iloc[-2 * window:-window], rets.iloc[-window:]]
         ew = rets[assets].mean(axis=1)
         return {"problems": sorted(problems),

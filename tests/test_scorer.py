@@ -582,7 +582,8 @@ class TestNoAttemptFlag:
             'num_clean_days': 12})
         assert 'no_attempt' in result['analysis_flags']
 
-    @pytest.mark.parametrize('value', [0.212345, 1.234588, 1.187654, 0.345674])
+    @pytest.mark.parametrize('value', [0.212345, 1.234588, 1.187654, 0.345674,
+                                       0.012345, 0.0123456])
     def test_single_partial_run_in_correct_answer_not_flagged(self, tmp_path,
                                                               value):
         # Regression (frontier reference answers, seeds 1-400): correct
@@ -623,6 +624,138 @@ class TestNoAttemptFlag:
             'num_clean_days': 12})
         assert result['passed']
         assert result['analysis_flags'] == []
+
+    def test_all_core_fields_zero_flagged(self, tmp_path):
+        # The Glimmer shape: every headline number exactly 0.0.
+        from src.scorer import _is_no_attempt
+        expected = {'beta_market': 1.1, 'beta_sector': 0.5,
+                    'r_squared': 0.83}
+        parsed = {'problems': [], 'beta_market': 0.0, 'beta_sector': 0.0,
+                  'r_squared': 0.0, 'alpha': 0.0002,
+                  'num_return_days': 79}
+        assert _is_no_attempt(parsed, expected)
+
+    def test_two_core_zeros_plus_placeholder_flagged(self, tmp_path):
+        from src.scorer import _is_no_attempt
+        expected = {'window_beta_1': 0.9, 'window_beta_2': 1.0,
+                    'window_beta_3': 1.1, 'window_beta_4': 0.8,
+                    'final_window_volatility': 0.2}
+        parsed = {'problems': [], 'window_beta_1': 0.0,
+                  'window_beta_2': 0.0, 'window_beta_3': 0.12345,
+                  'window_beta_4': 0.87, 'final_window_volatility': 0.2}
+        assert _is_no_attempt(parsed, expected)
+
+    def test_correct_value_with_long_run_not_flagged(self, tmp_path):
+        # A correct unrounded answer can carry a >= 6-digit sequential
+        # run (1.2345678 against a 1.234567 key); with the expected
+        # answer known it is credited computation, not a placeholder.
+        from src.scorer import _is_no_attempt
+        expected = {'final_return': 1.234567, 'max_drawdown': -0.21,
+                    'first_rebalance_value': 1.03}
+        parsed = {'problems': [], 'final_return': 1.2345678,
+                  'max_drawdown': -0.2103, 'first_rebalance_value': 1.0312,
+                  'num_aligned_days': 149}
+        assert not _is_no_attempt(parsed, expected)
+        # Without the key the same digits are indistinguishable from a
+        # typed placeholder, which is why the scorer always passes it.
+        assert _is_no_attempt(parsed)
+
+    def test_one_core_zero_alone_not_flagged(self, tmp_path):
+        from src.scorer import _is_no_attempt
+        expected = {'beta_market': 1.1, 'beta_sector': 0.5,
+                    'r_squared': 0.83}
+        parsed = {'problems': [], 'beta_market': 0.0, 'beta_sector': 0.5,
+                  'r_squared': 0.83, 'alpha': 0.0002}
+        assert not _is_no_attempt(parsed, expected)
+
+
+class TestNonDictResponses:
+    """A parsed answer that is not a JSON object scores 0 for that task
+    and must never abort the scoring run (a frontier model returned a
+    one-element list for whole tasks)."""
+
+    ANSWER = {'mean_return': 0.001, 'std_return': 0.02,
+              'num_clean_days': 12, 'problems_found': ['unit_change_x']}
+
+    def _scorer(self, tmp_path):
+        import json as _json
+        (tmp_path / 'task_h_1001_answer.json').write_text(
+            _json.dumps(self.ANSWER))
+        (tmp_path / 'task_h_1002_answer.json').write_text(
+            _json.dumps(self.ANSWER))
+        return TaskScorer(tmp_path)
+
+    @pytest.mark.parametrize('raw', [
+        '[{"mean_return": 0.001}]',  # one-element list
+        '"just a string"',
+        '42',
+        'null',
+        'true',
+    ])
+    def test_non_dict_scores_zero_not_crash(self, tmp_path, raw):
+        scorer = self._scorer(tmp_path)
+        result = scorer.score_task('task_h_1001', raw)
+        assert result['passed'] is False
+        assert result['score'] == 0.0
+        assert 'not an object' in result['feedback']
+
+    def test_score_all_survives_non_dict_entries(self, tmp_path):
+        import json as _json
+        scorer = self._scorer(tmp_path)
+        results = [
+            {'task_id': 'task_h_1001', 'response': '[{"mean_return": 1}]'},
+            {'task_id': 'task_h_1002', 'response': _json.dumps(
+                {'problems': ['unit_change'], 'mean_return': 0.001,
+                 'std_return': 0.02, 'num_clean_days': 12})},
+        ]
+        path = tmp_path / 'results.json'
+        path.write_text(_json.dumps(results))
+        summary = scorer.score_all(path)  # must not raise
+        assert summary['total_tasks'] == 2
+        assert summary['passed'] == 1
+
+
+class TestWindowCoreKeyCompatibility:
+    """The F1 core check requires only the window fields the answer
+    key actually carries: keys written before the fourth window was
+    added (window_beta_1..3) must not fail a matching answer, and a
+    failing task must never report 'All checks passed'."""
+
+    LEGACY_KEY = {'window_beta_1': 0.9, 'window_beta_2': 1.0,
+                  'window_beta_3': 1.1, 'final_window_volatility': 0.2,
+                  'target_asset': 'AST1', 'num_assets': 2,
+                  'num_aligned_days': 119,
+                  'problems_found': ['duplicate_2021-05-07']}
+    ANSWER = {'problems': ['duplicate'], 'window_beta_1': 0.9,
+              'window_beta_2': 1.0, 'window_beta_3': 1.1,
+              'final_window_volatility': 0.2, 'target_asset': 'AST1',
+              'num_assets': 2, 'num_aligned_days': 119}
+
+    def _score(self, tmp_path, key, answer):
+        import json as _json
+        (tmp_path / 'task_f_2001_answer.json').write_text(_json.dumps(key))
+        scorer = TaskScorer(tmp_path)
+        return scorer.score_task('task_f_2001', _json.dumps(answer))
+
+    def test_legacy_three_window_key_passes(self, tmp_path):
+        result = self._score(tmp_path, self.LEGACY_KEY, self.ANSWER)
+        assert result['passed']
+        assert result['score'] == 1.0
+        assert result['feedback'] == 'All checks passed'
+
+    def test_four_window_key_missing_beta_4_fails_with_message(self, tmp_path):
+        key = {**self.LEGACY_KEY, 'window_beta_4': 0.8}
+        result = self._score(tmp_path, key, self.ANSWER)  # no beta_4
+        assert not result['passed']
+        assert 'window_beta_4' in result['feedback']
+        assert 'All checks passed' not in result['feedback']
+
+    def test_legacy_key_wrong_window_beta_fails_with_message(self, tmp_path):
+        answer = {**self.ANSWER, 'window_beta_2': 0.5}
+        result = self._score(tmp_path, self.LEGACY_KEY, answer)
+        assert not result['passed']
+        assert 'window_beta_2' in result['feedback']
+        assert 'All checks passed' not in result['feedback']
 
 
 if __name__ == '__main__':

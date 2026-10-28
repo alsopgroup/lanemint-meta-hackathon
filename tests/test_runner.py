@@ -376,6 +376,27 @@ def test_family_filter_runs_only_named_types(tmp_path):
     assert all(r['task_type'] == 'fam_b' for r in capped)
 
 
+def test_family_filter_matching_nothing_is_an_error(tmp_path):
+    """A misspelled --family must not look like a green pilot run."""
+    import pytest
+    tasks_dir = _typed_tasks_dir(tmp_path / "tasks")
+    with pytest.raises(ValueError, match="matched 0 tasks"):
+        _runner_with_client(_StubClient()).run_all_tasks(
+            tasks_dir, tmp_path / "out", families=["nope"])
+
+
+def test_family_zero_match_exits_nonzero_via_cli(tmp_path, capsys, monkeypatch):
+    import sys
+
+    from src.runner import main as runner_main
+    tasks_dir = _typed_tasks_dir(tmp_path / "tasks")
+    monkeypatch.setattr(sys, "argv", ["runner", "--dry-run", "--tasks-dir",
+                                      str(tasks_dir), "--family", "nope"])
+    assert runner_main() == 1
+    captured = capsys.readouterr()
+    assert "matched 0 tasks" in captured.out + captured.err
+
+
 def test_env_overrides_tier_default(monkeypatch):
     runner, fake = _runner_with_fake(monkeypatch)
     monkeypatch.setenv('META_MAX_TOKENS', '20000')
