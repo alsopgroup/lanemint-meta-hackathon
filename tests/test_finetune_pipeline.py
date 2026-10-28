@@ -61,6 +61,27 @@ class TestSeedSplit:
             {'frontier_factor_exposure': 2}
 
 
+    def test_mix_applies_to_directory_loaded_tiers(self, tmp_path):
+        # Directory-loaded tasks have no explicit tier; it is inferred
+        # from the task id/type so tier-named mix groups still apply.
+        from src.generate_tasks import TaskGenerator
+        easy_dir = tmp_path / 'easy77'
+        TaskGenerator(seed=77).generate_all_tasks(easy_dir, num_tasks=8)
+        frontier_dir = tmp_path / 'frontier78'
+        FrontierTaskGenerator(seed=78).generate_all_tasks(
+            frontier_dir, num_tasks=8)
+        result = FineTunePrep().prepare(
+            tmp_path / 'out',
+            tasks_dirs=[(easy_dir, 201), (frontier_dir, 202)],
+            mix={'easy': 0.25, 'frontier': 0.75})
+        by_family = result['manifest']['counts']['train']['by_family']
+        easy_rows = sum(n for t, n in by_family.items()
+                        if not t.startswith('frontier_'))
+        frontier_rows = sum(n for t, n in by_family.items()
+                            if t.startswith('frontier_'))
+        assert (easy_rows, frontier_rows) == (2, 7)
+
+
 class TestEvalHashCheck:
     def test_hash_collision_refusal(self, tmp_path):
         eval_dir = tmp_path / 'eval99'

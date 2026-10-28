@@ -89,13 +89,25 @@ class FineTunePrep:
                 task['data'] = f.read()
         return tasks
 
+    @staticmethod
+    def _infer_tier(task: dict) -> str:
+        """Tier of a directory-loaded task (for --mix tier groups)."""
+        task_id = str(task.get('id', ''))
+        if task_id.startswith('task_f_') or \
+                str(task.get('type', '')).startswith('frontier_'):
+            return 'frontier'
+        if task_id.startswith('task_h_'):
+            return 'hard'
+        return 'easy'
+
     def load_records(self, tasks_dir: Path, seed: int | None,
                      tier: str | None = None) -> list[dict]:
         """Load one tasks directory as dataset records tagged by seed."""
         records = []
         for task in self.load_tasks_with_answers(tasks_dir):
             records.append({
-                'task': task, 'seed': seed, 'tier': tier,
+                'task': task, 'seed': seed,
+                'tier': tier or self._infer_tier(task),
                 'type': task['type'],
                 'csv_sha256': _sha256_bytes(task['data'].encode('utf-8')),
                 'answer_sha256': _canonical_answer_hash(task['expected']),
