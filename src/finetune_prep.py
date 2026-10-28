@@ -6,7 +6,7 @@ generated it (in-process generation, or a tasks directory declared as
 ``PATH@SEED``), the train/validation split is by whole seed, and the
 locked eval seeds (default 42, 1001, 1002) are refused as dataset
 seeds. An optional ``--eval-dirs`` SHA-256 check refuses to write
-anything if a training CSV or answer is byte-equivalent to an eval
+anything if a training or validation CSV or answer is byte-equivalent to an eval
 task's. All randomness comes from a local ``random.Random``.
 
 Each run writes ``train.jsonl``, ``validation.jsonl``,
@@ -222,12 +222,24 @@ class FineTunePrep:
                 seeds=(), count: int = 25, val_seeds=(),
                 exclude_seeds=DEFAULT_EXCLUDE_SEEDS, eval_dirs=(),
                 families=None, mix=None, target: str = 'answer',
-                trace_max_tokens: int = 4096, train_ratio: float = 0.8):
+                trace_max_tokens: int = 4096, train_ratio: float = 0.8,
+                allow_eval_seeds: bool = False):
         """Build the dataset; raise ValueError before writing anything
         when a seed rule or the eval hash check is violated."""
         output_dir = Path(output_dir)
         val_seeds = set(val_seeds)
         excluded = set(exclude_seeds)
+        missing_locked = sorted(set(DEFAULT_EXCLUDE_SEEDS) - excluded)
+        if missing_locked and not allow_eval_seeds:
+            raise ValueError(
+                f"refusing to build dataset: --exclude-seeds "
+                f"{sorted(excluded)} would unlock locked eval seed(s) "
+                f"{missing_locked}; pass --allow-eval-seeds to "
+                f"override the lock explicitly")
+        if allow_eval_seeds:
+            print("WARNING: --allow-eval-seeds in effect; the locked "
+                  "eval-seed protection (42, 1001, 1002) is "
+                  "overridden for this run")
 
         with tempfile.TemporaryDirectory() as tmp:
             records: list[dict] = []
@@ -275,18 +287,25 @@ class FineTunePrep:
                 for rec in self.load_records(path, seed=None):
                     eval_csv.add(rec['csv_sha256'])
                     eval_ans.add(rec['answer_sha256'])
-            collisions = [r for r in train_records
-                          if r['csv_sha256'] in eval_csv
-                          or r['answer_sha256'] in eval_ans]
+
+            def _collides(rec):
+                return rec['csv_sha256'] in eval_csv \
+                    or rec['answer_sha256'] in eval_ans
+
+            train_hits = [r for r in train_records if _collides(r)]
+            val_hits = [r for r in val_records if _collides(r)]
+            collisions = train_hits + val_hits
             if collisions:
                 sample = ", ".join(
                     f"seed {r['seed']}:{r['task']['id']}"
                     for r in collisions[:5])
                 raise ValueError(
-                    f"refusing to write: {len(collisions)} training "
+                    f"refusing to write: {len(collisions)} dataset "
                     f"task(s) match an eval task by SHA-256 (CSV or "
-                    f"answer), e.g. {sample}; training on held-out "
-                    f"eval tasks is not allowed")
+                    f"answer; {len(train_hits)} in training, "
+                    f"{len(val_hits)} in validation), e.g. {sample}; "
+                    f"training or validating on held-out eval tasks "
+                    f"is not allowed")
         else:
             eval_csv = eval_ans = set()
 
@@ -356,7 +375,8 @@ class FineTunePrep:
                 'eval_dirs': [str(p) for p in eval_dirs],
                 'eval_csv_hashes': len(eval_csv),
                 'eval_answer_hashes': len(eval_ans),
-                'train_collisions': 0},
+                'train_collisions': 0,
+                'validation_collisions': 0},
             'files': files,
         }
         (output_dir / 'manifest.json').write_text(
@@ -404,9 +424,11 @@ def main():
     parser = argparse.ArgumentParser(
         description='Prepare seed-disjoint Fireworks SFT data')
     parser.add_argument('--tasks-dir', action='append', default=None,
-                        help='Tasks directory (repeatable); append '
-                             '@SEED to declare its generation seed, '
-                             'e.g. tasks_frontier@2001')
+                        help='Tasks directory (repeatable); the '
+                             'generation seed must be declared as '
+                             '@SEED, e.g. tasks_frontier@2001, so '
+                             'undeclared directories cannot bypass the '
+                             'locked-seed refusal')
     parser.add_argument('--tier', choices=['easy', 'hard', 'frontier'],
                         default=None,
                         help='Tier to generate in-process with --seeds '
@@ -421,10 +443,16 @@ def main():
                              '2037-2040; split is by whole seed')
     parser.add_argument('--exclude-seeds', default='42,1001,1002',
                         help='Locked eval seeds refused as dataset '
-                             'seeds (default: 42,1001,1002)')
+                             'seeds (default: 42,1001,1002); dropping '
+                             'a locked seed from this list requires '
+                             '--allow-eval-seeds')
+    parser.add_argument('--allow-eval-seeds', action='store_true',
+                        help='Explicitly override the locked eval-seed '
+                             'protection (42, 1001, 1002); prints a '
+                             'warning. Never use for real training runs')
     parser.add_argument('--eval-dirs', action='append', default=None,
                         help='Eval tasks directory (repeatable); any '
-                             'training CSV/answer SHA-256 match refuses '
+                             'training/validation CSV/answer SHA-256 match refuses '
                              'the run before anything is written')
     parser.add_argument('--families', default=None,
                         help='Comma-separated task types to keep')
@@ -447,6 +475,14 @@ def main():
 
     args = parser.parse_args()
     tasks_dirs = _parse_tasks_dir(args.tasks_dir)
+    if args.tasks_dir is not None:
+        undeclared = [str(p) for p, seed in tasks_dirs if seed is None]
+        if undeclared:
+            print(f"Error: --tasks-dir {undeclared} must declare the "
+                  f"generation seed as PATH@SEED (e.g. "
+                  f"tasks_frontier@2001); undeclared directories "
+                  f"would bypass the locked eval-seed refusal")
+            return 1
     if not tasks_dirs and not args.seeds:
         tasks_dirs = [(Path('tasks'), None)]
     for path, _seed in tasks_dirs:
@@ -470,7 +506,8 @@ def main():
             mix=_parse_mix(args.mix),
             target=args.target,
             trace_max_tokens=args.trace_max_tokens,
-            train_ratio=args.train_ratio)
+            train_ratio=args.train_ratio,
+            allow_eval_seeds=args.allow_eval_seeds)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1

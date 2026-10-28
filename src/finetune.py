@@ -141,11 +141,19 @@ class FineTuneValidator:
                 print(f"    {error}")
 
 
+def default_names(target: str) -> tuple[str, str, str]:
+    """Per-target Fireworks names, so answer and trace runs never
+    collide: (train dataset, eval dataset, output model)."""
+    return (f'glimmer-sft-{target}', f'glimmer-sft-{target}-eval',
+            f'muse-glimmer-30b-lora-{target}')
+
+
 def planned_commands(train_file: Path, validation_file: Path | None,
                      base_model: str = BASE_MODEL, lora_rank: int = 16,
                      epochs: int = 2, train_dataset: str = 'glimmer-sft',
                      eval_dataset: str = 'glimmer-sft-eval',
-                     output_model: str = 'muse-glimmer-30b-lora'
+                     output_model: str = 'muse-glimmer-30b-lora',
+                     max_context_length: int = 32768
                      ) -> list[str]:
     """The firectl commands for this dataset. Printed, never run."""
     commands = [f"firectl dataset create {train_dataset} {train_file}"]
@@ -158,6 +166,7 @@ def planned_commands(train_file: Path, validation_file: Path | None,
         f"firectl sftj create --base-model {base_model} "
         f"--dataset {train_dataset}{eval_flag} "
         f"--lora-rank {lora_rank} --epochs {epochs} "
+        f"--max-context-length {max_context_length} "
         f"--output-model {output_model}")
     return commands
 
@@ -182,12 +191,21 @@ def main():
                         help=f'Base model (default: {BASE_MODEL})')
     parser.add_argument('--lora-rank', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=2)
-    parser.add_argument('--train-dataset', default='glimmer-sft',
-                        help='firectl dataset id for the training file')
-    parser.add_argument('--eval-dataset', default='glimmer-sft-eval',
-                        help='firectl dataset id for the eval file')
-    parser.add_argument('--output-model', default='muse-glimmer-30b-lora',
-                        help='Output LoRA model id')
+    parser.add_argument('--target', choices=['answer', 'trace'],
+                        default='answer',
+                        help='Dataset target the files were built '
+                             'with; selects the default dataset and '
+                             'output model names (glimmer-sft-<target>'
+                             ', muse-glimmer-30b-lora-<target>)')
+    parser.add_argument('--train-dataset', default=None,
+                        help='firectl dataset id for the training file '
+                             '(default: per-target, see --target)')
+    parser.add_argument('--eval-dataset', default=None,
+                        help='firectl dataset id for the eval file '
+                             '(default: per-target, see --target)')
+    parser.add_argument('--output-model', default=None,
+                        help='Output LoRA model id (default: '
+                             'per-target, see --target)')
     parser.add_argument('--dry-run', action='store_true', default=True,
                         help='Accepted for compatibility; this tool '
                              'only ever validates and prints commands')
@@ -213,18 +231,21 @@ def main():
     print("\n✓ All data files satisfy the Fireworks SFT rules")
     print("\nPlanned Fireworks commands (NOT executed; run them "
           "manually after review):")
+    def_train, def_eval, def_model = default_names(args.target)
     for command in planned_commands(
             args.train_file,
             args.validation_file if args.validation_file.exists()
             else None,
             base_model=args.base_model, lora_rank=args.lora_rank,
-            epochs=args.epochs, train_dataset=args.train_dataset,
-            eval_dataset=args.eval_dataset,
-            output_model=args.output_model):
+            epochs=args.epochs,
+            train_dataset=args.train_dataset or def_train,
+            eval_dataset=args.eval_dataset or def_eval,
+            output_model=args.output_model or def_model,
+            max_context_length=args.max_context_length):
         print(f"  {command}")
     print("\nAfter training, evaluate on the locked seeds (42/1001/"
           "1002) at low reasoning effort, then tear down the "
-          "deployment (see README 'Fireworks fine-tuning').")
+          "deployment (see README 'Fine-Tune on Fireworks').")
     return 0
 
 

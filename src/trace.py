@@ -119,7 +119,12 @@ def _aligned(frames, logs=None):
 
 
 def _f(x) -> str:
-    return f"{float(x):.6f}"
+    """Intermediate values at 10 significant digits: enough for a
+    reader to reproduce the final (6-decimal) values from the printed
+    cov/var, drawdown and OLS intermediates. The final answer values
+    themselves are rounded to 6 decimals when the answer is built,
+    independently of this formatting."""
+    return f"{float(x):.10g}"
 
 
 def _cap_steps(steps: str, max_tokens: int) -> str:
