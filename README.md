@@ -193,14 +193,20 @@ Shows pass/fail for each task with detailed feedback.
 
 ### 4. Prepare Fine-Tuning Data
 
-Build a Fireworks SFT dataset with `src/finetune_prep.py`. Tasks are generated in-process per seed (`--tier`/`--seeds`) or loaded from one or more task directories (`--tasks-dir`, repeatable; declare a directory's generation seed as `PATH@SEED`).
+Build a Fireworks SFT dataset with `src/finetune_prep.py`. Tasks are generated in-process per seed (`--tier`/`--seeds`) or loaded from one or more task directories (`--tasks-dir`, repeatable; a directory's generation seed must be declared as `PATH@SEED` — undeclared directories are refused, so they cannot bypass the locked-seed check). There is no implicit default tasks directory: running with neither `--seeds` nor a declared `--tasks-dir` is refused, because the old implicit `tasks/` default is generated at locked seed 42.
 
-**Seed-disjointness rule (mandatory):** training and validation data must be disjoint by generation seed from each other and from the locked eval seeds **42, 1001 and 1002**. The split is by whole seed (`--val-seeds`), never by shuffling tasks from the same seed across the split. `--exclude-seeds` (default `42,1001,1002`) refuses any dataset seed in the locked set, and `--eval-dirs` adds a SHA-256 check: if any training CSV or answer matches an eval task's, the run refuses before writing anything. All randomness uses a local `random.Random`, and every run writes a `manifest.json` (generator commit, seeds, per-family counts, token stats, SHA-256 of each output file).
+**Seed-disjointness rule (mandatory):** training and validation data must be disjoint by generation seed from each other and from the locked eval seeds **42, 1001 and 1002**. The split is by whole seed (`--val-seeds`), never by shuffling tasks from the same seed across the split. `--exclude-seeds` (default `42,1001,1002`) refuses any dataset seed in the locked set; dropping a locked seed from that list (e.g. `--exclude-seeds ''`) is itself refused unless `--allow-eval-seeds` is passed explicitly, which prints a warning and must never be used for a real training run. `--eval-dirs` adds a SHA-256 check over training **and** validation rows: if any CSV or answer matches an eval task's, the run refuses before writing anything. All randomness uses a local `random.Random`, and every run writes a `manifest.json` (generator commit, seeds, per-family counts, token stats, SHA-256 of each output file).
 
 ```bash
+# Build the locked eval sets first (these are the --eval-dirs inputs
+# and the post-training evaluation sets; never train on them):
+for s in 42 1001 1002; do
+  python -m src.generate_tasks --tier frontier --seed $s --count 32 --output-dir tasks_eval_$s
+done
+
 # Planned dataset: frontier seeds 2001-2040, 32 tasks per seed;
-# train on 2001-2036, validate on 2037-2040. Eval sets (seeds
-# 42/1001/1002, generated separately) guard against contamination.
+# train on 2001-2036, validate on 2037-2040, guarded against the
+# eval sets by SHA-256.
 python -m src.finetune_prep --tier frontier --seeds 2001-2040 --count 32 \
     --val-seeds 2037-2040 --eval-dirs tasks_eval_42 --eval-dirs tasks_eval_1001 --eval-dirs tasks_eval_1002 \
     --target trace --output-dir finetune_data
@@ -219,29 +225,35 @@ Creates:
 Fine-tune **Muse Glimmer 30B** with a LoRA adapter on Fireworks (managed SFT). `src/finetune.py` validates the dataset against the Fireworks SFT rules — 3 to 3,000,000 rows, valid message roles with a non-empty assistant message, and every row within `--max-context-length` tokens (default 32768; rows over the limit **fail** validation instead of being silently truncated by the platform) — and then prints, but never runs, the `firectl` commands:
 
 ```bash
-# Validate and print the plan (dry-run; nothing is executed)
-python -m src.finetune --dry-run
+# Validate and print the plan (dry-run; nothing is executed).
+# --target must match the target the data was built with; it selects
+# per-target dataset/output names (glimmer-sft-<target>,
+# muse-glimmer-30b-lora-<target>) so answer and trace runs never collide.
+python -m src.finetune --dry-run --target trace
 
 # Printed plan (run manually after review; these are paid operations):
-# firectl dataset create glimmer-sft finetune_data/train.jsonl
-# firectl dataset create glimmer-sft-eval finetune_data/validation.jsonl
+# firectl dataset create glimmer-sft-trace finetune_data/train.jsonl
+# firectl dataset create glimmer-sft-trace-eval finetune_data/validation.jsonl
 # firectl sftj create --base-model accounts/fireworks/models/muse-glimmer-30b \
-#     --dataset glimmer-sft --evaluation-dataset glimmer-sft-eval \
-#     --lora-rank 16 --epochs 2 --output-model muse-glimmer-30b-lora
+#     --dataset glimmer-sft-trace --evaluation-dataset glimmer-sft-trace-eval \
+#     --lora-rank 16 --epochs 2 --max-context-length 32768 \
+#     --output-model muse-glimmer-30b-lora-trace
 ```
 
 **Evaluation protocol:** after training, evaluate the LoRA model on the locked held-out frontier set — 96 tasks (seeds 42, 1001 and 1002 at `--count 32`) that were never trained or validated on — with the runner at **low reasoning effort** (the same setting as the frontier pilots), and report pass rates with Wilson score intervals. **Deployment teardown is mandatory:** delete the dedicated deployment (or unload the LoRA addon) as soon as evaluation finishes, so no fine-tuned endpoint is left running.
 
 **Runner model strings for the LoRA model** (the runner takes `--model` / `META_MODEL_NAME`, with `META_BASE_URL` pointed at the Fireworks OpenAI-compatible endpoint `https://api.fireworks.ai/inference/v1`):
 
-- Dedicated deployment of the tuned model: `--model accounts/<your-account>/models/muse-glimmer-30b-lora` (the output model resource name).
+- Dedicated deployment of the tuned model: `--model accounts/<your-account>/models/muse-glimmer-30b-lora-trace` (the output model resource name; `-answer` for the answer-target run).
 - Multi-LoRA deployment routing: `--model <model_name>#<deployment_name>` (the `#` form routes the request to that LoRA adapter on the named deployment; quote it in the shell).
 
 ```bash
+# Evaluate on each locked eval set built in section 4 (shown: seed 42;
+# repeat with tasks_eval_1001 and tasks_eval_1002 for the full 96 tasks):
 META_BASE_URL=https://api.fireworks.ai/inference/v1 \
-META_MODEL_NAME='accounts/<your-account>/models/muse-glimmer-30b-lora' \
-python -m src.runner --tier frontier --reasoning-effort low --output-dir output/glimmer_lora
-python -m src.scorer output/glimmer_lora/results.json tasks_frontier_eval/answers
+META_MODEL_NAME='accounts/<your-account>/models/muse-glimmer-30b-lora-trace' \
+python -m src.runner --tasks-dir tasks_eval_42 --reasoning-effort low --output-dir output/glimmer_lora_42
+python -m src.scorer output/glimmer_lora_42/results.json tasks_eval_42/answers
 ```
 
 ### 6. Running Real Model Evaluation

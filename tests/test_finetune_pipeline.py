@@ -3,6 +3,7 @@ check, traces, and Fireworks SFT validation. No network, no Fireworks.
 """
 
 import json
+import re
 
 import pytest
 
@@ -48,6 +49,78 @@ class TestSeedSplit:
                 tmp_path / 'out', tier='frontier', seeds=[2001, 1001],
                 count=4, val_seeds=[1001])
 
+    def test_tasks_dir_without_seed_declaration_refused(self, tmp_path,
+                                                        monkeypatch,
+                                                        capsys):
+        # An undeclared tasks directory cannot bypass the locked-seed
+        # refusal: the CLI requires PATH@SEED.
+        import sys
+
+        from src.finetune_prep import main
+        tasks_dir = tmp_path / 'tasks78'
+        FrontierTaskGenerator(seed=78).generate_all_tasks(tasks_dir,
+                                                          num_tasks=4)
+        monkeypatch.setattr(sys, 'argv', [
+            'prep', '--tasks-dir', str(tasks_dir),
+            '--output-dir', str(tmp_path / 'out')])
+        assert main() == 1
+        assert '@SEED' in capsys.readouterr().out
+        assert not (tmp_path / 'out').exists()
+
+    def test_empty_exclude_seeds_refused_without_override(self, tmp_path):
+        # --exclude-seeds '' must not silently disable the lock.
+        with pytest.raises(ValueError, match='allow-eval-seeds'):
+            FineTunePrep().prepare(
+                tmp_path / 'out', tier='frontier', seeds=[2001],
+                count=4, exclude_seeds=[])
+        assert not (tmp_path / 'out').exists()
+
+    def test_allow_eval_seeds_override_warns_and_proceeds(self, tmp_path,
+                                                          capsys):
+        result = FineTunePrep().prepare(
+            tmp_path / 'out', tier='frontier', seeds=[42], count=4,
+            exclude_seeds=[], allow_eval_seeds=True)
+        assert result['num_train'] == 4
+        out = capsys.readouterr().out
+        assert 'WARNING' in out and '--allow-eval-seeds' in out
+
+    def test_no_args_refused_even_with_default_tasks_dir(self, tmp_path,
+                                                         monkeypatch):
+        # The implicit tasks/ default was generated at locked seed 42
+        # by generate_tasks; finetune_prep with no arguments must
+        # refuse rather than train on it sight-unseen.
+        import sys
+
+        from src.finetune_prep import main
+        from src.generate_tasks import TaskGenerator
+        TaskGenerator(seed=42).generate_all_tasks(tmp_path / 'tasks',
+                                                  num_tasks=8)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, 'argv', ['prep'])
+        assert main() == 1
+        assert not (tmp_path / 'finetune_data').exists()
+
+    def test_split_and_prepare_requires_declared_seed(self, tmp_path):
+        from src.generate_tasks import TaskGenerator
+        tasks_dir = tmp_path / 'tasks3001'
+        TaskGenerator(seed=3001).generate_all_tasks(tasks_dir,
+                                                    num_tasks=8)
+        with pytest.raises(ValueError, match='generation seed'):
+            FineTunePrep().split_and_prepare(tasks_dir, tmp_path / 'no')
+        assert not (tmp_path / 'no').exists()
+        result = FineTunePrep().split_and_prepare(
+            tasks_dir, tmp_path / 'yes', seed=3001)
+        assert result['num_train'] == 8
+
+    def test_allow_eval_seeds_silent_when_lock_intact(self, tmp_path,
+                                                      capsys):
+        # The override warning only fires when a locked seed is
+        # actually dropped from the exclusion list.
+        FineTunePrep().prepare(tmp_path / 'out', tier='frontier',
+                               seeds=[2001], count=4,
+                               allow_eval_seeds=True)
+        assert 'WARNING' not in capsys.readouterr().out
+
     def test_parse_seed_list(self):
         assert parse_seed_list('2001-2003,2007') == [2001, 2002, 2003,
                                                      2007]
@@ -91,6 +164,23 @@ class TestEvalHashCheck:
         with pytest.raises(ValueError, match='SHA-256'):
             FineTunePrep().prepare(
                 out, tasks_dirs=[(eval_dir, 99)], eval_dirs=[eval_dir])
+        assert not out.exists()
+
+    def test_validation_row_collision_refused(self, tmp_path):
+        # The hash check covers validation rows too: training tasks
+        # are disjoint here, the validation seed's tasks are the eval
+        # tasks themselves.
+        eval_dir = tmp_path / 'eval98'
+        FrontierTaskGenerator(seed=98).generate_all_tasks(eval_dir,
+                                                          num_tasks=8)
+        train_dir = tmp_path / 'train97'
+        FrontierTaskGenerator(seed=97).generate_all_tasks(train_dir,
+                                                          num_tasks=8)
+        out = tmp_path / 'out'
+        with pytest.raises(ValueError, match='in validation'):
+            FineTunePrep().prepare(
+                out, tasks_dirs=[(train_dir, 97), (eval_dir, 98)],
+                val_seeds=[98], eval_dirs=[eval_dir])
         assert not out.exists()
 
     def test_disjoint_eval_dirs_pass(self, tmp_path):
@@ -169,6 +259,28 @@ class TestTraceCorrectness:
             assert beta_b not in trace_a
 
 
+class TestTracePrecision:
+    def test_printed_cov_var_reproduce_window_betas(self):
+        # Intermediates are printed at enough precision to reproduce
+        # the final values; the final values themselves are unchanged.
+        gen = FrontierTaskGenerator(seed=7)
+        task, payload = gen.generate_task_rolling_risk()
+        steps, answer = build_trace_parts(
+            task, payload, task['expected'], max_tokens=None)
+        pairs = re.findall(
+            r"cov=([-\d.]+), var=([-\d.]+), beta=([-\d.]+)", steps)
+        assert len(pairs) == 4
+        # Fixed-point intermediates: no scientific notation anywhere.
+        assert not re.search(r"\d[eE][+-]\d", steps)
+        for i, (cov, var, beta) in enumerate(pairs, 1):
+            expected = task['expected'][f'window_beta_{i}']
+            assert float(cov) / float(var) == pytest.approx(
+                expected, abs=1e-6)
+            assert float(beta) == pytest.approx(expected, abs=1e-6)
+            assert answer[f'window_beta_{i}'] == pytest.approx(
+                expected, abs=1e-6)
+
+
 class TestFireworksValidation:
     def _rows(self, n=3, content='{"ok": true}'):
         return [{'messages': [
@@ -220,11 +332,53 @@ class TestFireworksValidation:
         assert main() == 0
         out = capsys.readouterr().out
         assert 'NOT executed' in out
-        assert 'firectl dataset create glimmer-sft' in out
+        assert 'firectl dataset create glimmer-sft-answer' in out
         assert '--base-model accounts/fireworks/models/' \
                'muse-glimmer-30b' in out
         assert '--lora-rank 16' in out and '--epochs 2' in out
-        assert '--evaluation-dataset glimmer-sft-eval' in out
+        assert '--max-context-length 32768' in out
+        assert '--evaluation-dataset glimmer-sft-answer-eval' in out
+        assert '--output-model muse-glimmer-30b-lora-answer' in out
+
+    def test_trace_target_gets_distinct_names(self, tmp_path,
+                                              monkeypatch, capsys):
+        import sys
+
+        from src.finetune import main
+        train = tmp_path / 'train.jsonl'
+        val = tmp_path / 'validation.jsonl'
+        for path in (train, val):
+            path.write_text("".join(json.dumps(r) + "\n"
+                                    for r in self._rows()))
+        monkeypatch.setattr(sys, 'argv', [
+            'finetune', '--train-file', str(train),
+            '--validation-file', str(val), '--target', 'trace'])
+        assert main() == 0
+        out = capsys.readouterr().out
+        assert 'firectl dataset create glimmer-sft-trace' in out
+        assert '--evaluation-dataset glimmer-sft-trace-eval' in out
+        assert '--output-model muse-glimmer-30b-lora-trace' in out
+
+    def test_target_manifest_mismatch_refused(self, tmp_path,
+                                              monkeypatch):
+        import sys
+
+        from src.finetune import main
+        train = tmp_path / 'train.jsonl'
+        val = tmp_path / 'validation.jsonl'
+        for path in (train, val):
+            path.write_text("".join(json.dumps(r) + "\n"
+                                    for r in self._rows()))
+        (tmp_path / 'manifest.json').write_text(
+            json.dumps({'target': 'trace'}))
+        monkeypatch.setattr(sys, 'argv', [
+            'finetune', '--train-file', str(train),
+            '--validation-file', str(val), '--target', 'answer'])
+        assert main() == 1
+        monkeypatch.setattr(sys, 'argv', [
+            'finetune', '--train-file', str(train),
+            '--validation-file', str(val), '--target', 'trace'])
+        assert main() == 0
 
     def test_main_rejects_overlong_rows(self, tmp_path, monkeypatch):
         import sys

@@ -50,24 +50,25 @@ jobs:
     
     - name: Test task generation (dry run)
       run: |
-        python -m src.generate_tasks
-        test -f tasks/tasks.json || exit 1
+        python -m src.generate_tasks --seed 3001 --output-dir tasks3001
+        python -m src.generate_tasks --seed 3002 --output-dir tasks3002
+        test -f tasks3001/tasks.json || exit 1
         echo "✓ Task generation successful"
-    
+
     - name: Test runner (dry run)
       run: |
-        python -m src.runner --dry-run --limit 3
+        python -m src.runner --dry-run --limit 3 --tasks-dir tasks3001
         test -f output/results.json || exit 1
         echo "✓ Runner dry-run successful"
-    
+
     - name: Test scorer
       run: |
-        python -m src.scorer output/results.json
+        python -m src.scorer output/results.json tasks3001/answers
         echo "✓ Scorer successful"
-    
+
     - name: Test fine-tune prep
       run: |
-        python -m src.finetune_prep
+        python -m src.finetune_prep --tasks-dir tasks3001@3001 --tasks-dir tasks3002@3002 --val-seeds 3002
         test -f finetune_data/train.jsonl || exit 1
         test -f finetune_data/validation.jsonl || exit 1
         echo "✓ Fine-tune prep successful"

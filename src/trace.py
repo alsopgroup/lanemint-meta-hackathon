@@ -17,6 +17,7 @@ steps in ``reasoning_content``.
 
 import io
 import json
+import math
 import re
 
 import numpy as np
@@ -119,7 +120,17 @@ def _aligned(frames, logs=None):
 
 
 def _f(x) -> str:
-    return f"{float(x):.6f}"
+    """Intermediate values at 10 significant digits in fixed-point
+    (never scientific notation): enough for a reader to reproduce the
+    final (6-decimal) values from the printed cov/var, drawdown and
+    OLS intermediates. The final answer values themselves are rounded
+    to 6 decimals when the answer is built, independently of this
+    formatting."""
+    x = float(x)
+    if x == 0:
+        return "0"
+    decimals = min(max(9 - math.floor(math.log10(abs(x))), 0), 15)
+    return f"{x:.{decimals}f}"
 
 
 def _cap_steps(steps: str, max_tokens: int) -> str:
