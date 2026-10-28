@@ -32,7 +32,7 @@
     </div>
     <nav class="main-nav">
       <a href="#app">Try it</a>
-      <a href="#benchmark">Benchmark</a>
+      <a href="#leaderboard">Leaderboard</a>
       <a href="#how">How it works</a>
     </nav>
   </div>
@@ -72,29 +72,20 @@
   </div>
 </section>
 
-<section id="benchmark" class="benchmark-section">
+<section id="leaderboard" class="leaderboard-section">
   <div class="section-inner">
     <div class="benchmark-head">
       <div class="benchmark-intro">
-        <span class="eyebrow">Benchmark · seed 42 · 25 easy + 25 hard tasks</span>
-        <h2>Easy is close to solved. Hard separates the models.</h2>
-        <p>A task passes only when the problem set is exactly right (F1 = 1.0) and the overall score is ≥ 0.8, with numeric fields within tolerance.</p>
+        <span class="eyebrow" id="lbEyebrow">Leaderboard · frontier tier · held-out seeds</span>
+        <h2>The frontier tier is the real test.</h2>
+        <p id="lbIntro">Held-out frontier results, pooled across seeds the models never trained on. A task passes only when the problem set is exactly right and the core numbers are within tolerance.</p>
       </div>
-      <span class="badge badge-md badge-mono"><span class="badge-dot" style="background:var(--status-info)"></span>v4 run · 2026-10-26</span>
+      <span class="badge badge-md badge-mono"><span class="badge-dot" style="background:var(--status-info)"></span><span id="lbUpdated">held-out run</span></span>
     </div>
-    <div class="bench-overall" id="benchOverall"></div>
-    <div class="bench-baselines">
-      <span><span class="baseline-tick"></span>Fixed-guess baseline: <span class="mono">17/25</span> easy, <span class="mono">2/25</span> hard</span>
-      <span>Solver reference: <span class="mono">25/25</span> both tiers</span>
-      <span>Total run cost: <span class="mono">$4.48</span></span>
+    <div class="panel lb-panel">
+      <div id="leaderboardBody"><p class="lb-loading">Loading leaderboard…</p></div>
     </div>
-    <div class="panel bench-types-panel">
-      <div class="bench-types-head">
-        <span class="card-label">Pass rate by task type</span>
-        <div class="bench-legend" id="benchLegend"></div>
-      </div>
-      <div id="benchTiers"></div>
-    </div>
+    <div class="lb-notes" id="leaderboardNotes"></div>
   </div>
 </section>
 
