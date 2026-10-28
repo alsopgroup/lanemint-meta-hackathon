@@ -614,29 +614,44 @@ class TaskScorer:
         # headline computation must be right, not just the codes and
         # secondary fields (codes plus secondary fields alone could
         # otherwise reach 0.8 with the core value guessed as 0.0).
-        core_ok = True
-        for field in ('reconciled_total_return', 'reconciled_max_drawdown',
-                      'final_return', 'beta_market', 'beta_sector',
-                      'r_squared'):
-            if field in expected and scores.get(field, 0.0) < 1.0:
-                core_ok = False
-        # Frontier F1's cores are the four window betas and the
-        # final-window volatility (identified by window_beta_1; the
-        # hard tier's unrelated beta tasks are unaffected).
+        core_fields = [f for f in (
+            'reconciled_total_return', 'reconciled_max_drawdown',
+            'final_return', 'beta_market', 'beta_sector', 'r_squared')
+            if f in expected]
+        # Frontier F1's cores are the window betas and the final-window
+        # volatility (identified by window_beta_1; the hard tier's
+        # unrelated beta tasks are unaffected). Only the fields the
+        # answer key actually carries are required: keys written before
+        # the fourth window was added have window_beta_1..3 only, and a
+        # matching 3-window answer must still pass against them.
         if 'window_beta_1' in expected:
-            core_ok = core_ok and all(
-                scores.get(f, 0.0) >= 1.0 for f in (
-                    'window_beta_1', 'window_beta_2', 'window_beta_3',
-                    'window_beta_4', 'final_window_volatility'))
+            core_fields += [f for f in (
+                'window_beta_1', 'window_beta_2', 'window_beta_3',
+                'window_beta_4', 'final_window_volatility')
+                if f in expected]
         # Frontier F4's max_drawdown is core too (identified by the
         # accompanying first_rebalance_value; pilot passes had it wrong
         # while reaching 0.8 overall). The hard tier's standalone
         # max_drawdown tasks have no first_rebalance_value and keep
         # their existing pass rule.
         if 'max_drawdown' in expected and 'first_rebalance_value' in expected:
-            core_ok = core_ok and scores.get('max_drawdown', 0.0) >= 1.0
+            core_fields.append('max_drawdown')
+        core_failed = [f for f in core_fields
+                       if scores.get(f, 0.0) < 1.0]
+        core_ok = not core_failed
+        if core_failed:
+            feedback.append(
+                f"Core field(s) not correct: {', '.join(core_failed)}")
+        passed = overall >= 0.8 and problems_ok and core_ok
+        if not passed and not feedback:
+            # A failure must never read as success: if no per-field or
+            # core message explains it, say so explicitly rather than
+            # falling through to 'All checks passed'.
+            feedback.append(
+                "Failed: score, problem-set or core-field requirement "
+                "not met")
         result = {'task_id': task_id,
-                  'passed': overall >= 0.8 and problems_ok and core_ok,
+                  'passed': passed,
                   'score': round(overall, 3), 'component_scores': scores,
                   'feedback': '; '.join(feedback) if feedback else 'All checks passed',
                   'analysis_flags': ['no_attempt']

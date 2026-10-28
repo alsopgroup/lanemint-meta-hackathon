@@ -715,5 +715,48 @@ class TestNonDictResponses:
         assert summary['passed'] == 1
 
 
+class TestWindowCoreKeyCompatibility:
+    """The F1 core check requires only the window fields the answer
+    key actually carries: keys written before the fourth window was
+    added (window_beta_1..3) must not fail a matching answer, and a
+    failing task must never report 'All checks passed'."""
+
+    LEGACY_KEY = {'window_beta_1': 0.9, 'window_beta_2': 1.0,
+                  'window_beta_3': 1.1, 'final_window_volatility': 0.2,
+                  'target_asset': 'AST1', 'num_assets': 2,
+                  'num_aligned_days': 119,
+                  'problems_found': ['duplicate_2021-05-07']}
+    ANSWER = {'problems': ['duplicate'], 'window_beta_1': 0.9,
+              'window_beta_2': 1.0, 'window_beta_3': 1.1,
+              'final_window_volatility': 0.2, 'target_asset': 'AST1',
+              'num_assets': 2, 'num_aligned_days': 119}
+
+    def _score(self, tmp_path, key, answer):
+        import json as _json
+        (tmp_path / 'task_f_2001_answer.json').write_text(_json.dumps(key))
+        scorer = TaskScorer(tmp_path)
+        return scorer.score_task('task_f_2001', _json.dumps(answer))
+
+    def test_legacy_three_window_key_passes(self, tmp_path):
+        result = self._score(tmp_path, self.LEGACY_KEY, self.ANSWER)
+        assert result['passed']
+        assert result['score'] == 1.0
+        assert result['feedback'] == 'All checks passed'
+
+    def test_four_window_key_missing_beta_4_fails_with_message(self, tmp_path):
+        key = {**self.LEGACY_KEY, 'window_beta_4': 0.8}
+        result = self._score(tmp_path, key, self.ANSWER)  # no beta_4
+        assert not result['passed']
+        assert 'window_beta_4' in result['feedback']
+        assert 'All checks passed' not in result['feedback']
+
+    def test_legacy_key_wrong_window_beta_fails_with_message(self, tmp_path):
+        answer = {**self.ANSWER, 'window_beta_2': 0.5}
+        result = self._score(tmp_path, self.LEGACY_KEY, answer)
+        assert not result['passed']
+        assert 'window_beta_2' in result['feedback']
+        assert 'All checks passed' not in result['feedback']
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
