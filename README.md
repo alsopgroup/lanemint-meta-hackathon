@@ -202,7 +202,7 @@ Build a Fireworks SFT dataset with `src/finetune_prep.py`. Tasks are generated i
 # train on 2001-2036, validate on 2037-2040. Eval sets (seeds
 # 42/1001/1002, generated separately) guard against contamination.
 python -m src.finetune_prep --tier frontier --seeds 2001-2040 --count 32 \
-    --val-seeds 2037-2040 --eval-dirs tasks_eval_42 tasks_eval_1001 tasks_eval_1002 \
+    --val-seeds 2037-2040 --eval-dirs tasks_eval_42 --eval-dirs tasks_eval_1001 --eval-dirs tasks_eval_1002 \
     --target trace --output-dir finetune_data
 ```
 
