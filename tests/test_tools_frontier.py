@@ -228,12 +228,27 @@ class TestConstraintLint:
                         continue
                     by_ticker = defaultdict(list)
                     for row in rows:
-                        by_ticker[row["ticker"]].append(float(row["close"]))
-                    for ticker, closes in by_ticker.items():
-                        assert len(closes) >= 100, (task["id"], name, ticker)
-                        assert all(a != b for a, b in
-                                   zip(closes, closes[1:], strict=False)), \
-                            (task["id"], name, ticker)
+                        by_ticker[row["ticker"]].append(
+                            (row["date"], float(row["close"])))
+                    for ticker, pairs in by_ticker.items():
+                        # Consecutive means consecutive trading dates in
+                        # date order: one T1 ticker's rows are deliberately
+                        # shuffled in the file (so sort first), and vendor
+                        # files have one-vendor gap dates, across which a
+                        # repeated value is not a consecutive repeat.
+                        from datetime import datetime as _dt
+                        ordered = sorted(pairs)
+                        assert len(ordered) >= 100, (task["id"], name, ticker)
+                        for (d1, c1), (d2, c2) in zip(
+                                ordered, ordered[1:], strict=False):
+                            day1 = _dt.strptime(d1, "%Y-%m-%d")
+                            day2 = _dt.strptime(d2, "%Y-%m-%d")
+                            weekdays_between = sum(
+                                1 for k in range(1, (day2 - day1).days)
+                                if (day1.fromordinal(day1.toordinal() + k)
+                                    .weekday() < 5))
+                            if d1 != d2 and weekdays_between == 0:
+                                assert c1 != c2, (task["id"], name, ticker)
 
     def test_eval_seeds_blocked_without_eval_flag(self):
         assert EVAL_SEEDS == frozenset({42, 1001, 1002})
@@ -254,6 +269,128 @@ class TestConstraintLint:
                     assert expected["num_splits"] >= 1
                 else:
                     assert "splits.csv" not in task["files"]
+
+
+# ------------------------------------------------------- calibration fixes
+
+class TestCalibrationFixes:
+    """Regression tests for the 7101/7102 calibration findings."""
+
+    def test_drawdown_sign_convention_stated_and_enforced(
+            self, dev_sets, tmp_path):
+        # Every memo that asks for a drawdown states the sign convention.
+        root = dev_sets[7001]
+        seen = set()
+        for task in _tasks(root):
+            spec = (root / task["data_dir"] / "spec.md").read_text()
+            expected = json.loads(
+                (root / "answers" / f"{task['id']}_answer.json").read_text())
+            if any(k in expected for k in ("max_drawdown", "nav_max_drawdown")):
+                assert "negative fraction" in spec, task["type"]
+                seen.add(task["type"])
+        assert len(seen) == 4  # T2 (NAV), T3, T4, T5
+        # The scorer accepts only the stated convention: a positive
+        # drawdown scores 0 even within tolerance of a near-zero key.
+        answer = {
+            "max_drawdown": -0.000001, "final_nav": 10.0,
+            "_tools_frontier": {"family": "x", "core": ["max_drawdown"],
+                                "rtol": 1e-6, "atol": 2e-6, "field_rtol": {}},
+        }
+        (tmp_path / "task_tf_9001_answer.json").write_text(json.dumps(answer))
+        scorer = TaskScorer(tmp_path)
+        good = scorer.score_task("task_tf_9001", json.dumps(
+            {"max_drawdown": -0.000001, "final_nav": 10.0}))
+        flipped = scorer.score_task("task_tf_9001", json.dumps(
+            {"max_drawdown": 0.000001, "final_nav": 10.0}))
+        assert good["passed"]
+        assert flipped["component_scores"]["max_drawdown"] == 0.0
+        assert not flipped["passed"]
+
+    def test_memos_list_exact_allowed_codes(self, dev_sets):
+        root = dev_sets[7001]
+        by_type = {}
+        for task in _tasks(root):
+            by_type.setdefault(task["type"],
+                               (root / task["data_dir"] / "spec.md").read_text())
+        t3 = by_type["tools_frontier_reconciliation"]
+        assert "may contain only: source_conflict, unit_change" in t3
+        # The one-vendor date rule is stated precisely in the memo.
+        assert "present in only one vendor is" in t3 and "NOT missing" in t3
+        t4 = by_type["tools_frontier_split_holdings"]
+        assert "may contain only: split, reverse_split" in t4
+        assert "Split-table rows DO count as problems" in t4
+
+    def test_t5_sector_caps_enforced_bind_and_cash_rules(self, dev_sets):
+        total = binding = 0
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_portfolio_construction":
+                    continue
+                total += 1
+                task_dir = root / task["data_dir"]
+                cfg = json.loads((task_dir / "constraints.json").read_text())
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                weights = expected["weights_first_rebalance"]
+                for sector, cap in cfg["sector_caps"].items():
+                    ssum = sum(w for t, w in weights.items()
+                               if cfg["sectors"][t] == sector)
+                    assert ssum <= cap + 2e-3, (task["id"], sector, ssum, cap)
+                    if abs(ssum - cap) <= 2e-3:
+                        binding += 1
+                        break
+                # Cash can never go negative, and every post-first
+                # turnover is the actual one and within the cap.
+                assert expected["cash_left"] >= 0
+                turnovers = list(expected["turnover_by_rebalance"].values())
+                assert all(t <= cfg["turnover_cap"] + 1e-6
+                           for t in turnovers[1:]), task["id"]
+        assert total == 60
+        # Caps are constructed to bind at the first rebalance.
+        assert binding >= 48, binding
+
+    def test_rounded_and_unrounded_correct_values_both_pass(self, dev_sets):
+        root = dev_sets[7001]
+        scorer = TaskScorer(root / "answers")
+        task = _tasks(root)[0]  # T1
+        got = solve_task(task, root)
+        assert scorer.score_task(task["id"], json.dumps(got))["passed"]
+        # A correct value left unrounded sits within 5e-7 of the stored
+        # 6-decimal key; it must pass just like the rounded value.
+        field = "ann_vol_AST1"
+        nudged = dict(got)
+        nudged[field] = got[field] + 5e-7
+        result = scorer.score_task(task["id"], json.dumps(nudged))
+        assert result["component_scores"][field] == 1.0
+        assert result["passed"]
+
+    def test_t1_t2_hardening_fields_and_pitfalls(self, dev_sets):
+        root = dev_sets[7001]
+        t1 = next(t for t in _tasks(root)
+                  if t["type"] == "tools_frontier_convention_risk")
+        t2 = next(t for t in _tasks(root)
+                  if t["type"] == "tools_frontier_fx_calendar")
+        exp1 = json.loads((root / "answers" / f"{t1['id']}_answer.json").read_text())
+        exp2 = json.loads((root / "answers" / f"{t2['id']}_answer.json").read_text())
+        assert {"rolling2_max_beta", "downside_volatility",
+                "log_return_correlation",
+                "weekly_annualised_log_return"} <= set(exp1)
+        assert {"effective_fx_rate_mid_probe", "max_nav_value",
+                "max_nav_date", "nav_max_drawdown"} <= set(exp2)
+        # Weekend prints exist in T1 prices and are excluded by calendar.
+        import csv as csv_mod
+        cal = {r["date"] for r in csv_mod.DictReader(
+            open(root / t1["data_dir"] / "calendar.csv"))}
+        price_dates = {r["date"] for r in csv_mod.DictReader(
+            open(root / t1["data_dir"] / "prices.csv"))}
+        assert price_dates - cal
+        # T2 stamps include the after-midnight +01:00 form in some task.
+        stamps = []
+        for task in _tasks(root):
+            if task["type"] == "tools_frontier_fx_calendar":
+                stamps += [r["timestamp"] for r in csv_mod.DictReader(
+                    open(root / task["data_dir"] / "fx.csv"))]
+        assert any(s.endswith("T00:30:00+01:00") for s in stamps)
 
 
 # ---------------------------------------------------------------- check 5

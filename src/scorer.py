@@ -611,7 +611,15 @@ class TaskScorer:
                         or isinstance(actual_val, bool):
                     scores[field] = 0.0
                     feedback.append(f"{field}: not a number")
-                elif self.compare_float(actual_val, exp_val, tolerance):
+                elif self.compare_float(actual_val, exp_val, tolerance) \
+                        and not (tf_schema is not None
+                                 and field in ('max_drawdown', 'nav_max_drawdown')
+                                 and actual_val > 0):
+                    # Tools-frontier memos state the drawdown sign
+                    # convention explicitly: a negative fraction (0.0
+                    # only when the path never falls). A positive value
+                    # uses the opposite convention and never scores, even
+                    # within tolerance of a near-zero key.
                     scores[field] = 1.0
                 else:
                     scores[field] = 0.0

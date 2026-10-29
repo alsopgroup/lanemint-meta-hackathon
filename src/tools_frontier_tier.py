@@ -51,8 +51,14 @@ FAMILY_TYPES = {
 }
 
 # Core-field scoring tolerances (see src/scorer.py schema handling).
+# The memo instructs 6-decimal reporting, so the absolute tolerance is
+# 2e-6: a value that is correct when rounded to 6 decimals and the same
+# value left unrounded must both pass (their distance from the stored,
+# 6-decimal key is at most 1e-6, and 2e-6 gives that rule a clean margin
+# without opening a gap any wrong-method variant has been measured to fit
+# through -- the discriminator gate below uses 50x this tolerance).
 _RTOL = 1e-6
-_ATOL = 1e-8
+_ATOL = 2e-6
 
 
 # --------------------------------------------------------------------------
@@ -320,6 +326,33 @@ class ToolsFrontierTaskGenerator:
             excess = [r - rf_daily for r in rets]
             return _mean(excess) / _std(excess, 1) * math.sqrt(252)
 
+        # Second rolling section: a different asset, window and step.
+        rb2 = rolling_betas(simple[assets[1]], simple[bench_name], 15, 1)
+        max_beta2, max_end2 = max(rb2, key=lambda p: p[0])
+        downside_rets = simple[assets[2]]
+        downside_vol = math.sqrt(
+            _mean([min(r, 0.0) ** 2 for r in downside_rets])) * math.sqrt(252)
+        log_a = _returns(series[assets[0]], "log")
+        log_b = _returns(series[bench_name], "log")
+        log_corr = _cov(log_a, log_b, 1) / (_std(log_a, 1) * _std(log_b, 1))
+        weekly_a = _returns(weekly_closes(assets[0]), "log")
+        weekly_ann = _mean(weekly_a) * 52
+
+        # Pitfall rows that only appear on inspection: weekend prints for
+        # the first asset (their dates are absent from calendar.csv and
+        # the memo excludes them) and, below, one ticker's rows shuffled.
+        weekend_points = []
+        for idx in rng.sample(range(20, rows - 20), 3):
+            saturday = dates[idx] + timedelta(days=1)
+            while saturday.weekday() != 5:
+                saturday += timedelta(days=1)
+            weekend_points.append(
+                (saturday, round(series[assets[0]][idx] * (1 + rng.uniform(-0.03, 0.03)), 2)))
+        interleaved = sorted(
+            [(d, c) for d, c in zip(dates, series[assets[0]], strict=True)]
+            + weekend_points)
+        weekend_ann_vol = _ann_vol([c for _d, c in interleaved], "simple", 252, 1)
+
         expected = {
             f"ann_vol_{a}": round(_ann_vol(series[a], *vol_spec[a]), 6)
             for a in assets
@@ -327,15 +360,27 @@ class ToolsFrontierTaskGenerator:
         expected.update({
             "rolling_max_beta": round(max_beta, 6),
             "rolling_max_beta_end_date": end_date,
+            "rolling2_max_beta": round(max_beta2, 6),
+            "rolling2_max_beta_end_date": _dstr(dates[max_end2 + 1]),
             "weekly_tracking_error": round(weekly_te("log", 0, 52), 6),
             "ewma_vol_last": round(ewma_vol(assets[2], 0.94), 6),
             "sharpe_ratio": round(sharpe(assets[1], "simple"), 6),
+            "downside_volatility": round(downside_vol, 6),
+            "log_return_correlation": round(log_corr, 6),
+            "weekly_annualised_log_return": round(weekly_ann, 6),
             "num_aligned_days": rows,
-            "num_return_days": rows - 1,
         })
         core = [f"ann_vol_{a}" for a in assets] + [
             "rolling_max_beta", "rolling_max_beta_end_date",
-            "weekly_tracking_error", "ewma_vol_last", "sharpe_ratio"]
+            "rolling2_max_beta", "rolling2_max_beta_end_date",
+            "weekly_tracking_error", "ewma_vol_last", "sharpe_ratio",
+            "downside_volatility", "log_return_correlation",
+            "weekly_annualised_log_return"]
+
+        def _corr(kind):
+            ra = _returns(series[assets[0]], kind)
+            rbk = _returns(series[bench_name], kind)
+            return _cov(ra, rbk, 1) / (_std(ra, 1) * _std(rbk, 1))
 
         naive = {
             f"ann_vol_{a}": round(_ann_vol(series[a], "simple", 252, 1), 6)
@@ -344,10 +389,19 @@ class ToolsFrontierTaskGenerator:
         naive.update({
             "rolling_max_beta": expected["rolling_max_beta"],
             "rolling_max_beta_end_date": end_date,
+            "rolling2_max_beta": round(max(
+                rolling_betas(simple[assets[1]], simple[bench_name], 15, 15),
+                key=lambda p: p[0])[0], 6),
+            "rolling2_max_beta_end_date": expected["rolling2_max_beta_end_date"],
             "weekly_tracking_error": round(weekly_te("simple", 1, 252), 6),
             "ewma_vol_last": round(_ann_vol(series[assets[2]], "simple", 252, 1), 6),
             "sharpe_ratio": round(sharpe(assets[1], "log"), 6),
-            "num_aligned_days": rows, "num_return_days": rows - 1,
+            "downside_volatility": round(
+                _ann_vol(series[assets[2]], "simple", 252, 1), 6),
+            "log_return_correlation": round(_corr("simple"), 6),
+            "weekly_annualised_log_return": round(
+                _mean(_returns(weekly_closes(assets[0]), "simple")) * 52, 6),
+            "num_aligned_days": rows,
         })
         nonoverlap = rolling_betas(simple[target], simple[bench_name], window, window)
         no_beta, no_end = max(nonoverlap, key=lambda p: p[0])
@@ -355,12 +409,24 @@ class ToolsFrontierTaskGenerator:
         variant_nonoverlap.update({
             "rolling_max_beta": round(no_beta, 6),
             "rolling_max_beta_end_date": _dstr(dates[no_end + 1])})
+        variant_weekend = dict(expected)
+        variant_weekend[f"ann_vol_{assets[0]}"] = round(weekend_ann_vol, 6)
         variants = {"naive_simple_252": naive,
-                    "nonoverlapping_rolling": variant_nonoverlap}
+                    "nonoverlapping_rolling": variant_nonoverlap,
+                    "weekend_prints_included": variant_weekend}
 
         rows_out = []
         for ticker in assets + [bench_name]:
-            rows_out += _price_rows(ticker, dates, series[ticker], rng)
+            ticker_rows = _price_rows(ticker, dates, series[ticker], rng)
+            if ticker == assets[0]:
+                for day, close in weekend_points:
+                    ticker_rows.append(_price_rows(ticker, [day], [close], rng)[0])
+                ticker_rows.sort(key=lambda r: r[0])
+            if ticker == assets[1]:
+                # Row order in the file is not date order for this
+                # ticker; the memo requires sorting before any use.
+                rng.shuffle(ticker_rows)
+            rows_out += ticker_rows
         spec = f"""# Methodology memo - convention-switch risk report (T1)
 
 Desk default: simple returns, 252 periods per year, sample statistics
@@ -375,6 +441,17 @@ section only; honour the governing clause for each field.
 - weekly_tracking_error: asset={assets[1]}; benchmark={bench_name}; resample=W-FRI last close; return=log; periods_per_year=52; ddof=0
 - ewma_vol: asset={assets[2]}; return=simple; lambda=0.94; periods_per_year=252; seed_variance=first_return_squared
 - sharpe: asset={assets[1]}; return=simple; annual_rf={rf_annual}; periods_per_year=252; ddof=1
+- rolling_beta2: asset={assets[1]}; benchmark={bench_name}; window=15; step=1; return=simple; ddof=1
+- downside_vol: asset={assets[2]}; return=simple; periods_per_year=252
+- log_correlation: asset={assets[0]}; benchmark={bench_name}
+- weekly_annualised_log_return: asset={assets[0]}; resample=W-FRI last close; periods_per_year=52
+
+## Data rules (read before computing)
+- calendar.csv lists the trading dates. prices.csv can contain rows on
+  dates that are not in calendar.csv (weekend prints); exclude every row
+  whose date is not in calendar.csv before any computation.
+- Row order inside prices.csv is not guaranteed to be date order.
+  Sort each ticker by date before computing anything.
 
 ## Sections
 1. Annualised volatility per asset per its convention-table row:
@@ -393,9 +470,23 @@ section only; honour the governing clause for each field.
 5. Sharpe ratio: daily risk-free rate is (1 + annual_rf)^(1/252) - 1
    (the stated compounding); excess simple returns over that rate;
    mean(excess) / std(excess, ddof=1) * sqrt(252).
+6. Rolling beta, second section: overlapping windows of 15 consecutive
+   simple returns of {assets[1]} against {bench_name}, advancing by 1
+   return. Report the largest window beta and its end date (same
+   end-date rule as section 2). This section's window and step override
+   section 2's.
+7. Downside volatility of {assets[2]}: sqrt(mean over ALL simple returns
+   of min(return, 0)^2) * sqrt(252). The denominator is the count of all
+   returns, not the count of negative returns.
+8. Log-return correlation between {assets[0]} and {bench_name} over the
+   full sample of log returns (ddof cancels; report the correlation).
+9. Weekly annualised log return of {assets[0]}: mean of the log weekly
+   returns (W-FRI last close, as in section 3) times 52. This is a mean
+   log return, not a compounded growth rate.
 
-Prices are in prices.csv (date,ticker,open,high,low,close,volume) and are
-already clean and aligned on {rows} business days.
+Prices are in prices.csv (date,ticker,open,high,low,close,volume);
+after the data rules above are applied the series align on {rows}
+business days.
 """
         cal_rows = [[_dstr(d), "true"] for d in dates]
         files = {"prices.csv": _csv(
@@ -424,21 +515,29 @@ already clean and aligned on {rows} business days.
         eu_series = {t: make_series(eu_dates) for t in eu_assets}
         holdings = {t: rng.randrange(100, 900, 25) for t in us_assets + eu_assets}
 
-        # FX fixes on the union calendar; a contiguous segment is quoted
-        # inverted, flagged only by the quote column.
+        # FX fixes on the union calendar; two separate segments are
+        # quoted inverted, flagged only by the quote column.
         union_dates = sorted(set(us_dates) | set(eu_dates))
-        inv_start = rng.randint(50, 70)
-        inv_end = inv_start + rng.randint(20, 35)
+        inv1 = (rng.randint(35, 55), 0)
+        inv1 = (inv1[0], inv1[0] + rng.randint(15, 25))
+        inv2 = (rng.randint(110, 130), 0)
+        inv2 = (inv2[0], inv2[0] + rng.randint(15, 25))
         base_rate, fx_rows, fx_info = 1.08, [], {}
         for i, day in enumerate(union_dates):
             base_rate = max(0.7, base_rate * (1 + rng.gauss(0, 0.004)))
-            inverted = inv_start <= i < inv_end
+            inverted = (inv1[0] <= i < inv1[1]) or (inv2[0] <= i < inv2[1])
             quote = "USDEUR" if inverted else "EURUSD"
             rate = (1 / base_rate) if inverted else base_rate
-            form = rng.choice(["+00:00", "Z", "+01:00"])
+            form = rng.choice(["+00:00", "Z", "+01:00", "midnight+01"])
             hour_utc = rng.choice([7, 12, 15, 17])
-            # Render the instant in the chosen offset form.
-            if form == "Z":
+            # Render the instant in the chosen offset form.  The
+            # "midnight+01" form is stamped 00:30 local on the NEXT
+            # calendar day, which is 23:30 UTC on the trade date itself:
+            # its date string is not its UTC (trade) date.
+            if form == "midnight+01":
+                stamp = f"{_dstr(day + timedelta(days=1))}T00:30:00+01:00"
+                utc_hour = 23
+            elif form == "Z":
                 stamp = f"{_dstr(day)}T{hour_utc:02d}:30:00Z"
                 utc_hour = hour_utc
             elif form == "+01:00":
@@ -450,31 +549,54 @@ already clean and aligned on {rows} business days.
             fx_rows.append([stamp, quote, f"{rate:.6f}"])
             # Answers must be computed from the rate as written to the
             # file (6 decimals), not the unrounded internal walk.
-            fx_info[_dstr(day)] = (round(rate, 6), quote, utc_hour)
+            # fx_info also keeps the stamp's own date string, for the
+            # local-date trap variant below.
+            fx_info[_dstr(day)] = (round(rate, 6), quote, utc_hour, stamp[:10])
+        # Weekend FX prints: real rows in the file, on dates that are
+        # not union trade dates.  The memo says to ignore them; using
+        # one as a "previous fix" corrupts the next trade date.
+        weekend_source = [d for d in union_dates if d.weekday() == 4][:4]
+        for friday in weekend_source:
+            saturday = friday + timedelta(days=1)
+            fx_rows.append([f"{_dstr(saturday)}T10:00:00Z", "EURUSD", "9.999999"])
 
         cutoff = 16
 
-        def effective_rates(use_prev_after_cutoff=True, fix_inversion=True):
+        def effective_rates(use_prev_after_cutoff=True, fix_inversion=True,
+                            key_by_stamp_date=False):
             out, prev = {}, None
             for day in union_dates:
-                rate, quote, utc_hour = fx_info[_dstr(day)]
+                rate, quote, utc_hour, stamp_date = fx_info[_dstr(day)]
                 eff = rate if quote == "EURUSD" else (1 / rate if fix_inversion else rate)
                 chosen = eff
                 if use_prev_after_cutoff and utc_hour > cutoff and prev is not None:
                     chosen = prev
-                out[_dstr(day)] = chosen
+                # Trap variant: file fixes by the stamp's own date string
+                # instead of the UTC date (midnight+01 rows shift a day).
+                out[stamp_date if key_by_stamp_date else _dstr(day)] = chosen
                 prev = eff
+            if key_by_stamp_date:
+                filled, prev = {}, None
+                for day in union_dates:
+                    if _dstr(day) in out:
+                        prev = out[_dstr(day)]
+                    filled[_dstr(day)] = prev if prev is not None else 1.0
+                return filled
             return out
+
+        us_idx = {t: {_dstr(d): c for d, c in zip(us_dates, us_series[t], strict=True)}
+                  for t in us_assets}
+        eu_idx = {t: {_dstr(d): c for d, c in zip(eu_dates, eu_series[t], strict=True)}
+                  for t in eu_assets}
+
+        def eu_sleeve(ds, eff_map):
+            return sum(holdings[t] * eu_idx[t][ds] * eff_map[ds] for t in eu_assets)
 
         def nav_series(eff, calendar="inner"):
             if calendar == "inner":
                 days = sorted(set(us_dates) & set(eu_dates))
             else:
                 days = union_dates
-            us_idx = {t: {_dstr(d): c for d, c in zip(us_dates, us_series[t], strict=True)}
-                      for t in us_assets}
-            eu_idx = {t: {_dstr(d): c for d, c in zip(eu_dates, eu_series[t], strict=True)}
-                      for t in eu_assets}
             navs, last_us, last_eu = {}, {}, {}
             for day in days:
                 ds = _dstr(day)
@@ -501,15 +623,25 @@ already clean and aligned on {rows} business days.
         navs_const = nav_series(const_eff)
         fx_contrib = total_ret - (navs_const[last] / navs_const[first] - 1)
 
+        max_nav_date = max(inner_dates, key=lambda d: navs[d])
+        nav_dd, _trough = _max_drawdown([navs[d] for d in inner_dates])
+        eu_field = f"eu_sleeve_usd_{probe[-1].replace('-', '')}"
         expected = {f"nav_{d.replace('-', '')}": round(navs[d], 6) for d in probe}
         expected.update({
             "total_return_usd": round(total_ret, 6),
             "fx_pnl_contribution": round(fx_contrib, 6),
             "dates_dropped_by_alignment": len(union_dates) - len(inner_dates),
+            "effective_fx_rate_mid_probe": round(eff[probe[1]], 6),
+            eu_field: round(eu_sleeve(probe[-1], eff), 6),
+            "max_nav_value": round(navs[max_nav_date], 6),
+            "max_nav_date": max_nav_date,
+            "nav_max_drawdown": round(nav_dd, 6),
             "num_inner_days": len(inner_dates),
         })
-        core = list(expected)[:3] + ["total_return_usd", "fx_pnl_contribution",
-                                     "dates_dropped_by_alignment"]
+        core = list(expected)[:3] + [
+            "total_return_usd", "fx_pnl_contribution",
+            "dates_dropped_by_alignment", "effective_fx_rate_mid_probe",
+            eu_field, "max_nav_value", "max_nav_date", "nav_max_drawdown"]
 
         def variant_answer(eff_v, calendar="inner"):
             n = nav_series(eff_v, calendar)
@@ -518,11 +650,19 @@ already clean and aligned on {rows} business days.
             for d in probe:
                 out[f"nav_{d.replace('-', '')}"] = round(n.get(d, 0.0), 6)
             c = nav_series(dict.fromkeys(eff_v, eff_v[ks[0]]), calendar)
+            v_max_date = max(ks, key=lambda d: n[d])
+            v_dd, _t = _max_drawdown([n[d] for d in ks])
             out.update({
                 "total_return_usd": round(n[ks[-1]] / n[ks[0]] - 1, 6),
                 "fx_pnl_contribution": round(
                     (n[ks[-1]] / n[ks[0]] - 1) - (c[ks[-1]] / c[ks[0]] - 1), 6),
                 "dates_dropped_by_alignment": len(union_dates) - len(ks),
+                "effective_fx_rate_mid_probe": round(eff_v.get(probe[1], 0.0), 6),
+                eu_field: round(eu_sleeve(probe[-1], eff_v), 6)
+                if probe[-1] in eu_idx[eu_assets[0]] and probe[-1] in eff_v else 0.0,
+                "max_nav_value": round(n[v_max_date], 6),
+                "max_nav_date": v_max_date,
+                "nav_max_drawdown": round(v_dd, 6),
                 "num_inner_days": len(ks)})
             return out
 
@@ -532,6 +672,8 @@ already clean and aligned on {rows} business days.
             "no_inversion_fix": variant_answer(effective_rates(fix_inversion=False)),
             "same_day_fix_after_cutoff": variant_answer(
                 effective_rates(use_prev_after_cutoff=False)),
+            "fx_filed_by_stamp_local_date": variant_answer(
+                effective_rates(key_by_stamp_date=True)),
         }
         problems = ["currency_inverted_quote_segment", "timezone_mixed_utc_offsets",
                     "calendar_exchange_holidays"]
@@ -563,12 +705,19 @@ holdings: {json.dumps(holdings, sort_keys=True)}
 
 ## Rules
 1. Convert each European close to USD with the FX fix for the same trade
-   date as of the 16:00 UTC cut-off. fx.csv timestamps use several UTC
-   offset forms; convert each timestamp to UTC first. If the fix instant
-   is after the cut-off, use the previous union date's fix instead.
+   date as of the 16:00 UTC cut-off. A fix's trade date is the UTC date
+   of its timestamp: fx.csv timestamps use several UTC offset forms, and
+   a stamp just after midnight in a +01:00 form (00:30 local) is 23:30
+   UTC on the previous day, so its date string is not its trade date.
+   Convert each timestamp to UTC first and file the fix under its UTC
+   date. If the fix instant is after the cut-off, use the previous union
+   date's fix instead. fx.csv also contains weekend prints on dates
+   that are not union trade dates; they are not fixes for any trade
+   date and must be ignored (in particular, never as a previous fix).
 2. The quote column governs direction: EURUSD is USD per EUR (multiply),
-   USDEUR is EUR per USD (divide by the rate to get USD). A contiguous
-   segment of fx.csv is quoted inverted; the quote column is the only flag.
+   USDEUR is EUR per USD (divide by the rate to get USD). Two separate
+   segments of fx.csv are quoted inverted; the quote column is the
+   only flag, and it must be checked on every row.
 3. NAV on a date is sum over holdings of shares * USD close, on the inner
    calendar. total_return_usd is last inner NAV / first inner NAV - 1.
 4. fx_pnl_contribution is total_return_usd minus the total return of the
@@ -576,12 +725,23 @@ holdings: {json.dumps(holdings, sort_keys=True)}
    date's effective rate.
 5. dates_dropped_by_alignment is the number of union dates (dates on
    either exchange) that the inner calendar drops.
+6. effective_fx_rate_mid_probe is the effective USD-per-EUR rate actually
+   used (after rules 1-2) on the middle nav_date. The EU sleeve value on
+   the last nav_date is the sum over European holdings of shares * EUR
+   close * that date's effective rate. max_nav_value / max_nav_date are
+   the largest inner-calendar NAV and its date. nav_max_drawdown is the
+   minimum over inner dates of (NAV - running maximum NAV) / running
+   maximum NAV: drawdowns are reported as a negative fraction (for
+   example -0.083 means the NAV fell 8.3% from its running peak; 0.0 only
+   if the NAV never falls). Do not report a drawdown as a positive number.
 
 Report NAV on each nav_date, total_return_usd, fx_pnl_contribution,
-dates_dropped_by_alignment and num_inner_days. Also report a problems
-array with the category codes that apply, from: currency, timezone,
-calendar, duplicate, missing, bad_price, split, reverse_split,
-unit_change, out_of_order, adj_close, column_order, source_conflict.
+dates_dropped_by_alignment, effective_fx_rate_mid_probe, the EU sleeve
+value, max_nav_value, max_nav_date, nav_max_drawdown and num_inner_days.
+Also report a problems array with the category codes that apply, from:
+currency, timezone, calendar, duplicate, missing, bad_price, split,
+reverse_split, unit_change, out_of_order, adj_close, column_order,
+source_conflict.
 """
         files = {
             "us_prices.csv": _csv(["date", "ticker", "open", "high", "low", "close", "volume"], us_rows),
@@ -652,7 +812,15 @@ unit_change, out_of_order, adj_close, column_order, source_conflict.
         dup_keys = []
         for _ in range(4):
             row = list(rng.choice(a_rows))
-            row[2] = f"{float(row[2]) * 1.03:.2f}"
+            dup_close = round(float(row[2]) * 1.03, 2)
+            # The duplicate copy must not equal a neighbouring date's
+            # close for its ticker either (raw-file consecutive check).
+            _idx = [_dstr(d) for d in dates].index(row[0])
+            _neighbours = {truth[row[1]][j] for j in (_idx - 1, _idx + 1)
+                           if 0 <= j < len(dates)}
+            while dup_close in _neighbours:
+                dup_close = round(dup_close * 1.01 + 0.11, 2)
+            row[2] = f"{dup_close:.2f}"
             a_rows.append(row)
             dup_keys.append((row[1], row[0]))
         # Corrections: some effective at report time, some too late.
@@ -786,6 +954,17 @@ unit_change, out_of_order, adj_close, column_order, source_conflict.
                     "ignore_indicative_flag": variant("ignore_indicative")}
         problems = ["source_conflict_vendor_disagreement", "unit_change_vendor_b_unit_column",
                     "duplicate_vendor_a_rows"]
+        # The memo's missing rule, applied to the key exactly as stated:
+        # a business date in a ticker's union range reported by neither
+        # vendor.  A date reported by only one vendor is not missing.
+        _all_keys = set(a_val) | set(b_val)
+        for t in tickers:
+            present = sorted(ds for (tt, ds) in _all_keys if tt == t)
+            if any(_dstr(d) not in present
+                   for d in dates
+                   if present[0] <= _dstr(d) <= present[-1]):
+                problems.append("missing_no_vendor_reports_date")
+                break
         spec = f"""# Methodology memo - vendor reconciliation (T3)
 
 report_time: {report_time}
@@ -811,12 +990,33 @@ column), corrections.csv (ticker,date,close,as_of).
    median). With two available values the median is their mean; with one
    it is that value.
 
+## Drawdown sign convention
+max_drawdown is the minimum over aligned dates of (path - running
+maximum path) / running maximum path, reported as a negative fraction
+(for example -0.083 means an 8.3% fall from the running peak; 0.0 only
+if the path never falls). Do not report a drawdown as a positive number.
+
+## Allowed problem codes (report exactly these, under exactly these rules)
+The problems array may contain only: source_conflict, unit_change,
+duplicate, missing. Report a code if and only if its rule is met:
+- source_conflict: at least one conflicted key exists (rule 2 above,
+  judged after unit conversion and first-occurrence de-duplication).
+- unit_change: Vendor B's unit column takes more than one distinct
+  value in the file.
+- duplicate: at least one vendor file contains a repeated ticker-date
+  row (judged on the raw file, before rule 0 is applied).
+- missing: a business date inside a ticker's union date range (first to
+  last date reported by either vendor for that ticker) has no row from
+  EITHER vendor for that ticker. A date present in only one vendor is
+  NOT missing: it is simply resolved from that vendor under the
+  resolution order, and it must not be reported as missing.
+
 Report the three path counts over conflicted keys only, the resolved
 closes for the probe ticker on the probe dates, and, from the resolved
 series aligned on dates present for every ticker, the equal-weight
 buy-and-hold total return (mean of last/first close minus 1) and the max
-drawdown of the mean normalised price path with its trough date. Also
-report a problems array from the standard category list.
+drawdown of the mean normalised price path with its trough date, plus
+the problems array defined above.
 """
         files = {
             "vendor_a.csv": _csv(["date", "ticker", "close", "status"], a_rows),
@@ -1001,11 +1201,25 @@ executions at that price). Positions are in shares as booked.
    cash-in-lieu, after that date's trades). Each later date's return is
    (value - net trade flow that date) / previous positive value - 1,
    where a buy is a positive flow of shares*price and a sell negative.
-   Modified Dietz is not used. Max drawdown is on this index.
+   Modified Dietz is not used. Max drawdown is on this index, reported
+   as a negative fraction (for example -0.083 means the index fell 8.3%
+   from its running peak; 0.0 only if it never falls). Do not report a
+   drawdown as a positive number.
+
+## Allowed problem codes (report exactly these, under exactly these rules)
+The problems array may contain only: split, reverse_split.
+Split-table rows DO count as problems, as follows:
+- split: splits.csv contains at least one row whose ratio A-for-B has
+  A > B (a forward split).
+- reverse_split: splits.csv contains at least one row whose ratio
+  A-for-B has A < B.
+Report both codes when the table contains both kinds of row, exactly
+one when it contains only one kind, and neither if the table were empty.
+No other category code may be reported for this task.
 
 Report end share counts per asset, realised_pnl_fifo, unrealised_pnl,
 cash_in_lieu, twr_total_return, max_drawdown, num_trades, num_splits and
-a problems array from the standard category list.
+the problems array defined above.
 """
         files = {
             "prices.csv": _csv(["date", "ticker", "open", "high", "low", "close", "volume"], rows_out),
@@ -1029,41 +1243,71 @@ a problems array from the standard category list.
             series[t] = _closes(rng, rng.uniform(30, 160), [0.0] + rets)
         lookback, delta = cfg["lookback"], 0.2
         capital, buffer_pct, lot = 1_000_000.0, 0.02, 10
-        cap_asset, cap_sector = 0.30, 0.70
+        cap_asset = 0.30
+        # Sector caps are set per task below (after a first look at the
+        # unconstrained optimum) so that the dominant sector's cap
+        # actually binds at the first rebalance.
+        sector_caps = {"Alpha": 0.70, "Beta": 0.70}
         turnover_cap, cost_bps = 0.25, 5.0
         first_idx = cfg["first_rebalance"]  # 0-based row index
         rebalance_idx = list(range(first_idx, rows - 5, cfg["rebalance_every"]))
 
         import numpy as np
 
-        def _min_var_weights(cov, capped):
-            """Exact min-variance weights under sum=1 and 0<=w<=cap.
+        sector_members: dict[str, list[int]] = {}
+        for i, t in enumerate(assets):
+            sector_members.setdefault(sectors[t], []).append(i)
 
-            Active-set solve: fix the most violated bound, re-solve the
-            equality QP for the free assets, then release any fixed asset
-            whose KKT multiplier has the wrong sign.  The shrunk
-            covariance is strictly positive definite, so this terminates
-            at the unique optimum.  Sector caps are feasibility-checked
-            afterwards (they do not bind at the generated optima).
+        def _solve_eq_qp(cov, fixed, equalities):
+            """Equality QP over free assets; returns (weights, lambdas).
+
+            ``equalities`` is a list of (member indices, target) rows that
+            include the fixed assets' contributions on the right side.
+            """
+            free = [i for i in range(n) if i not in fixed]
+            w = np.zeros(n)
+            for i, v in fixed.items():
+                w[i] = v
+            if not free:
+                return w, np.zeros(len(equalities))
+            m = len(equalities)
+            a_mat = np.zeros((m, len(free)))
+            b_vec = np.zeros(m)
+            for k, (members, target) in enumerate(equalities):
+                b_vec[k] = target - sum(fixed[i] for i in members if i in fixed)
+                for j, i in enumerate(free):
+                    if i in members:
+                        a_mat[k, j] = 1.0
+            kkt = np.zeros((len(free) + m, len(free) + m))
+            kkt[:len(free), :len(free)] = 2 * cov[np.ix_(free, free)]
+            kkt[:len(free), len(free):] = a_mat.T
+            kkt[len(free):, :len(free)] = a_mat
+            sol = np.linalg.solve(
+                kkt, np.concatenate([np.zeros(len(free)), b_vec]))
+            for i, v in zip(free, sol[:len(free)], strict=True):
+                w[i] = v
+            return w, sol[len(free):]
+
+        def _min_var_weights(cov, capped, enforce_sector=True):
+            """Exact min-variance weights: sum=1, 0<=w<=cap, sector caps.
+
+            Active-set solve over asset bounds and, when a sector cap is
+            violated, that sector's sum as an added equality; fixed
+            assets and active sector equalities are released when their
+            KKT multipliers have the wrong sign.  The shrunk covariance
+            is strictly positive definite, so the optimum is unique.
             """
             cap = cap_asset if capped else 1.0
-            fixed: dict[int, float] = {}
+            active_sectors: list[str] = []
             w = np.full(n, 1.0 / n)
-            for _ in range(100):
-                free = [i for i in range(n) if i not in fixed]
-                w = np.zeros(n)
-                for i, v in fixed.items():
-                    w[i] = v
-                rhs = 1 - sum(fixed.values())
-                if free:
-                    kkt = np.zeros((len(free) + 1, len(free) + 1))
-                    kkt[:len(free), :len(free)] = 2 * cov[np.ix_(free, free)]
-                    kkt[:len(free), -1] = 1
-                    kkt[-1, :len(free)] = 1
-                    sol = np.linalg.solve(
-                        kkt, np.array([0.0] * len(free) + [rhs]))
-                    for i, v in zip(free, sol[:len(free)], strict=True):
-                        w[i] = v
+            for _outer in range(20):
+                fixed: dict[int, float] = {}
+                lambdas = np.zeros(1 + len(active_sectors))
+                for _inner in range(100):
+                    equalities = [(list(range(n)), 1.0)] + [
+                        (sector_members[s], sector_caps[s]) for s in active_sectors]
+                    w, lambdas = _solve_eq_qp(cov, fixed, equalities)
+                    free = [i for i in range(n) if i not in fixed]
                     below = [(w[i], i) for i in free if w[i] < -1e-10]
                     above = [(w[i], i) for i in free if w[i] > cap + 1e-10]
                     if below:
@@ -1072,22 +1316,50 @@ a problems array from the standard category list.
                     if above:
                         fixed[max(above)[1]] = cap
                         continue
-                grad = 2 * cov @ w
-                mu = _mean([grad[i] for i in free]) if free else _mean(list(grad))
-                release, worst = None, 1e-9
-                for i, v in fixed.items():
-                    violation = (mu - grad[i]) if v == 0.0 else (grad[i] - mu)
-                    if violation > worst:
-                        release, worst = i, violation
-                if release is None:
+                    # KKT release check for fixed assets: stationarity
+                    # is grad + A^T lambda (+ bound multiplier) = 0.
+                    grad = 2 * cov @ w
+                    at_lam = np.zeros(n)
+                    all_eq = [(list(range(n)), 1.0)] + [
+                        (sector_members[s], sector_caps[s]) for s in active_sectors]
+                    for k, (members, _t) in enumerate(all_eq):
+                        for i in members:
+                            at_lam[i] += lambdas[k]
+                    release, worst = None, 1e-9
+                    for i, v in fixed.items():
+                        resid = grad[i] + at_lam[i]
+                        violation = -resid if v == 0.0 else resid
+                        if violation > worst:
+                            release, worst = i, violation
+                    if release is None:
+                        break
+                    del fixed[release]
+                if not (capped and enforce_sector):
                     return w
-                del fixed[release]
+                sector_sum = {s: float(sum(w[i] for i in mem))
+                              for s, mem in sector_members.items()}
+                violated = [s for s in sector_sum
+                            if sector_sum[s] > sector_caps[s] + 1e-9
+                            and s not in active_sectors]
+                if violated:
+                    active_sectors.append(
+                        max(violated, key=lambda s: sector_sum[s] - sector_caps[s]))
+                    continue
+                # An active sector whose multiplier is negative is not
+                # really binding; release the worst such sector.
+                release_sector, worst = None, -1e-9
+                for k, s in enumerate(active_sectors):
+                    if lambdas[1 + k] < worst:
+                        release_sector, worst = s, lambdas[1 + k]
+                if release_sector is None:
+                    return w
+                active_sectors.remove(release_sector)
             return w  # pragma: no cover - active set converges in practice
 
         _weight_cache: dict = {}
 
-        def estimate_weights(end_idx, shrink=True, capped=True):
-            key = (end_idx, shrink, capped)
+        def estimate_weights(end_idx, shrink=True, capped=True, enforce_sector=True):
+            key = (end_idx, shrink, capped, enforce_sector)
             if key in _weight_cache:
                 return _weight_cache[key]
             rets = np.array([_returns(series[t], "simple")[end_idx - lookback:end_idx]
@@ -1095,21 +1367,34 @@ a problems array from the standard category list.
             cov = np.cov(rets, rowvar=False, ddof=1)
             if shrink:
                 cov = (1 - delta) * cov + delta * np.diag(np.diag(cov))
-            w = _min_var_weights(cov, capped)
-            if capped:
-                sec = {}
-                for t, wi in zip(assets, w, strict=True):
-                    sec[sectors[t]] = sec.get(sectors[t], 0.0) + float(wi)
-                if any(v > cap_sector + 1e-9 for v in sec.values()):
-                    # Sector cap binds: fall back to clipping the sector
-                    # and renormalising the remainder (deterministic; the
-                    # generated draws make this path vanishingly rare).
-                    w = np.minimum(w, cap_sector)
-                    w = w / w.sum()
+            w = _min_var_weights(cov, capped, enforce_sector)
             _weight_cache[key] = w
             return w
 
+        # Set the dominant sector's cap just below its unconstrained
+        # first-rebalance share, so the sector cap binds there (the memo
+        # and constraints file state the resulting cap).
+        _w_pre = estimate_weights(first_idx, enforce_sector=False)
+        _sector_sums = {}
+        for _t, _wi in zip(assets, _w_pre, strict=True):
+            _sector_sums[sectors[_t]] = _sector_sums.get(sectors[_t], 0.0) + float(_wi)
+        _dominant = max(_sector_sums, key=_sector_sums.get)
+        sector_caps[_dominant] = round(
+            min(max(_sector_sums[_dominant] - 0.06, 0.25), 0.65), 4)
+        if sector_caps[_dominant] >= _sector_sums[_dominant]:
+            sector_caps[_dominant] = round(_sector_sums[_dominant] - 0.03, 4)
+        _weight_cache.clear()
+
         def allocate(desired_values, nav, prices_now):
+            """Floor to lots, then greedy leftover-cash allocation.
+
+            Greedy buys one lot at a time for the first asset (largest
+            residual, ties by ticker) whose residual is positive and
+            whose lot cost fits in the remaining cash.  Remaining cash
+            here is the whole cash after flooring, so greedy allocation
+            may spend into the cash buffer; it stops when no positive-
+            residual asset has an affordable lot.
+            """
             shares = [int(math.floor(dv / (p * lot)) * lot)
                       for dv, p in zip(desired_values, prices_now, strict=True)]
             cash = nav - sum(s * p for s, p in zip(shares, prices_now, strict=True))
@@ -1120,7 +1405,7 @@ a problems array from the standard category list.
                 bought = False
                 for i in order:
                     cost = lot * prices_now[i]
-                    if cash >= cost - 1e-9:
+                    if residuals[i] > 1e-9 and cash >= cost - 1e-9:
                         shares[i] += lot
                         cash -= cost
                         bought = True
@@ -1140,26 +1425,51 @@ a problems array from the standard category list.
                     nav_pre = cash + sum(s * p for s, p in zip(shares, prices_now, strict=True))
                     w = estimate_weights(idx, shrink, capped)
                     desired = [wi * nav_pre * (1 - buffer_pct) for wi in w]
-                    turnover_raw = sum(abs(dv - s * p) for dv, s, p in
-                                       zip(desired, shares, prices_now, strict=True)) / nav_pre \
-                        if any(shares) else sum(desired) / nav_pre
-                    # First allocation from cash: turnover is the invested
-                    # fraction; later turnovers use traded notional / NAV.
-                    if any(shares):
-                        traded_target = desired
-                        if use_turnover_cap and turnover_raw > turnover_cap:
-                            scale = turnover_cap / turnover_raw
-                            traded_target = [s * p + (dv - s * p) * scale for dv, s, p in
-                                             zip(desired, shares, prices_now, strict=True)]
-                        new_shares, new_cash = allocate(traded_target, nav_pre, prices_now)
-                    else:
-                        new_shares, new_cash = allocate(desired, nav_pre, prices_now)
+                    new_shares, new_cash = allocate(desired, nav_pre, prices_now)
                     traded = sum(abs(ns - s) * p for ns, s, p in
                                  zip(new_shares, shares, prices_now, strict=True))
+                    # Turnover is defined on the actual post-rounding
+                    # share changes, and the cap is checked on that
+                    # actual turnover (rebalances after the first only):
+                    # scale every share change toward zero by
+                    # cap/actual, truncated to whole lots, with no
+                    # further greedy allocation afterwards.
+                    if any(shares) and use_turnover_cap \
+                            and traded / nav_pre > turnover_cap:
+                        factor = turnover_cap / (traded / nav_pre)
+                        new_shares = [
+                            s + (1 if ns > s else -1)
+                            * int(math.floor(abs(ns - s) * factor / lot)) * lot
+                            for ns, s in zip(new_shares, shares, strict=True)]
+                        new_cash = nav_pre - sum(
+                            s * p for s, p in zip(new_shares, prices_now, strict=True))
+                        traded = sum(abs(ns - s) * p for ns, s, p in
+                                     zip(new_shares, shares, prices_now, strict=True))
                     turnover = traded / nav_pre if nav_pre else 0.0
                     turnovers[str(len(turnovers) + 1)] = round(turnover, 6)
                     if apply_cost:
-                        new_cash -= traded * cost_bps / 10000
+                        # Cost is deducted from cash after the final
+                        # share counts are set.  If that would take cash
+                        # below zero, return lots (largest excess of
+                        # allocated over desired value, ties by ticker)
+                        # and recompute traded notional and cost, until
+                        # cash after cost is >= 0.  Cash never goes
+                        # negative.
+                        cost = traded * cost_bps / 10000
+                        while new_cash - cost < 0 and any(s > 0 for s in new_shares):
+                            excess = [ns * p - dv for ns, dv, p in
+                                      zip(new_shares, desired, prices_now, strict=True)]
+                            pick = min(range(n), key=lambda i: (-excess[i], assets[i]))
+                            if new_shares[pick] <= 0:
+                                pick = max(range(n), key=lambda i: new_shares[i])
+                            new_shares[pick] -= lot
+                            new_cash += lot * prices_now[pick]
+                            traded = sum(abs(ns - s) * p for ns, s, p in
+                                         zip(new_shares, shares, prices_now, strict=True))
+                            cost = traded * cost_bps / 10000
+                            turnovers[str(len(turnovers))] = round(
+                                traded / nav_pre, 6) if nav_pre else 0.0
+                        new_cash -= cost
                     if weights_first is None:
                         weights_first = {t: round(float(wi), 6) for t, wi in zip(assets, w, strict=True)}
                         shares_first = {t: int(s) for t, s in zip(assets, new_shares, strict=True)}
@@ -1189,7 +1499,7 @@ a problems array from the standard category list.
             rows_out += _price_rows(t, dates, series[t], rng)
         constraints = {
             "capital": capital, "cash_buffer_pct": buffer_pct, "lot_size": lot,
-            "per_asset_cap": cap_asset, "sector_caps": {"Alpha": cap_sector, "Beta": cap_sector},
+            "per_asset_cap": cap_asset, "sector_caps": sector_caps,
             "sectors": sectors, "turnover_cap": turnover_cap, "cost_bps": cost_bps,
             "lookback_returns": lookback, "shrinkage_delta": delta,
             "rebalance_row_indices_1based": [i + 1 for i in rebalance_idx],
@@ -1200,30 +1510,62 @@ Files: prices.csv and constraints.json (capital, cash buffer, lot size,
 per-asset and sector caps, turnover cap, cost in basis points, lookback,
 shrinkage delta, sectors and the 1-based rebalance row indices).
 
-## Pipeline (at each rebalance row, in this order)
+## Pipeline (at each rebalance row, in exactly this order)
 1. Estimate the covariance from the last lookback_returns simple daily
    returns ending at that row (sample covariance, ddof=1), then shrink
    toward its diagonal: Sigma = (1-delta)*Sigma + delta*diag(Sigma).
-2. Weights minimise w' Sigma w subject to sum(w)=1, long-only,
-   per-asset cap and sector caps. The shrunk covariance is strictly
-   positive definite, so the optimum is unique.
-3. Trade to the weights: desired value per asset is weight * NAV *
-   (1 - cash_buffer_pct), where NAV is cash plus holdings at that row's
-   closes. Convert to round lots by flooring to a lot multiple, then
-   greedily spend leftover cash one lot at a time on the asset with the
-   largest residual (desired minus allocated value), ties by ticker,
-   repeating until no lot is affordable.
-4. Turnover is traded notional (sum of |change in shares| * price)
-   divided by pre-trade NAV. At rebalances after the first, if turnover
-   to the full target would exceed the turnover cap, scale every
-   asset's desired value from its current value toward the target by
-   cap/turnover first, then apply step 3 to the scaled values.
-5. Deduct cost_bps of traded notional from cash. Between rebalances
-   shares and cash are constant; NAV is shares*close plus cash daily.
+2. Weights minimise w' Sigma w subject to ALL of: sum(w)=1, long-only
+   (w >= 0), the per-asset cap (w_i <= per_asset_cap for every asset)
+   and the sector caps (for each sector, the sum of weights of its
+   assets <= that sector's cap in constraints.json). Both caps are hard
+   constraints, not targets. The shrunk covariance is strictly positive
+   definite, so the optimum is unique.
+3. Trade to the weights. Desired value per asset is
+   weight * NAV_pre * (1 - cash_buffer_pct), where NAV_pre is cash plus
+   holdings at that row's closes. Convert desired values to shares:
+   (a) floor each desired value to a whole lot multiple;
+   (b) greedy allocation: repeatedly take the asset with the largest
+   residual (desired value minus allocated value; ties by ticker name,
+   alphabetically first), and if its residual is positive and one lot
+   costs no more than the remaining cash, buy one lot for it; repeat
+   until no asset qualifies. "Remaining cash" in this step is the whole
+   cash left after flooring (NAV_pre minus allocated value), so greedy
+   allocation MAY spend into the cash buffer: the final cash after this
+   step can be below cash_buffer_pct * NAV_pre, down to less than the
+   cheapest lot. Greedy allocation never makes cash negative, because a
+   lot is bought only when the cash before the purchase covers it.
+4. Turnover is defined on the ACTUAL post-rounding share changes of
+   step 3: turnover = (sum over assets of |new shares - old shares| *
+   price) / NAV_pre. At the first rebalance the old share counts are
+   zero, the turnover cap does not limit the allocation, and the
+   reported turnover is this actual invested fraction. At every later
+   rebalance the cap is checked on this actual turnover: if it exceeds
+   turnover_cap, scale every asset's share change toward zero by the
+   factor turnover_cap / actual_turnover, truncate each scaled change
+   to a whole number of lots toward zero, and take those as the final
+   share counts (no further greedy allocation after scaling). The
+   reported turnover is then recomputed from these final share counts,
+   so the reported turnover is always the actual one and, after the
+   first rebalance, never exceeds the cap.
+5. Transaction cost, in this order: traded notional is computed from
+   the final share counts of step 4; cost = cost_bps/10000 * traded
+   notional; cash after trading is NAV_pre minus final holdings value
+   minus cost. If that cash would be negative, return lots before
+   deducting: repeatedly remove one lot from the asset whose allocated
+   value most exceeds its step-3 desired value (ties by ticker name,
+   alphabetically first; recompute traded notional, turnover and cost
+   after each removal) until cash after cost is >= 0, then deduct the
+   cost. Cash can therefore never be negative at any rebalance, and
+   cash_left is the cash after the last rebalance's cost deduction.
+   Between rebalances shares and cash are constant; NAV is
+   shares*close plus cash daily. max_drawdown is over this daily NAV
+   path, reported as a negative fraction (for example -0.083 means the
+   NAV fell 8.3% from its running peak; 0.0 only if it never falls).
+   Do not report a drawdown as a positive number.
 
 Report weights and share counts at the first rebalance, turnover at each
-rebalance, num_rebalances, final_nav, max_drawdown of the daily NAV path
-and cash_left.
+rebalance (the actual turnover of step 4/5), num_rebalances, final_nav,
+max_drawdown of the daily NAV path and cash_left.
 """
         files = {
             "prices.csv": _csv(["date", "ticker", "open", "high", "low", "close", "volume"], rows_out),

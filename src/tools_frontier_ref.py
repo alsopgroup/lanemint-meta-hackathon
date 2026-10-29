@@ -20,7 +20,7 @@ import csv
 import json
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -87,6 +87,14 @@ def _drawdown(values):
 def _solve_t1(task_dir: Path) -> dict:
     spec = _spec(task_dir)
     series = _price_map(task_dir)
+    # calendar.csv lists the trading dates; rows on other dates (weekend
+    # prints) are excluded before any computation.  _price_map already
+    # returns each ticker sorted by date.
+    if (task_dir / "calendar.csv").exists():
+        trading = {r["date"] for r in _read_csv(task_dir, "calendar.csv")}
+        for ticker, (dates, closes) in series.items():
+            kept = [(d, c) for d, c in zip(dates, closes, strict=True) if d in trading]
+            series[ticker] = ([d for d, _c in kept], [c for _d, c in kept])
     tickers = sorted(series)
     answer = {}
     weekly_cfg, ewma_cfg, sharpe_cfg = None, None, None
@@ -128,6 +136,33 @@ def _solve_t1(task_dir: Path) -> dict:
     answer["rolling_max_beta"] = round(best, 6)
     answer["rolling_max_beta_end_date"] = series[asset][0][best_end + 1]
 
+    # Second rolling section, downside volatility, log correlation and
+    # weekly annualised log return (memo convention table).
+    m2 = re.search(r"- rolling_beta2: asset=(\w+); benchmark=(\w+); window=(\d+); step=(\d+)", spec)
+    asset2, bench2, win2, step2 = m2.group(1), m2.group(2), int(m2.group(3)), int(m2.group(4))
+    ra2 = _returns(series[asset2][1], "simple")
+    rb2 = _returns(series[bench2][1], "simple")
+    best2, best2_end = None, None
+    for start in range(0, len(ra2) - win2 + 1, step2):
+        value = beta(ra2[start:start + win2], rb2[start:start + win2])
+        if best2 is None or value > best2:
+            best2, best2_end = value, start + win2 - 1
+    answer["rolling2_max_beta"] = round(best2, 6)
+    answer["rolling2_max_beta_end_date"] = series[asset2][0][best2_end + 1]
+
+    md = re.search(r"- downside_vol: asset=(\w+); return=(\w+); periods_per_year=(\d+)", spec)
+    d_rets = _returns(series[md.group(1)][1], md.group(2))
+    answer["downside_volatility"] = round(
+        math.sqrt(_mean([min(r, 0.0) ** 2 for r in d_rets])) * math.sqrt(int(md.group(3))), 6)
+
+    mc = re.search(r"- log_correlation: asset=(\w+); benchmark=(\w+)", spec)
+    la = _returns(series[mc.group(1)][1], "log")
+    lb = _returns(series[mc.group(2)][1], "log")
+    mla, mlb = _mean(la), _mean(lb)
+    cov = sum((x - mla) * (y - mlb) for x, y in zip(la, lb, strict=True)) / (len(la) - 1)
+    answer["log_return_correlation"] = round(
+        cov / (_std(la, 1) * _std(lb, 1)), 6)
+
     asset, bench, kind, periods, ddof = weekly_cfg
 
     def weekly(ticker):
@@ -141,6 +176,10 @@ def _solve_t1(task_dir: Path) -> dict:
     diff = [a - b for a, b in zip(_returns(weekly(asset), kind),
                                   _returns(weekly(bench), kind), strict=True)]
     answer["weekly_tracking_error"] = round(_std(diff, ddof) * math.sqrt(periods), 6)
+
+    mw = re.search(r"- weekly_annualised_log_return: asset=(\w+);", spec)
+    answer["weekly_annualised_log_return"] = round(
+        _mean(_returns(weekly(mw.group(1)), "log")) * 52, 6)
 
     asset, kind, lam, periods = ewma_cfg
     rets = _returns(series[asset][1], kind)
@@ -156,7 +195,6 @@ def _solve_t1(task_dir: Path) -> dict:
 
     any_ticker = tickers[0]
     answer["num_aligned_days"] = len(series[any_ticker][0])
-    answer["num_return_days"] = answer["num_aligned_days"] - 1
     return answer
 
 
@@ -179,20 +217,23 @@ def _solve_t2(task_dir: Path) -> dict:
 
     fx_rows = _read_csv(task_dir, "fx.csv")
 
-    def to_utc_hour(stamp):
-        # Forms seen in the file: ...Z, ...+00:00, ...+01:00.
-        if stamp.endswith("Z"):
-            return int(stamp[11:13])
-        offset = int(stamp[-5:-3]) * (1 if stamp[-6] == "+" else -1)
-        return int(stamp[11:13]) - offset
+    def to_utc(stamp):
+        # A fix's trade date is its UTC date: a 00:30 +01:00 stamp is
+        # 23:30 UTC on the previous day.  Weekend prints land on UTC
+        # dates outside the union calendar and are never looked up.
+        instant = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        return instant.astimezone(UTC)
 
     effective, prev = {}, None
-    fx_by_date = {row["timestamp"][:10]: row for row in fx_rows}
+    fx_by_utc_date = {}
+    for row in fx_rows:
+        fx_by_utc_date[to_utc(row["timestamp"]).strftime("%Y-%m-%d")] = row
     for ds in union_dates:
-        row = fx_by_date[ds]
+        row = fx_by_utc_date[ds]
         rate = float(row["rate"])
         eff = rate if row["quote"] == "EURUSD" else 1 / rate
-        effective[ds] = prev if (to_utc_hour(row["timestamp"]) > cutoff and prev is not None) else eff
+        effective[ds] = prev if (to_utc(row["timestamp"]).hour > cutoff
+                                 and prev is not None) else eff
         prev = eff
 
     def nav(eff_map, ds):
@@ -207,12 +248,22 @@ def _solve_t2(task_dir: Path) -> dict:
     const = dict.fromkeys(effective, effective[inner_dates[0]])
     navs_const = {ds: nav(const, ds) for ds in inner_dates}
     total = navs[inner_dates[-1]] / navs[inner_dates[0]] - 1
+    max_date = max(inner_dates, key=lambda d: navs[d])
+    dd, _trough = _drawdown([navs[d] for d in inner_dates])
+    eu_last = sum(
+        holdings[t] * dict(zip(*eu[t], strict=True))[probe[-1]] * effective[probe[-1]]
+        for t in eu)
     answer = {f"nav_{d.replace('-', '')}": round(navs[d], 6) for d in probe}
     answer.update({
         "total_return_usd": round(total, 6),
         "fx_pnl_contribution": round(
             total - (navs_const[inner_dates[-1]] / navs_const[inner_dates[0]] - 1), 6),
         "dates_dropped_by_alignment": len(union_dates) - len(inner_dates),
+        "effective_fx_rate_mid_probe": round(effective[probe[1]], 6),
+        f"eu_sleeve_usd_{probe[-1].replace('-', '')}": round(eu_last, 6),
+        "max_nav_value": round(navs[max_date], 6),
+        "max_nav_date": max_date,
+        "nav_max_drawdown": round(dd, 6),
         "num_inner_days": len(inner_dates),
         "problems": _t2_problems(task_dir, fx_rows, us_dates, eu_dates),
     })
@@ -315,6 +366,19 @@ def _t3_problems(task_dir, resolved, a_val, b_val):
         if len(keys) != len(set(keys)):
             problems.append("duplicate")
             break
+    # Memo missing rule: a weekday inside a ticker's union date range
+    # reported by neither vendor.  One-vendor dates are not missing.
+    present_by = {}
+    for _ticker, ds in resolved:
+        present_by.setdefault(_ticker, set()).add(ds)
+    for _ticker, present in present_by.items():
+        day = datetime.strptime(min(present), "%Y-%m-%d")
+        last = datetime.strptime(max(present), "%Y-%m-%d")
+        while day <= last:
+            if day.weekday() < 5 and day.strftime("%Y-%m-%d") not in present:
+                problems.append("missing")
+                break
+            day += timedelta(days=1)
     return sorted(set(problems))
 
 
@@ -418,57 +482,103 @@ def _solve_t5(task_dir: Path) -> dict:
     lookback, delta = cfg["lookback_returns"], cfg["shrinkage_delta"]
     lot, buffer_pct = cfg["lot_size"], cfg["cash_buffer_pct"]
 
+    sector_members: dict[str, list[int]] = {}
+    for i, t in enumerate(assets):
+        sector_members.setdefault(cfg["sectors"][t], []).append(i)
+
     def weights_at(end_idx):
         rets = np.array([_returns(closes[t], "simple")[end_idx - lookback:end_idx]
                          for t in assets]).T
         cov = np.cov(rets, rowvar=False, ddof=1)
         cov = (1 - delta) * cov + delta * np.diag(np.diag(cov))
         n, cap = len(assets), cfg["per_asset_cap"]
-        # Active-set solve for min w' Sigma w, sum(w)=1, 0<=w<=cap:
-        # fix the most violated bound, re-solve the equality QP for the
-        # free assets, release fixed assets with wrong-sign multipliers.
-        fixed: dict[int, float] = {}
+        # Active-set solve for min w' Sigma w subject to sum(w)=1,
+        # 0<=w<=per-asset cap and every sector cap in constraints.json:
+        # sector sums enter as added equalities whenever violated, and
+        # fixed assets / active sectors are released on wrong-sign KKT
+        # multipliers.
+        active_sectors: list[str] = []
         w = np.full(n, 1.0 / n)
-        for _ in range(100):
-            free = [i for i in range(n) if i not in fixed]
-            w = np.zeros(n)
-            for i, v in fixed.items():
-                w[i] = v
-            if free:
-                kkt = np.zeros((len(free) + 1, len(free) + 1))
-                kkt[:len(free), :len(free)] = 2 * cov[np.ix_(free, free)]
-                kkt[:len(free), -1] = 1
-                kkt[-1, :len(free)] = 1
-                sol = np.linalg.solve(kkt, [0.0] * len(free) + [1 - sum(fixed.values())])
-                for i, v in zip(free, sol[:len(free)], strict=True):
+        for _outer in range(20):
+            fixed: dict[int, float] = {}
+            lambdas = np.zeros(1 + len(active_sectors))
+            for _inner in range(100):
+                equalities = [(list(range(n)), 1.0)] + [
+                    (sector_members[s], cfg["sector_caps"][s]) for s in active_sectors]
+                free = [i for i in range(n) if i not in fixed]
+                w = np.zeros(n)
+                for i, v in fixed.items():
                     w[i] = v
-                below = [(w[i], i) for i in free if w[i] < -1e-10]
-                above = [(w[i], i) for i in free if w[i] > cap + 1e-10]
+                if free:
+                    m = len(equalities)
+                    a_mat = np.zeros((m, len(free)))
+                    b_vec = np.zeros(m)
+                    for k, (members, target) in enumerate(equalities):
+                        b_vec[k] = target - sum(fixed[i] for i in members if i in fixed)
+                        for j, i in enumerate(free):
+                            if i in members:
+                                a_mat[k, j] = 1.0
+                    kkt = np.zeros((len(free) + m, len(free) + m))
+                    kkt[:len(free), :len(free)] = 2 * cov[np.ix_(free, free)]
+                    kkt[:len(free), len(free):] = a_mat.T
+                    kkt[len(free):, :len(free)] = a_mat
+                    sol = np.linalg.solve(
+                        kkt, np.concatenate([np.zeros(len(free)), b_vec]))
+                    for i, v in zip(free, sol[:len(free)], strict=True):
+                        w[i] = v
+                    lambdas = sol[len(free):]
+                below = [(w[i], i) for i in range(n)
+                         if i not in fixed and w[i] < -1e-10]
+                above = [(w[i], i) for i in range(n)
+                         if i not in fixed and w[i] > cap + 1e-10]
                 if below:
                     fixed[min(below)[1]] = 0.0
                     continue
                 if above:
                     fixed[max(above)[1]] = cap
                     continue
-            grad = 2 * cov @ w
-            mu = _mean([grad[i] for i in free]) if free else _mean(list(grad))
-            release, worst = None, 1e-9
-            for i, v in fixed.items():
-                violation = (mu - grad[i]) if v == 0.0 else (grad[i] - mu)
-                if violation > worst:
-                    release, worst = i, violation
-            if release is None:
-                break
-            del fixed[release]
+                grad = 2 * cov @ w
+                at_lam = np.zeros(n)
+                for k, (members, _t) in enumerate(equalities):
+                    for i in members:
+                        at_lam[i] += lambdas[k]
+                release, worst = None, 1e-9
+                for i, v in fixed.items():
+                    resid = grad[i] + at_lam[i]
+                    violation = -resid if v == 0.0 else resid
+                    if violation > worst:
+                        release, worst = i, violation
+                if release is None:
+                    break
+                del fixed[release]
+            sector_sum = {s: float(sum(w[i] for i in mem))
+                          for s, mem in sector_members.items()}
+            violated = [s for s in sector_sum
+                        if sector_sum[s] > cfg["sector_caps"][s] + 1e-9
+                        and s not in active_sectors]
+            if violated:
+                active_sectors.append(
+                    max(violated, key=lambda s: sector_sum[s] - cfg["sector_caps"][s]))
+                continue
+            release_sector, worst = None, -1e-9
+            for k, s in enumerate(active_sectors):
+                if lambdas[1 + k] < worst:
+                    release_sector, worst = s, lambdas[1 + k]
+            if release_sector is None:
+                return w
+            active_sectors.remove(release_sector)
         return w
 
     def allocate(desired, nav, px):
+        # Floor to lots, then greedy: largest positive residual first
+        # (ties by ticker), one lot at a time while cash covers it.
+        # Remaining cash includes the buffer, so this may spend into it.
         shares = [int(math.floor(d / (p * lot)) * lot) for d, p in zip(desired, px, strict=True)]
         cash = nav - sum(s * p for s, p in zip(shares, px, strict=True))
         while True:
             residuals = [d - s * p for d, s, p in zip(desired, shares, px, strict=True)]
             for i in sorted(range(len(assets)), key=lambda i: (-residuals[i], assets[i])):
-                if cash >= lot * px[i] - 1e-9:
+                if residuals[i] > 1e-9 and cash >= lot * px[i] - 1e-9:
                     shares[i] += lot
                     cash -= lot * px[i]
                     break
@@ -484,16 +594,36 @@ def _solve_t5(task_dir: Path) -> dict:
             nav_pre = cash + sum(s * p for s, p in zip(shares, px, strict=True))
             w = weights_at(idx)
             desired = [float(wi) * nav_pre * (1 - buffer_pct) for wi in w]
-            if any(shares):
-                raw = sum(abs(d - s * p) for d, s, p in zip(desired, shares, px, strict=True)) / nav_pre
-                if raw > cfg["turnover_cap"]:
-                    scale = cfg["turnover_cap"] / raw
-                    desired = [s * p + (d - s * p) * scale
-                               for d, s, p in zip(desired, shares, px, strict=True)]
             new_shares, new_cash = allocate(desired, nav_pre, px)
             traded = sum(abs(ns - s) * p for ns, s, p in zip(new_shares, shares, px, strict=True))
+            # Cap is checked on the actual post-rounding turnover
+            # (later rebalances only): scale share changes toward zero
+            # by cap/actual, truncated to whole lots; no re-allocation.
+            if any(shares) and traded / nav_pre > cfg["turnover_cap"]:
+                factor = cfg["turnover_cap"] / (traded / nav_pre)
+                new_shares = [
+                    s + (1 if ns > s else -1)
+                    * int(math.floor(abs(ns - s) * factor / lot)) * lot
+                    for ns, s in zip(new_shares, shares, strict=True)]
+                new_cash = nav_pre - sum(
+                    s * p for s, p in zip(new_shares, px, strict=True))
+                traded = sum(abs(ns - s) * p for ns, s, p in zip(new_shares, shares, px, strict=True))
             turnovers[str(len(turnovers) + 1)] = round(traded / nav_pre, 6)
-            new_cash -= traded * cfg["cost_bps"] / 10000
+            # Cost last: if cash after cost would be negative, return
+            # lots (largest allocated-minus-desired excess, ties by
+            # ticker) and recompute, until cash after cost is >= 0.
+            cost = traded * cfg["cost_bps"] / 10000
+            while new_cash - cost < 0 and any(s > 0 for s in new_shares):
+                excess = [ns * p - d for ns, d, p in zip(new_shares, desired, px, strict=True)]
+                pick = min(range(len(assets)), key=lambda i: (-excess[i], assets[i]))
+                if new_shares[pick] <= 0:
+                    pick = max(range(len(assets)), key=lambda i: new_shares[i])
+                new_shares[pick] -= lot
+                new_cash += lot * px[pick]
+                traded = sum(abs(ns - s) * p for ns, s, p in zip(new_shares, shares, px, strict=True))
+                cost = traded * cfg["cost_bps"] / 10000
+                turnovers[str(len(turnovers))] = round(traded / nav_pre, 6)
+            new_cash -= cost
             if weights_first is None:
                 weights_first = {t: round(float(wi), 6) for t, wi in zip(assets, w, strict=True)}
                 shares_first = {t: int(s) for t, s in zip(assets, new_shares, strict=True)}
