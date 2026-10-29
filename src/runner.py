@@ -465,6 +465,74 @@ def main():
              'parameter; META_REASONING_EFFORT applies when set). Recorded '
              'per result entry; --resume refuses on a mismatch.'
     )
+    parser.add_argument(
+        '--tools',
+        choices=['python'],
+        default=None,
+        help='Opt-in tool mode: give the model one sandboxed run_python '
+             'tool (see docs/tool-mode.md). With no flag, requests are '
+             'exactly as before.'
+    )
+    parser.add_argument(
+        '--max-turns',
+        type=int,
+        default=12,
+        help='Tool mode: maximum tool-using model turns per task before '
+             'a forced final answer (default: 12)'
+    )
+    parser.add_argument(
+        '--sandbox-timeout',
+        type=float,
+        default=30.0,
+        help='Tool mode: wall-clock timeout in seconds per run_python '
+             'call (default: 30)'
+    )
+    parser.add_argument(
+        '--tool-protocol',
+        choices=['auto', 'tools', 'text'],
+        default='auto',
+        help='Tool mode: native tool calls (tools), fenced-python text '
+             'protocol (text), or native with text fallback (auto; default)'
+    )
+    parser.add_argument(
+        '--call-timeout',
+        type=float,
+        default=900.0,
+        help='Tool mode: per-API-call timeout in seconds (default: 900)'
+    )
+    parser.add_argument(
+        '--task-timeout',
+        type=float,
+        default=1200.0,
+        help='Tool mode: per-task wall-clock cap in seconds; exceeding '
+             'it forces a final answer (default: 1200)'
+    )
+    parser.add_argument(
+        '--context-token-limit',
+        type=int,
+        default=None,
+        help='Tool mode: estimated-prompt-token guard that forces a '
+             'final answer (default: 90000, or 200000 for Spark models)'
+    )
+    parser.add_argument(
+        '--cost-cap-usd',
+        type=float,
+        default=None,
+        help='Tool mode: per-run cost guard in USD; checked before every '
+             'non-final call using the per-Mtok prices below'
+    )
+    parser.add_argument(
+        '--input-cost-per-mtok',
+        type=float,
+        default=0.0,
+        help='Tool mode: input price per million tokens, for the cost guard'
+    )
+    parser.add_argument(
+        '--output-cost-per-mtok',
+        type=float,
+        default=0.0,
+        help='Tool mode: output price per million tokens, for the cost guard'
+    )
 
     args = parser.parse_args()
 
@@ -478,13 +546,37 @@ def main():
         print("Run: python -m src.generate_tasks first")
         return 1
 
-    runner = TaskRunner(
-        base_url=args.base_url,
-        model_name=args.model,
-        dry_run=args.dry_run,
-        max_tokens=args.max_tokens,
-        reasoning_effort=args.reasoning_effort
-    )
+    if args.tools:
+        # Lazy import: the default path must not gain new dependencies
+        # or change in any way when tool mode is not requested.
+        from src.tool_runner import ToolTaskRunner
+        runner = ToolTaskRunner(
+            base_url=args.base_url,
+            model_name=args.model,
+            dry_run=args.dry_run,
+            max_tokens=args.max_tokens,
+            reasoning_effort=args.reasoning_effort,
+            tools=args.tools,
+            max_turns=args.max_turns,
+            sandbox_timeout=args.sandbox_timeout,
+            protocol=args.tool_protocol,
+            call_timeout=args.call_timeout,
+            task_timeout_seconds=args.task_timeout,
+            context_token_limit=args.context_token_limit,
+            cost_cap_usd=args.cost_cap_usd,
+            input_cost_per_mtok=args.input_cost_per_mtok,
+            output_cost_per_mtok=args.output_cost_per_mtok,
+            tasks_dir=args.tasks_dir,
+            transcript_dir=args.output_dir / 'transcripts'
+        )
+    else:
+        runner = TaskRunner(
+            base_url=args.base_url,
+            model_name=args.model,
+            dry_run=args.dry_run,
+            max_tokens=args.max_tokens,
+            reasoning_effort=args.reasoning_effort
+        )
 
     try:
         results = runner.run_all_tasks(
