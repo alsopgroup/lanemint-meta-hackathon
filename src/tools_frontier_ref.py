@@ -215,6 +215,47 @@ def _solve_t1(task_dir: Path) -> dict:
     excess = [r - rf_daily for r in _returns(series[asset][1], kind)]
     answer["sharpe_ratio"] = round(_mean(excess) / _std(excess, ddof) * math.sqrt(periods), 6)
 
+    # Composite equal-weight portfolio: daily return is the mean of the
+    # member assets' simple returns; compound an index from 1.0.
+    members = re.search(r"- portfolio: assets=([\w,]+);", spec).group(1).split(",")
+    member_rets = {t: _returns(series[t][1], "simple") for t in members}
+    prets = [_mean([member_rets[t][i] for t in members])
+             for i in range(len(member_rets[members[0]]))]
+    pindex = [1.0]
+    for r in prets:
+        pindex.append(pindex[-1] * (1 + r))
+    pdd, ptrough = _drawdown(pindex)
+    pexc = [r - rf_daily for r in prets]
+    answer["portfolio_ann_vol"] = round(_std(prets, 1) * math.sqrt(periods), 6)
+    answer["portfolio_max_drawdown"] = round(pdd, 6)
+    answer["portfolio_max_drawdown_trough_date"] = series[members[0]][0][ptrough]
+    answer["portfolio_sharpe"] = round(
+        _mean(pexc) / _std(pexc, 1) * math.sqrt(periods), 6)
+
+    # Rolling correlation section (log returns, memo window/step).
+    mrc = re.search(r"- rolling_correlation: asset=(\w+); benchmark=(\w+); "
+                    r"window=(\d+); step=(\d+); return=(\w+)", spec)
+    ca = _returns(series[mrc.group(1)][1], mrc.group(5))
+    cb = _returns(series[mrc.group(2)][1], mrc.group(5))
+    win, stp = int(mrc.group(3)), int(mrc.group(4))
+    best_c, best_c_end = None, None
+    for start in range(0, len(ca) - win + 1, stp):
+        xa, xb = ca[start:start + win], cb[start:start + win]
+        mx, my = _mean(xa), _mean(xb)
+        cov = sum((x - mx) * (y - my) for x, y in zip(xa, xb, strict=True)) / (win - 1)
+        value = cov / (_std(xa, 1) * _std(xb, 1))
+        if best_c is None or value > best_c:
+            best_c, best_c_end = value, start + win - 1
+    answer["rolling_max_correlation"] = round(best_c, 6)
+    answer["rolling_max_correlation_end_date"] = series[mrc.group(1)][0][best_c_end + 1]
+
+    # Worst single day of the named asset.
+    mwd = re.search(r"- worst_day: asset=(\w+); return=(\w+)", spec)
+    wrets = _returns(series[mwd.group(1)][1], mwd.group(2))
+    wi = min(range(len(wrets)), key=lambda i: wrets[i])
+    answer["worst_day_return"] = round(wrets[wi], 6)
+    answer["worst_day_date"] = series[mwd.group(1)][0][wi + 1]
+
     any_ticker = tickers[0]
     answer["num_aligned_days"] = len(series[any_ticker][0])
     return answer
@@ -254,6 +295,7 @@ def _solve_t2(task_dir: Path) -> dict:
     fx_by_utc_date = {}
     for row in fx_rows:
         fx_by_utc_date[to_utc(row["timestamp"]).strftime("%Y-%m-%d")] = row
+    num_late = 0
     for ds in union_dates:
         row = fx_by_utc_date[ds]
         rate = float(row["rate"])
@@ -263,6 +305,8 @@ def _solve_t2(task_dir: Path) -> dict:
         effective[ds] = eff if on_time else prev_on_time
         if on_time:
             prev_on_time = eff
+        else:
+            num_late += 1
 
     def nav(eff_map, ds):
         total = 0.0
@@ -277,10 +321,15 @@ def _solve_t2(task_dir: Path) -> dict:
     navs_const = {ds: nav(const, ds) for ds in inner_dates}
     total = navs[inner_dates[-1]] / navs[inner_dates[0]] - 1
     max_date = max(inner_dates, key=lambda d: navs[d])
-    dd, _trough = _drawdown([navs[d] for d in inner_dates])
+    dd, trough_idx = _drawdown([navs[d] for d in inner_dates])
     eu_last = sum(
         holdings[t] * dict(zip(*eu[t], strict=True))[probe[-1]] * effective[probe[-1]]
         for t in eu)
+    us_last = sum(
+        holdings[t] * dict(zip(*us[t], strict=True))[probe[-1]] for t in us)
+    nav_log_rets = [math.log(navs[b] / navs[a])
+                    for a, b in zip(inner_dates, inner_dates[1:], strict=False)]
+    union_set = set(union_dates)
     answer = {f"nav_{d.replace('-', '')}": round(navs[d], 6) for d in probe}
     answer.update({
         "total_return_usd": round(total, 6),
@@ -291,9 +340,18 @@ def _solve_t2(task_dir: Path) -> dict:
         f"effective_fx_rate_{detail_date.replace('-', '')}": round(
             effective[detail_date], 6),
         f"eu_sleeve_usd_{probe[-1].replace('-', '')}": round(eu_last, 6),
+        f"us_sleeve_usd_{probe[-1].replace('-', '')}": round(us_last, 6),
+        "eu_sleeve_weight_last_probe": round(eu_last / navs[probe[-1]], 6),
         "max_nav_value": round(navs[max_date], 6),
         "max_nav_date": max_date,
         "nav_max_drawdown": round(dd, 6),
+        "nav_drawdown_trough_date": inner_dates[trough_idx],
+        "nav_ann_vol": round(_std(nav_log_rets, 1) * math.sqrt(252), 6),
+        "num_late_fixes": num_late,
+        "num_inverted_fix_rows": sum(1 for r in fx_rows if r["quote"] != "EURUSD"),
+        "num_weekend_prints": sum(
+            1 for r in fx_rows
+            if to_utc(r["timestamp"]).strftime("%Y-%m-%d") not in union_set),
         "num_inner_days": len(inner_dates),
         "problems": _t2_problems(task_dir, fx_rows, us_dates, eu_dates),
     })
@@ -321,6 +379,8 @@ def _solve_t3(task_dir: Path) -> dict:
     report_time = re.search(r"report_time: (\S+)", spec).group(1)
     probe_ticker = re.search(r"probe_ticker: (\S+)", spec).group(1)
     probe_dates = re.search(r"probe_dates: (.+)", spec).group(1).split(", ")
+    probe_ticker_2 = re.search(r"probe_ticker_2: (\S+)", spec).group(1)
+    probe_dates_2 = re.search(r"probe_dates_2: (.+)", spec).group(1).split(", ")
 
     def first_wins(rows, value_fn):
         out, status = {}, {}
@@ -347,10 +407,15 @@ def _solve_t3(task_dir: Path) -> dict:
 
     report_instant = _instant(report_time)
     corr = {}
-    for row in _read_csv(task_dir, "corrections.csv"):
+    corr_rows = _read_csv(task_dir, "corrections.csv")
+    # "Applicable" (memo rule 1) = as_of instant at or before
+    # report_time; later rows are excluded entirely and counted here.
+    n_corr_late = 0
+    for row in corr_rows:
         key = (row["ticker"], row["date"])
         when = _instant(row["as_of"])
         if when > report_instant:
+            n_corr_late += 1
             continue
         if key not in corr or when > corr[key][1]:
             corr[key] = (float(row["close"]), when)
@@ -379,19 +444,33 @@ def _solve_t3(task_dir: Path) -> dict:
     common = sorted(set.intersection(*[set(by[t]) for t in tickers]))
     path = [_mean([by[t][d] / by[t][common[0]] for t in tickers]) for d in common]
     dd, trough = _drawdown(path)
+    # Probe-ticker risk on its own resolved series (date order).
+    p_dates = sorted(by[probe_ticker])
+    p_closes = [by[probe_ticker][d] for d in p_dates]
+    p_dd, p_trough = _drawdown(p_closes)
     answer = {
         "resolved_by_correction": paths["correction"],
         "resolved_by_vendor_a": paths["vendor_a"],
         "resolved_by_median": paths["median"],
+        "num_conflicted_keys": sum(paths.values()),
         "reconciled_total_return": round(path[-1] - 1, 6),
         "max_drawdown": round(dd, 6),
         "max_drawdown_trough_date": common[trough],
+        "probe_ann_vol": round(
+            _std(_returns(p_closes, "log"), 1) * math.sqrt(252), 6),
+        "probe_ticker_max_drawdown": round(p_dd, 6),
+        "probe_ticker_drawdown_trough_date": p_dates[p_trough],
+        "num_correction_rows_total": len(corr_rows),
+        "num_correction_rows_late": n_corr_late,
         "num_resolved_days": len(common),
         "problems": _t3_problems(task_dir, resolved, a_val, b_val),
     }
     for d in probe_dates:
         answer[f"resolved_close_{probe_ticker}_{d.replace('-', '')}"] = \
             round(resolved[(probe_ticker, d)], 6)
+    for d in probe_dates_2:
+        answer[f"resolved_close_{probe_ticker_2}_{d.replace('-', '')}"] = \
+            round(resolved[(probe_ticker_2, d)], 6)
     return answer
 
 
@@ -452,6 +531,7 @@ def _solve_t4(task_dir: Path) -> dict:
 
     lots = {t: [] for t in assets}
     cash_lieu, realised = 0.0, 0.0
+    lieu_events = 0
     values, flows = [], []
     for ds in dates:
         for ticker, a, b in events.get(ds, []):
@@ -461,7 +541,11 @@ def _solve_t4(task_dir: Path) -> dict:
                     continue
                 new_shares = lot[0] * ratio
                 whole = math.floor(new_shares + 1e-9)
+                # The fraction's basis leaves with the cash: per-share
+                # cost divides by the ratio (memo rule 2).
                 cash_lieu += (new_shares - whole) * price_at[ticker][ds]
+                if new_shares - whole > 1e-9:
+                    lieu_events += 1
                 lot[0], lot[1] = float(whole), lot[1] / ratio
             lots[ticker] = [lot for lot in lots[ticker] if lot[0] > 0]
         flow = 0.0
@@ -494,10 +578,23 @@ def _solve_t4(task_dir: Path) -> dict:
         index.append(index[-1] * (1 + ((v - f) / prev - 1)))
         if v > 0:
             prev = v
-    dd, _ = _drawdown(index)
+    dd, dd_idx = _drawdown(index)
+    idx_dates = dates[len(dates) - len(index):]
     end_shares = {t: int(round(sum(lot[0] for lot in lots[t]))) for t in assets}
     remaining_cost = sum(lot[0] * lot[1] for t in assets for lot in lots[t])
     end_mv = sum(end_shares[t] * price_at[t][dates[-1]] for t in assets)
+    # Downstream chain: risk on the TWR index, then the terminal
+    # equal-weight rebalance on the end state (memo rules 6-8).
+    idx_rets = _returns(index, "simple")
+    worst_roll, worst_roll_end = None, None
+    for j in range(20, len(index)):
+        r = index[j] / index[j - 20] - 1
+        if worst_roll is None or r < worst_roll:
+            worst_roll, worst_roll_end = r, j
+    total_value = end_mv + cash_lieu
+    n_assets = len(assets)
+    target_shares = {t: int(math.floor(
+        (total_value / n_assets) / price_at[t][dates[-1]])) for t in assets}
     answer = {
         **{f"shares_{t}": end_shares[t] for t in assets},
         "realised_pnl_fifo": round(realised, 6),
@@ -505,6 +602,21 @@ def _solve_t4(task_dir: Path) -> dict:
         "cash_in_lieu": round(cash_lieu, 6),
         "twr_total_return": round(index[-1] - 1, 6),
         "max_drawdown": round(dd, 6),
+        "max_drawdown_trough_date": idx_dates[dd_idx],
+        "twr_ann_vol": round(_std(idx_rets, 1) * math.sqrt(252), 6)
+        if len(idx_rets) > 1 else 0.0,
+        "worst_rolling_20d_return": round(worst_roll, 6)
+        if worst_roll is not None else 0.0,
+        "worst_rolling_20d_end_date": idx_dates[worst_roll_end]
+        if worst_roll_end is not None else dates[-1],
+        "num_cash_in_lieu_events": lieu_events,
+        "num_lots_end": sum(len(lots[t]) for t in assets),
+        "rebalance_target_shares": target_shares,
+        "rebalance_trade_shares": {
+            t: target_shares[t] - end_shares[t] for t in assets},
+        "rebalance_leftover_cash": round(
+            total_value - sum(target_shares[t] * price_at[t][dates[-1]]
+                              for t in assets), 6),
         "num_trades": n_trades,
         "num_splits": sum(len(v) for v in events.values()),
         "problems": sorted(set(problems)),
@@ -526,7 +638,8 @@ def _solve_t5(task_dir: Path) -> dict:
     closes = {t: prices[t][1] for t in assets}
     rebalance_idx = [i - 1 for i in cfg["rebalance_row_indices_1based"]]
     lookback, delta = cfg["lookback_returns"], cfg["shrinkage_delta"]
-    lot, buffer_pct = cfg["lot_size"], cfg["cash_buffer_pct"]
+    lot_sizes, min_trade = cfg["lot_sizes"], cfg["min_trade_shares"]
+    buffer_pct = cfg["cash_buffer_pct"]
 
     sector_members: dict[str, list[int]] = {}
     for i, t in enumerate(assets):
@@ -616,23 +729,27 @@ def _solve_t5(task_dir: Path) -> dict:
         return w
 
     def allocate(desired, nav, px):
-        # Floor to lots, then greedy: largest positive residual first
-        # (ties by ticker), one lot at a time while cash covers it.
-        # Remaining cash includes the buffer, so this may spend into it.
-        shares = [int(math.floor(d / (p * lot)) * lot) for d, p in zip(desired, px, strict=True)]
+        # Floor to each asset's own lot size, then greedy: largest
+        # positive residual first (ties by ticker), one lot at a time
+        # while cash covers it.  Remaining cash includes the buffer,
+        # so this may spend into it.
+        shares = [int(math.floor(d / (p * lot_sizes[t])) * lot_sizes[t])
+                  for d, p, t in zip(desired, px, assets, strict=True)]
         cash = nav - sum(s * p for s, p in zip(shares, px, strict=True))
         while True:
             residuals = [d - s * p for d, s, p in zip(desired, shares, px, strict=True)]
             for i in sorted(range(len(assets)), key=lambda i: (-residuals[i], assets[i])):
-                if residuals[i] > 1e-9 and cash >= lot * px[i] - 1e-9:
-                    shares[i] += lot
-                    cash -= lot * px[i]
+                if residuals[i] > 1e-9 and cash >= lot_sizes[assets[i]] * px[i] - 1e-9:
+                    shares[i] += lot_sizes[assets[i]]
+                    cash -= lot_sizes[assets[i]] * px[i]
                     break
             else:
                 return shares, cash
 
     shares, cash = [0] * len(assets), float(cfg["capital"])
     weights_first = shares_first = None
+    weights_last = shares_last = None
+    total_cost, traded_last = 0.0, 0
     turnovers, nav_path = {}, []
     for idx, _ds in enumerate(dates):
         px = [closes[t][idx] for t in assets]
@@ -649,11 +766,19 @@ def _solve_t5(task_dir: Path) -> dict:
                 factor = cfg["turnover_cap"] / (traded / nav_pre)
                 new_shares = [
                     s + (1 if ns > s else -1)
-                    * int(math.floor(abs(ns - s) * factor / lot)) * lot
-                    for ns, s in zip(new_shares, shares, strict=True)]
+                    * int(math.floor(abs(ns - s) * factor / lot_sizes[t])) * lot_sizes[t]
+                    for ns, s, t in zip(new_shares, shares, assets, strict=True)]
                 new_cash = nav_pre - sum(
                     s * p for s, p in zip(new_shares, px, strict=True))
                 traded = sum(abs(ns - s) * p for ns, s, p in zip(new_shares, shares, px, strict=True))
+            # Minimum trade size (memo step 5): a nonzero change
+            # smaller than min_trade_shares is not traded at all.
+            new_shares = [
+                s if 0 < abs(ns - s) < min_trade else ns
+                for ns, s in zip(new_shares, shares, strict=True)]
+            new_cash = nav_pre - sum(
+                s * p for s, p in zip(new_shares, px, strict=True))
+            traded = sum(abs(ns - s) * p for ns, s, p in zip(new_shares, shares, px, strict=True))
             turnovers[str(len(turnovers) + 1)] = round(traded / nav_pre, 6)
             # Cost last: if cash after cost would be negative, return
             # lots (largest allocated-minus-desired excess, ties by
@@ -664,23 +789,33 @@ def _solve_t5(task_dir: Path) -> dict:
                 pick = min(range(len(assets)), key=lambda i: (-excess[i], assets[i]))
                 if new_shares[pick] <= 0:
                     pick = max(range(len(assets)), key=lambda i: new_shares[i])
-                new_shares[pick] -= lot
-                new_cash += lot * px[pick]
+                new_shares[pick] -= lot_sizes[assets[pick]]
+                new_cash += lot_sizes[assets[pick]] * px[pick]
                 traded = sum(abs(ns - s) * p for ns, s, p in zip(new_shares, shares, px, strict=True))
                 cost = traded * cfg["cost_bps"] / 10000
                 turnovers[str(len(turnovers))] = round(traded / nav_pre, 6)
             new_cash -= cost
+            total_cost += cost
             if weights_first is None:
                 weights_first = {t: round(float(wi), 6) for t, wi in zip(assets, w, strict=True)}
                 shares_first = {t: int(s) for t, s in zip(assets, new_shares, strict=True)}
+            weights_last = {t: round(float(wi), 6) for t, wi in zip(assets, w, strict=True)}
+            shares_last = {t: int(s) for t, s in zip(assets, new_shares, strict=True)}
+            traded_last = sum(
+                1 for ns, s in zip(new_shares, shares, strict=True) if ns != s)
             shares, cash = new_shares, new_cash
         nav_path.append(cash + sum(s * p for s, p in zip(shares, px, strict=True)))
     dd, _ = _drawdown(nav_path)
     return {
         "weights_first_rebalance": weights_first,
         "shares_first_rebalance": shares_first,
+        "weights_last_rebalance": weights_last,
+        "shares_last_rebalance": shares_last,
         "turnover_by_rebalance": turnovers,
         "num_rebalances": len(rebalance_idx),
+        "total_cost_paid": round(total_cost, 6),
+        "num_assets_traded_last_rebalance": traded_last,
+        "nav_ann_vol": round(_std(_returns(nav_path, "simple"), 1) * math.sqrt(252), 6),
         "final_nav": round(nav_path[-1], 6),
         "max_drawdown": round(dd, 6),
         "cash_left": round(cash, 6),

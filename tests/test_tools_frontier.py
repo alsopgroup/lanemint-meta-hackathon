@@ -571,7 +571,8 @@ class TestRepilotFixes:
                 task_dir = root / task["data_dir"]
                 spec = (task_dir / "spec.md").read_text()
                 assert "supersedes every earlier" in spec
-                assert "comparing the stamp strings as written" in spec
+                assert "comparing the stamp strings as written" in \
+                    " ".join(spec.split())
                 corr = list(csv_mod.DictReader(
                     open(task_dir / "corrections.csv")))
                 # At least one key carries two corrections (one
@@ -603,9 +604,9 @@ class TestRepilotFixes:
                 assert "not counted" in spec
                 rows = list(csv_mod.DictReader(open(task_dir / "splits.csv")))
                 real = [r for r in rows if r["ratio"] != "1-for-1"]
-                # The no-op row is present in the table but is not an
-                # event: num_splits counts only real rows.
-                assert len(rows) == len(real) + 1, task["id"]
+                # The no-op rows are present in the table but are not
+                # events: num_splits counts only real rows.
+                assert len(rows) - len(real) == 2, task["id"]
                 expected = json.loads(
                     (root / "answers" / f"{task['id']}_answer.json").read_text())
                 assert expected["num_splits"] == len(real)
@@ -635,3 +636,201 @@ class TestRepilotFixes:
                         "recent_vol_last_60"} <= set(expected)
                 assert {"wrong_benchmark", "full_sample_instead_of_recent"} \
                     <= set(task["trap_variants"])
+
+
+# ------------------------------------------------- computation hardening
+
+class TestComputationHardening:
+    """Round-4 hardening (seed 7301 pilot saturated at 30/30): scale,
+    chained pipelines, cross-family composites and exact counts.  These
+    tests pin the structural guarantees the generator constructs; the
+    reference-solver test pins the numbers."""
+
+    def test_t1_scale_and_composite_fields(self, dev_sets):
+        import csv as csv_mod
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_convention_risk":
+                    continue
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                # 8 assets, each with its own ann-vol convention field.
+                assert sum(1 for k in expected
+                           if k.startswith("ann_vol_")) == 8
+                assert {"portfolio_ann_vol", "portfolio_max_drawdown",
+                        "portfolio_max_drawdown_trough_date",
+                        "portfolio_sharpe", "rolling_max_correlation",
+                        "rolling_max_correlation_end_date",
+                        "worst_day_return", "worst_day_date"} <= set(expected)
+                assert expected["num_aligned_days"] == 260
+                tickers = {r["ticker"] for r in csv_mod.DictReader(
+                    open(root / task["data_dir"] / "prices.csv"))}
+                assert {"BMK", "BMK2"} <= tickers and len(tickers) == 10
+                assert "portfolio_from_price_levels" in task["trap_variants"]
+
+    def test_t2_exact_fix_counts(self, dev_sets):
+        import csv as csv_mod
+        from datetime import UTC
+        from datetime import datetime as dt
+
+        def read(task_dir, name):
+            return list(csv_mod.DictReader(open(task_dir / name)))
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_fx_calendar":
+                    continue
+                task_dir = root / task["data_dir"]
+                union = sorted(
+                    {r["date"] for r in read(task_dir, "us_prices.csv")}
+                    | {r["date"] for r in read(task_dir, "eu_prices.csv")})
+                by_utc, late = {}, 0
+                inverted = weekend = 0
+                for r in read(task_dir, "fx.csv"):
+                    instant = dt.fromisoformat(
+                        r["timestamp"].replace("Z", "+00:00")).astimezone(UTC)
+                    ds = instant.strftime("%Y-%m-%d")
+                    by_utc[ds] = instant
+                    inverted += r["quote"] == "USDEUR"
+                    weekend += ds not in union
+                for ds in union:
+                    inst = by_utc[ds]
+                    late += (inst.hour * 60 + inst.minute) > 16 * 60
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert expected["num_late_fixes"] == late, task["id"]
+                assert expected["num_inverted_fix_rows"] == inverted
+                assert expected["num_weekend_prints"] == weekend
+                assert {"nav_ann_vol", "nav_drawdown_trough_date",
+                        "eu_sleeve_weight_last_probe"} <= set(expected)
+                assert any(k.startswith("us_sleeve_usd_") for k in expected)
+                assert 0.0 < expected["eu_sleeve_weight_last_probe"] < 1.0
+
+    def test_t3_applicable_correction_counts(self, dev_sets):
+        import csv as csv_mod
+        import re as re_mod
+        from datetime import UTC
+        from datetime import datetime as dt
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_reconciliation":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                # The nit fix: "applicable correction" is defined, and
+                # post-report-time corrections are excluded entirely.
+                assert "An APPLICABLE correction" in spec
+                assert "applicable: it is excluded entirely" in spec
+                report = re_mod.search(r"report_time: (\S+)", spec).group(1)
+                report_inst = dt.fromisoformat(
+                    report.replace("Z", "+00:00")).astimezone(UTC)
+                corr = list(csv_mod.DictReader(
+                    open(task_dir / "corrections.csv")))
+                late = sum(
+                    1 for r in corr
+                    if dt.fromisoformat(r["as_of"].replace("Z", "+00:00"))
+                    .astimezone(UTC) > report_inst)
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert expected["num_correction_rows_total"] == len(corr)
+                assert expected["num_correction_rows_late"] == late
+                assert expected["num_conflicted_keys"] == (
+                    expected["resolved_by_correction"]
+                    + expected["resolved_by_vendor_a"]
+                    + expected["resolved_by_median"])
+                # Second probe ticker and the resolved-series risk
+                # composite are reported.
+                assert sum(1 for k in expected
+                           if k.startswith("resolved_close_REC2_")) == 2
+                assert {"probe_ann_vol", "probe_ticker_max_drawdown",
+                        "probe_ticker_drawdown_trough_date"} <= set(expected)
+
+    def test_t4_rebalance_chain_and_cost_basis(self, dev_sets):
+        import csv as csv_mod
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_split_holdings":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                # The nit fix: the memo states the cashed-out
+                # fraction's cost basis is removed from the lot.
+                assert "REMOVED from the lot" in spec
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert expected["num_splits"] == 6
+                # Terminal rebalance identity, recomputed from the
+                # key's own end state and the last closes in the file.
+                prices = list(csv_mod.DictReader(
+                    open(task_dir / "prices.csv")))
+                # Take each ticker's close on its maximum date (rows
+                # are not guaranteed to be in date order).
+                last_close, best_date = {}, {}
+                for r in prices:
+                    t = r["ticker"]
+                    if r["date"] >= best_date.get(t, ""):
+                        best_date[t] = r["date"]
+                        last_close[t] = float(r["close"])
+                tickers = sorted(last_close)
+                end_mv = sum(expected[f"shares_{t}"] * last_close[t]
+                             for t in tickers)
+                total = end_mv + expected["cash_in_lieu"]
+                for t in tickers:
+                    want = int((total / len(tickers)) // last_close[t])
+                    assert expected["rebalance_target_shares"][t] == want, (
+                        task["id"], t)
+                    assert expected["rebalance_trade_shares"][t] == (
+                        want - expected[f"shares_{t}"])
+                leftover = total - sum(
+                    expected["rebalance_target_shares"][t] * last_close[t]
+                    for t in tickers)
+                assert abs(expected["rebalance_leftover_cash"] - leftover) < 1e-4
+                assert {"max_drawdown_trough_date", "twr_ann_vol",
+                        "worst_rolling_20d_return",
+                        "worst_rolling_20d_end_date",
+                        "num_cash_in_lieu_events", "num_lots_end"} <= set(expected)
+                assert expected["num_cash_in_lieu_events"] >= 1
+
+    def test_t5_constraints_and_multiperiod_state(self, dev_sets):
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_portfolio_construction":
+                    continue
+                task_dir = root / task["data_dir"]
+                cfg = json.loads((task_dir / "constraints.json").read_text())
+                assert len(cfg["lot_sizes"]) == 10
+                assert cfg["min_trade_shares"] > 0
+                assert len(set(cfg["sectors"].values())) == 3
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert {"weights_last_rebalance", "shares_last_rebalance",
+                        "total_cost_paid",
+                        "num_assets_traded_last_rebalance",
+                        "nav_ann_vol"} <= set(expected)
+                assert expected["num_rebalances"] == len(
+                    cfg["rebalance_row_indices_1based"]) == 7
+                for field in ("shares_first_rebalance",
+                              "shares_last_rebalance"):
+                    for t, s in expected[field].items():
+                        # Every share count is a whole multiple of the
+                        # asset's own lot size.  (The minimum-trade rule
+                        # itself is pinned by the min_trade_size_ignored
+                        # gate variant below: it changes the answer on
+                        # every generated task, or the task is reseeded.)
+                        assert s % cfg["lot_sizes"][t] == 0, (task["id"], t)
+                assert "min_trade_size_ignored" in task["trap_variants"]
+                for field in ("weights_first_rebalance",
+                              "weights_last_rebalance"):
+                    weights = expected[field]
+                    assert all(w <= cfg["per_asset_cap"] + 1e-4
+                               for w in weights.values())
+                    for sector, cap in cfg["sector_caps"].items():
+                        ssum = sum(w for t, w in weights.items()
+                                   if cfg["sectors"][t] == sector)
+                        assert ssum <= cap + 2e-3, (task["id"], sector)
+                assert expected["total_cost_paid"] > 0
+                assert 0 <= expected[
+                    "num_assets_traded_last_rebalance"] <= 10
