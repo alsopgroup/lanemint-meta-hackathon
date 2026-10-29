@@ -274,6 +274,63 @@ def _solve_t1(task_dir: Path) -> dict:
     answer["hedged_ann_vol"] = round(
         _std(hedged, int(mh.group(8))) * math.sqrt(int(mh.group(7))), 6)
 
+    # Stateful hedged-strategy simulation (memo section 16): rolling
+    # re-estimation of the bounded hedge ratio every rebalance_step
+    # indices, short resized in whole hedge lots, costs charged to
+    # cash, NAV carried daily over asset + short + cash.
+    ms = re.search(
+        r"- hedge_strategy: asset=(\w+); benchmark=(\w+); capital=(\d+); "
+        r"window_returns=(\d+); first_rebalance_index=(\d+); "
+        r"rebalance_step=(\d+); hedge_lot=(\d+); cost_bps=([\d.]+); "
+        r"lower_bound=([\d.]+); upper_bound=([\d.]+)", spec)
+    s_asset, s_bench = ms.group(1), ms.group(2)
+    capital = float(ms.group(3))
+    s_window, s_first = int(ms.group(4)), int(ms.group(5))
+    s_step, s_lot = int(ms.group(6)), int(ms.group(7))
+    s_cost = float(ms.group(8))
+    s_lo, s_hi = float(ms.group(9)), float(ms.group(10))
+    closes_a, closes_b = series[s_asset][1], series[s_bench][1]
+    log_a = _returns(closes_a, "log")
+    log_b = _returns(closes_b, "log")
+
+    def _cov_var(xa, xb):
+        mx, my = _mean(xa), _mean(xb)
+        cov = sum((x - mx) * (y - my) for x, y in zip(xa, xb, strict=True)) \
+            / (len(xa) - 1)
+        var = sum((y - my) ** 2 for y in xb) / (len(xb) - 1)
+        return cov / var
+
+    asset_shares = int(capital // closes_a[0])
+    cash = capital - asset_shares * closes_a[0]
+    short, total_cost, ratios, navs = 0.0, 0.0, [], []
+    for idx in range(len(closes_a)):
+        if idx >= s_first and (idx - s_first) % s_step == 0:
+            ratio = _cov_var(log_a[idx - s_window:idx],
+                             log_b[idx - s_window:idx])
+            ratio = min(max(ratio, s_lo), s_hi)
+            ratios.append(ratio)
+            desired = float(int(
+                ratio * asset_shares * closes_a[idx] / closes_b[idx]
+                // s_lot) * s_lot)
+            trade = desired - short
+            cost = abs(trade) * closes_b[idx] * s_cost / 10000
+            cash += trade * closes_b[idx] - cost
+            total_cost += cost
+            short = desired
+        navs.append(cash + asset_shares * closes_a[idx] - short * closes_b[idx])
+    s_dd, _s_tr = _drawdown(navs)
+    s_log_rets = [math.log(b / a) for a, b in zip(navs, navs[1:], strict=False)]
+    answer.update({
+        "hedge_strategy_final_nav": round(navs[-1], 6),
+        "hedge_strategy_ann_vol": round(_std(s_log_rets, 1) * math.sqrt(252), 6),
+        "hedge_strategy_max_drawdown": round(s_dd, 6),
+        "hedge_strategy_total_cost": round(total_cost, 6),
+        "num_hedge_rebalances": len(ratios),
+        "hedge_strategy_final_short_shares": int(short),
+        "hedge_strategy_last_ratio": round(ratios[-1], 6),
+        "hedge_strategy_cash_end": round(cash, 6),
+    })
+
     any_ticker = tickers[0]
     answer["num_aligned_days"] = len(series[any_ticker][0])
     return answer
@@ -376,6 +433,129 @@ def _solve_t2(task_dir: Path) -> dict:
     h_dd, _h_trough = _drawdown(hedged_series)
     h_log = [math.log(b / a)
              for a, b in zip(hedged_series, hedged_series[1:], strict=False)]
+
+    # Monthly rebalanced sleeve strategy (memo rule 9): rolling
+    # bounded two-asset minimum-variance sleeve weight from trailing
+    # sleeve returns (EU measured in USD at effective rates), traded
+    # in lots with minimum trade size and costs against cash.
+    mst = re.search(
+        r"- strategy: capital=(\d+); window_returns=(\d+); "
+        r"eu_weight_bounds=([\d.]+),([\d.]+); cash_buffer_pct=([\d.]+); "
+        r"min_trade_shares=(\d+); cost_bps=([\d.]+); lots: (.+)$",
+        spec, re.MULTILINE)
+    st_capital, st_window = float(mst.group(1)), int(mst.group(2))
+    st_lo, st_hi = float(mst.group(3)), float(mst.group(4))
+    st_buffer = float(mst.group(5))
+    st_min_trade, st_cost_bps = int(mst.group(6)), float(mst.group(7))
+    st_lots = {t: int(v) for t, v in re.findall(r"(\w+)=(\d+)", mst.group(8))}
+    us_tickers, eu_tickers = sorted(us), sorted(eu)
+    st_assets = us_tickers + eu_tickers
+    us_map = {t: dict(zip(*us[t], strict=True)) for t in us_tickers}
+    eu_map = {t: dict(zip(*eu[t], strict=True)) for t in eu_tickers}
+
+    def st_price(ticker, ds):
+        if ticker in us_map:
+            return us_map[ticker][ds]
+        return eu_map[ticker][ds] * effective[ds]
+
+    sleeve_us, sleeve_eu = [], []
+    for k in range(len(inner_dates) - 1):
+        d0, d1 = inner_dates[k], inner_dates[k + 1]
+        sleeve_us.append(_mean([us_map[t][d1] / us_map[t][d0] - 1
+                                for t in us_tickers]))
+        sleeve_eu.append(_mean([
+            (eu_map[t][d1] * effective[d1]) / (eu_map[t][d0] * effective[d0]) - 1
+            for t in eu_tickers]))
+
+    def _var_of(xs):
+        m = _mean(xs)
+        return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+
+    st_shares = dict.fromkeys(st_assets, 0)
+    st_cash, st_total_cost, st_weights = st_capital, 0.0, []
+    st_nav_path = []
+    st_reb = {i for i, ds in enumerate(inner_dates)
+              if i >= st_window
+              and (i == 0 or ds[:7] != inner_dates[i - 1][:7])}
+    for idx, ds in enumerate(inner_dates):
+        if idx in st_reb:
+            nav_pre = st_cash + sum(st_shares[t] * st_price(t, ds)
+                                    for t in st_assets)
+            xa = sleeve_us[idx - st_window:idx]
+            xb = sleeve_eu[idx - st_window:idx]
+            var_us, var_eu = _var_of(xa), _var_of(xb)
+            mx, my = _mean(xa), _mean(xb)
+            cov_se = sum((x - mx) * (y - my)
+                         for x, y in zip(xa, xb, strict=True)) / (len(xa) - 1)
+            denom = var_us + var_eu - 2 * cov_se
+            w_unc = (var_us - cov_se) / denom if denom else 0.5
+            w_eu = min(max(w_unc, st_lo), st_hi)
+            st_weights.append(w_eu)
+            desired = {}
+            for t in us_tickers:
+                desired[t] = (1 - w_eu) / len(us_tickers) * nav_pre * (1 - st_buffer)
+            for t in eu_tickers:
+                desired[t] = w_eu / len(eu_tickers) * nav_pre * (1 - st_buffer)
+            new_shares = {t: int(desired[t] / st_price(t, ds) // st_lots[t])
+                          * st_lots[t] for t in st_assets}
+            cash_left = nav_pre - sum(new_shares[t] * st_price(t, ds)
+                                      for t in st_assets)
+            while True:
+                residuals = {t: desired[t] - new_shares[t] * st_price(t, ds)
+                             for t in st_assets}
+                bought = False
+                for t in sorted(st_assets, key=lambda t: (-residuals[t], t)):
+                    lot_cost = st_lots[t] * st_price(t, ds)
+                    if residuals[t] > 1e-9 and cash_left >= lot_cost - 1e-9:
+                        new_shares[t] += st_lots[t]
+                        cash_left -= lot_cost
+                        bought = True
+                        break
+                if not bought:
+                    break
+            new_shares = {
+                t: st_shares[t]
+                if 0 < abs(new_shares[t] - st_shares[t]) < st_min_trade
+                else new_shares[t] for t in st_assets}
+            traded = sum(abs(new_shares[t] - st_shares[t]) * st_price(t, ds)
+                         for t in st_assets)
+            cash_left = nav_pre - sum(new_shares[t] * st_price(t, ds)
+                                      for t in st_assets)
+            cost = traded * st_cost_bps / 10000
+            while cash_left - cost < 0 and any(new_shares[t] > 0
+                                               for t in st_assets):
+                excess = {t: new_shares[t] * st_price(t, ds) - desired[t]
+                          for t in st_assets}
+                pick = min(st_assets, key=lambda t: (-excess[t], t))
+                if new_shares[pick] <= 0:
+                    pick = max(st_assets, key=lambda t: new_shares[t])
+                new_shares[pick] -= st_lots[pick]
+                cash_left += st_lots[pick] * st_price(pick, ds)
+                traded = sum(abs(new_shares[t] - st_shares[t]) * st_price(t, ds)
+                             for t in st_assets)
+                cost = traded * st_cost_bps / 10000
+            st_cash = cash_left - cost
+            st_total_cost += cost
+            st_shares = new_shares
+        st_nav_path.append(st_cash + sum(st_shares[t] * st_price(t, ds)
+                                         for t in st_assets))
+    st_dd, _st_tr = _drawdown(st_nav_path)
+    st_log = [math.log(b / a)
+              for a, b in zip(st_nav_path, st_nav_path[1:], strict=False)]
+    st_last = inner_dates[-1]
+    strategy_fields = {
+        "strategy_final_nav": round(st_nav_path[-1], 6),
+        "strategy_ann_vol": round(_std(st_log, 1) * math.sqrt(252), 6),
+        "strategy_max_drawdown": round(st_dd, 6),
+        "strategy_total_cost": round(st_total_cost, 6),
+        "num_strategy_rebalances": len(st_weights),
+        "strategy_final_shares": {t: int(st_shares[t]) for t in st_assets},
+        "strategy_last_eu_weight": round(st_weights[-1], 6),
+        "strategy_cash_end": round(st_cash, 6),
+        "strategy_eu_weight_final": round(
+            sum(st_shares[t] * st_price(t, st_last) for t in eu_tickers)
+            / st_nav_path[-1], 6),
+    }
     union_set = set(union_dates)
     answer = {f"nav_{d.replace('-', '')}": round(navs[d], 6) for d in probe}
     answer.update({
@@ -403,6 +583,7 @@ def _solve_t2(task_dir: Path) -> dict:
         "num_hedge_resets": len(resets),
         "hedged_nav_ann_vol": round(_std(h_log, 1) * math.sqrt(252), 6),
         "hedged_nav_max_drawdown": round(h_dd, 6),
+        **strategy_fields,
         "num_inner_days": len(inner_dates),
         "problems": _t2_problems(task_dir, fx_rows, us_dates, eu_dates),
     })
@@ -494,6 +675,46 @@ def _solve_t3(task_dir: Path) -> dict:
 
     tickers = sorted({t for t, _ in resolved})
     by = {t: {d: v for (tt, d), v in resolved.items() if tt == t} for t in tickers}
+
+    def _parity_weights(cov):
+        """Risk-parity weights for a 3x3 covariance (Newton, memo)."""
+
+        def solve3(mat, vec):
+            a = [row[:] + [vec[i]] for i, row in enumerate(mat)]
+            for col in range(3):
+                piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
+                a[col], a[piv] = a[piv], a[col]
+                for r in range(3):
+                    if r != col:
+                        f = a[r][col] / a[col][col]
+                        for cc in range(col, 4):
+                            a[r][cc] -= f * a[col][cc]
+            return [a[i][3] / a[i][i] for i in range(3)]
+
+        def obj(w):
+            return 0.5 * sum(w[i] * cov[i][j] * w[j]
+                             for i in range(3) for j in range(3)) \
+                - sum(math.log(x) for x in w)
+
+        w = [1.0 / math.sqrt(cov[i][i]) for i in range(3)]
+        for _it in range(200):
+            sw = [sum(cov[i][j] * w[j] for j in range(3)) for i in range(3)]
+            grad = [sw[i] - 1.0 / w[i] for i in range(3)]
+            if max(abs(g) for g in grad) < 1e-13:
+                break
+            hess = [[cov[i][j] + (1.0 / w[i] ** 2 if i == j else 0.0)
+                     for j in range(3)] for i in range(3)]
+            step = solve3(hess, [-g for g in grad])
+            t_step, f0 = 1.0, obj(w)
+            for _ls in range(80):
+                cand = [w[i] + t_step * step[i] for i in range(3)]
+                if all(x > 0 for x in cand) and obj(cand) <= f0:
+                    break
+                t_step *= 0.5
+            w = [w[i] + t_step * step[i] for i in range(3)]
+        total = sum(w)
+        return [x / total for x in w]
+
     # Risk-parity weights (memo Derived fields): unique positive
     # weights summing to 1 with w_i (Sigma w)_i equal across the three
     # tickers, Sigma the ddof=1 log-return covariance on the dates
@@ -509,42 +730,107 @@ def _solve_t3(task_dir: Path) -> dict:
                    for k in range(n_rp)) / (n_rp - 1)
                for b in rp_tickers] for a in rp_tickers]
 
-    def _solve3(mat, vec):
-        a = [row[:] + [vec[i]] for i, row in enumerate(mat)]
-        for col in range(3):
-            piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
-            a[col], a[piv] = a[piv], a[col]
-            for r in range(3):
-                if r != col:
-                    f = a[r][col] / a[col][col]
-                    for cc in range(col, 4):
-                        a[r][cc] -= f * a[col][cc]
-        return [a[i][3] / a[i][i] for i in range(3)]
+    rp_weights = dict(zip(
+        rp_tickers, _parity_weights(rp_cov), strict=True))
 
-    def _rp_obj(w):
-        return 0.5 * sum(w[i] * rp_cov[i][j] * w[j]
-                         for i in range(3) for j in range(3)) \
-            - sum(math.log(x) for x in w)
+    # Rolling risk-parity strategy (memo Derived fields): re-solve
+    # the parity weights on trailing 60-return windows and trade
+    # them in lots with minimum trade size and costs at resolved
+    # closes, carrying shares and cash across rebalances.
+    mrs = re.search(
+        r"rp_strategy: capital=(\d+); window_returns=(\d+); "
+        r"first_rebalance_index=(\d+); rebalance_step=(\d+); "
+        r"cash_buffer_pct=([\d.]+); min_trade_shares=(\d+); "
+        r"cost_bps=([\d.]+); lots: (.+)$", spec, re.MULTILINE)
+    rs_capital, rs_window = float(mrs.group(1)), int(mrs.group(2))
+    rs_first, rs_step = int(mrs.group(3)), int(mrs.group(4))
+    rs_buffer = float(mrs.group(5))
+    rs_min_trade, rs_cost_bps = int(mrs.group(6)), float(mrs.group(7))
+    rs_lots = {t: int(v) for t, v in re.findall(r"(\w+)=(\d+)", mrs.group(8))}
+    rs_days = rp_days
+    rs_closes = [[by[t][d] for d in rs_days] for t in rp_tickers]
 
-    rp_w = [1.0 / math.sqrt(rp_cov[i][i]) for i in range(3)]
-    for _it in range(200):
-        sw = [sum(rp_cov[i][j] * rp_w[j] for j in range(3)) for i in range(3)]
-        grad = [sw[i] - 1.0 / rp_w[i] for i in range(3)]
-        if max(abs(g) for g in grad) < 1e-13:
-            break
-        hess = [[rp_cov[i][j] + (1.0 / rp_w[i] ** 2 if i == j else 0.0)
-                 for j in range(3)] for i in range(3)]
-        step = _solve3(hess, [-g for g in grad])
-        t_step, f0 = 1.0, _rp_obj(rp_w)
-        for _ls in range(80):
-            cand = [rp_w[i] + t_step * step[i] for i in range(3)]
-            if all(x > 0 for x in cand) and _rp_obj(cand) <= f0:
-                break
-            t_step *= 0.5
-        rp_w = [rp_w[i] + t_step * step[i] for i in range(3)]
-    _rp_total = sum(rp_w)
-    rp_weights = {t: rp_w[i] / _rp_total
-                  for i, t in enumerate(rp_tickers)}
+    def rs_window_weights(idx):
+        rets = []
+        for c in rs_closes:
+            seg = c[idx - rs_window:idx + 1]
+            rets.append([math.log(b / a)
+                         for a, b in zip(seg, seg[1:], strict=False)])
+        m = len(rets[0])
+        means = [_mean(r) for r in rets]
+        cov = [[sum((rets[i][k] - means[i]) * (rets[j][k] - means[j])
+                    for k in range(m)) / (m - 1)
+                for j in range(3)] for i in range(3)]
+        return _parity_weights(cov)
+
+    rs_shares = [0, 0, 0]
+    rs_cash, rs_total_cost, rs_last_w = rs_capital, 0.0, None
+    rs_nav_path, rs_n_reb = [], 0
+    for idx in range(len(rs_days)):
+        px = [rs_closes[i][idx] for i in range(3)]
+        if idx >= rs_first and (idx - rs_first) % rs_step == 0:
+            nav_pre = rs_cash + sum(s * p for s, p in
+                                    zip(rs_shares, px, strict=True))
+            w = rs_window_weights(idx)
+            rs_last_w, rs_n_reb = w, rs_n_reb + 1
+            desired = [wi * nav_pre * (1 - rs_buffer) for wi in w]
+            lot_of = [rs_lots[t] for t in rp_tickers]
+            new_shares = [int(desired[i] / px[i] // lot_of[i]) * lot_of[i]
+                          for i in range(3)]
+            cash_left = nav_pre - sum(s * p for s, p in
+                                      zip(new_shares, px, strict=True))
+            while True:
+                residuals = [desired[i] - new_shares[i] * px[i]
+                             for i in range(3)]
+                bought = False
+                for i in sorted(range(3), key=lambda i: (
+                        -residuals[i], rp_tickers[i])):
+                    lot_cost = lot_of[i] * px[i]
+                    if residuals[i] > 1e-9 and cash_left >= lot_cost - 1e-9:
+                        new_shares[i] += lot_of[i]
+                        cash_left -= lot_cost
+                        bought = True
+                        break
+                if not bought:
+                    break
+            new_shares = [
+                rs_shares[i] if 0 < abs(new_shares[i] - rs_shares[i])
+                < rs_min_trade else new_shares[i] for i in range(3)]
+            traded = sum(abs(ns - s) * p for ns, s, p in
+                         zip(new_shares, rs_shares, px, strict=True))
+            cash_left = nav_pre - sum(s * p for s, p in
+                                      zip(new_shares, px, strict=True))
+            cost = traded * rs_cost_bps / 10000
+            while cash_left - cost < 0 and any(s > 0 for s in new_shares):
+                excess = [new_shares[i] * px[i] - desired[i] for i in range(3)]
+                pick = min(range(3), key=lambda i: (-excess[i], rp_tickers[i]))
+                if new_shares[pick] <= 0:
+                    pick = max(range(3), key=lambda i: new_shares[i])
+                new_shares[pick] -= lot_of[pick]
+                cash_left += lot_of[pick] * px[pick]
+                traded = sum(abs(ns - s) * p for ns, s, p in
+                             zip(new_shares, rs_shares, px, strict=True))
+                cost = traded * rs_cost_bps / 10000
+            rs_cash = cash_left - cost
+            rs_total_cost += cost
+            rs_shares = new_shares
+        rs_nav_path.append(rs_cash + sum(s * p for s, p in
+                                         zip(rs_shares, px, strict=True)))
+    rs_dd, _rs_tr = _drawdown(rs_nav_path)
+    rs_log = [math.log(b / a)
+              for a, b in zip(rs_nav_path, rs_nav_path[1:], strict=False)]
+    rp_strategy_fields = {
+        "rp_strategy_final_nav": round(rs_nav_path[-1], 6),
+        "rp_strategy_ann_vol": round(_std(rs_log, 1) * math.sqrt(252), 6),
+        "rp_strategy_max_drawdown": round(rs_dd, 6),
+        "rp_strategy_total_cost": round(rs_total_cost, 6),
+        "num_rp_rebalances": rs_n_reb,
+        "rp_final_shares": {t: int(s) for t, s in
+                            zip(rp_tickers, rs_shares, strict=True)},
+        "rp_last_weights": {t: round(float(wi), 10) for t, wi in
+                            zip(rp_tickers, rs_last_w, strict=True)},
+        "rp_strategy_cash_end": round(rs_cash, 6),
+    }
     common = sorted(set.intersection(*[set(by[t]) for t in tickers]))
     path = [_mean([by[t][d] / by[t][common[0]] for t in tickers]) for d in common]
     dd, trough = _drawdown(path)
@@ -568,6 +854,7 @@ def _solve_t3(task_dir: Path) -> dict:
         "num_correction_rows_late": n_corr_late,
         **{f"risk_parity_weight_{t}": round(rp_weights[t], 6)
            for t in rp_tickers},
+        **rp_strategy_fields,
         "num_resolved_days": len(common),
         "problems": _t3_problems(task_dir, resolved, a_val, b_val),
     }
@@ -635,8 +922,23 @@ def _solve_t4(task_dir: Path) -> dict:
             (row["ticker"], int(row["shares"]), float(row["price"])))
         n_trades += 1
 
+    # Periodic-rebalance parameters (memo rule 9) and the terminal
+    # lot sizes / minimum trade size (memo rule 7).
+    spec_t4 = _spec(task_dir)
+    mrb = re.search(r"Periodic rebalances: dates are ([0-9, -]+); "
+                    r"cost_bps=(\d+)", spec_t4)
+    rebalance_dates = {d.strip() for d in mrb.group(1).split(",")}
+    rebalance_cost_bps = float(mrb.group(2))
+    lot_sizes_t4 = {t: int(v) for t, v in re.findall(
+        r"(\w+)=(\d+)", re.search(
+            r"lot size, in shares: ([^.]+)\.", spec_t4).group(1))}
+    min_trade_t4 = int(re.search(
+        r"minimum\s+trade\s+size\s+is\s+(\d+)\s+shares", spec_t4).group(1))
+
     lots = {t: [] for t in assets}
     cash_lieu, realised = 0.0, 0.0
+    cash_balance = 0.0
+    reb_cost_total, reb_trade_count, reb_count = 0.0, 0, 0
     lieu_events = 0
     values, flows = [], []
     for ds in dates:
@@ -650,6 +952,7 @@ def _solve_t4(task_dir: Path) -> dict:
                 # The fraction's basis leaves with the cash: per-share
                 # cost divides by the ratio (memo rule 2).
                 cash_lieu += (new_shares - whole) * price_at[ticker][ds]
+                cash_balance += (new_shares - whole) * price_at[ticker][ds]
                 if new_shares - whole > 1e-9:
                     lieu_events += 1
                 lot[0], lot[1] = float(whole), lot[1] / ratio
@@ -670,8 +973,68 @@ def _solve_t4(task_dir: Path) -> dict:
                     lot[0] -= take
                     to_sell -= take
                 lots[ticker] = [lot for lot in lots[ticker] if lot[0] > 0]
+        if ds in rebalance_dates:
+            # Periodic equal-weight rebalance (memo rule 9): targets
+            # from the cash balance plus holdings value, floored to
+            # lots with the minimum trade size, cost safeguard on the
+            # leftover, sells FIFO before buys, cost deducted last.
+            reb_count += 1
+            current = {t: int(round(sum(lot[0] for lot in lots[t])))
+                       for t in assets}
+            total_v = cash_balance + sum(current[t] * price_at[t][ds]
+                                         for t in assets)
+            target_dollar = total_v / len(assets)
+            target = {t: int(math.floor(target_dollar / price_at[t][ds]))
+                      for t in assets}
+            target = {t: int(target[t] // lot_sizes_t4[t]) * lot_sizes_t4[t]
+                      for t in assets}
+            target = {t: current[t]
+                      if 0 < abs(target[t] - current[t]) < min_trade_t4
+                      else target[t] for t in assets}
+
+            traded_rb = sum(abs(target[t] - current[t]) * price_at[t][ds]
+                            for t in assets)
+            cost_rb = traded_rb * rebalance_cost_bps / 10000
+            leftover_rb = total_v - sum(target[t] * price_at[t][ds]
+                                        for t in assets)
+            while leftover_rb < cost_rb and any(
+                    target[t] > current[t] for t in assets):
+                buys = [t for t in assets if target[t] > current[t]]
+                pick = min(buys, key=lambda t: (
+                    -(target[t] * price_at[t][ds] - target_dollar), t))
+                target[pick] = max(current[pick],
+                                   target[pick] - lot_sizes_t4[pick])
+                traded_rb = sum(abs(target[t] - current[t]) * price_at[t][ds]
+                                for t in assets)
+                cost_rb = traded_rb * rebalance_cost_bps / 10000
+                leftover_rb = total_v - sum(target[t] * price_at[t][ds]
+                                            for t in assets)
+            for t in assets:
+                if target[t] < current[t]:
+                    px = price_at[t][ds]
+                    to_sell = current[t] - target[t]
+                    for lot in lots[t]:
+                        if to_sell <= 0:
+                            break
+                        take = min(lot[0], to_sell)
+                        realised += take * (px - lot[1])
+                        lot[0] -= take
+                        to_sell -= take
+                    lots[t] = [lot for lot in lots[t] if lot[0] > 0]
+                    cash_balance += (current[t] - target[t]) * px
+                    reb_trade_count += 1
+            for t in assets:
+                if target[t] > current[t]:
+                    diff = target[t] - current[t]
+                    settle_idx = min(dates.index(ds) + 2, len(dates) - 1)
+                    lots[t].append([float(diff), price_at[t][ds],
+                                    dates[settle_idx]])
+                    cash_balance -= diff * price_at[t][ds]
+                    reb_trade_count += 1
+            cash_balance -= cost_rb
+            reb_cost_total += cost_rb
         flows.append(flow)
-        values.append(cash_lieu + sum(
+        values.append(cash_balance + sum(
             sum(lot[0] for lot in lots[t]) * price_at[t][ds] for t in assets))
 
     index, prev, started = [], None, False
@@ -697,7 +1060,7 @@ def _solve_t4(task_dir: Path) -> dict:
         r = index[j] / index[j - 20] - 1
         if worst_roll is None or r < worst_roll:
             worst_roll, worst_roll_end = r, j
-    total_value = end_mv + cash_lieu
+    total_value = end_mv + cash_balance
     # Terminal rebalance (memo rule 7): n is the number of distinct
     # tickers in prices.csv; targets are floored to whole multiples of
     # each asset's lot size, and a trade smaller than the minimum
@@ -734,6 +1097,10 @@ def _solve_t4(task_dir: Path) -> dict:
         if worst_roll_end is not None else dates[-1],
         "num_cash_in_lieu_events": lieu_events,
         "num_lots_end": sum(len(lots[t]) for t in assets),
+        "cash_end": round(cash_balance, 6),
+        "rebalance_total_cost": round(reb_cost_total, 6),
+        "num_periodic_rebalances": reb_count,
+        "num_rebalance_trades": reb_trade_count,
         "rebalance_target_shares": target_shares,
         "rebalance_trade_shares": {
             t: target_shares[t] - end_shares[t] for t in assets},

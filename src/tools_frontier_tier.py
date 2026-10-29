@@ -251,6 +251,7 @@ class ToolsFrontierTaskGenerator:
         elif family == "reconciliation":
             field_rtol = {f"risk_parity_weight_REC{i}": 1e-4
                           for i in (1, 2, 3)}
+            field_rtol["rp_last_weights"] = 1e-4
         expected["_tools_frontier"] = {
             "family": FAMILY_TYPES[family],
             "core": core,
@@ -424,6 +425,67 @@ class ToolsFrontierTaskGenerator:
             return _std([a - h * b for a, b in zip(h_a, h_b, strict=True)],
                         1) * math.sqrt(252)
 
+        # Stateful hedged-strategy simulation (section 16): the bounded
+        # hedge of section 15 becomes a rolling, re-estimated short
+        # hedge.  Every 21 trading days the ratio is re-solved from the
+        # trailing 60 log returns and clipped to the same bounds; the
+        # short position is resized in whole lots of 25 benchmark
+        # shares at that close, trading costs are charged to the cash
+        # account, and the daily NAV carries asset, short and cash
+        # forward.  The scored fields sit at the end of this chain, so
+        # an error in any window's ratio propagates into the NAV path.
+        strat_capital, strat_lot, strat_cost = 1_000_000.0, 25, 25.0
+        strat_first_idx, strat_step, strat_window = 60, 21, 60
+        log_ha = _returns(series[hedge_asset], "log")
+        log_hb = _returns(series[bench_name], "log")
+
+        def hedge_strategy(mode="rolling", apply_cost=True, use_lot=True):
+            closes_a, closes_b = series[hedge_asset], series[bench_name]
+            asset_shares = int(strat_capital // closes_a[0])
+            cash = strat_capital - asset_shares * closes_a[0]
+            short, total_cost, ratios = 0.0, 0.0, []
+            navs = []
+            rebalance_idx = set(range(strat_first_idx, rows, strat_step))
+            for idx in range(rows):
+                if idx in rebalance_idx:
+                    xa = log_ha[idx - strat_window:idx]
+                    xb = log_hb[idx - strat_window:idx]
+                    unc = _cov(xa, xb, 1) / _var(xb, 1)
+                    if mode == "unbounded":
+                        h = unc
+                    elif mode == "first" and ratios:
+                        h = ratios[0]
+                    else:
+                        h = min(max(unc, h_lower), h_upper)
+                    ratios.append(h)
+                    raw = h * asset_shares * closes_a[idx] / closes_b[idx]
+                    desired = float(int(raw // strat_lot) * strat_lot) \
+                        if use_lot else raw
+                    trade = desired - short
+                    cost = abs(trade) * closes_b[idx] * strat_cost / 10000 \
+                        if apply_cost else 0.0
+                    cash += trade * closes_b[idx] - cost
+                    total_cost += cost
+                    short = desired
+                navs.append(cash + asset_shares * closes_a[idx]
+                            - short * closes_b[idx])
+            s_dd, _s_trough = _max_drawdown(navs)
+            s_log = [math.log(b / a)
+                     for a, b in zip(navs, navs[1:], strict=False)]
+            return {
+                "hedge_strategy_final_nav": round(navs[-1], 6),
+                "hedge_strategy_ann_vol": round(
+                    _std(s_log, 1) * math.sqrt(252), 6),
+                "hedge_strategy_max_drawdown": round(s_dd, 6),
+                "hedge_strategy_total_cost": round(total_cost, 6),
+                "num_hedge_rebalances": len(ratios),
+                "hedge_strategy_final_short_shares": int(short),
+                "hedge_strategy_last_ratio": round(ratios[-1], 6),
+                "hedge_strategy_cash_end": round(cash, 6),
+            }
+
+        strat_expected = hedge_strategy()
+
         # Pitfall rows that only appear on inspection: weekend prints for
         # the first asset (their dates are absent from calendar.csv and
         # the memo excludes them) and, below, one ticker's rows shuffled.
@@ -464,6 +526,7 @@ class ToolsFrontierTaskGenerator:
             "worst_day_date": _dstr(dates[worst_i + 1]),
             "hedge_ratio": round(h_opt, 6),
             "hedged_ann_vol": round(hedged_vol(h_opt), 6),
+            **strat_expected,
             "num_aligned_days": rows,
         })
         core = [f"ann_vol_{a}" for a in assets] + [
@@ -477,7 +540,11 @@ class ToolsFrontierTaskGenerator:
             "portfolio_max_drawdown_trough_date", "portfolio_sharpe",
             "rolling_max_correlation", "rolling_max_correlation_end_date",
             "worst_day_return", "worst_day_date",
-            "hedge_ratio", "hedged_ann_vol"]
+            "hedge_ratio", "hedged_ann_vol",
+            "hedge_strategy_final_nav", "hedge_strategy_ann_vol",
+            "hedge_strategy_max_drawdown", "hedge_strategy_total_cost",
+            "hedge_strategy_final_short_shares",
+            "hedge_strategy_last_ratio", "hedge_strategy_cash_end"]
 
         def _corr(kind):
             ra = _returns(series[assets[0]], kind)
@@ -532,6 +599,9 @@ class ToolsFrontierTaskGenerator:
             # reports the unconstrained ratio.
             "hedge_ratio": round(h_unc, 6),
             "hedged_ann_vol": round(hedged_vol(h_unc), 6),
+            # ... and runs the strategy with the first ratio never
+            # re-estimated.
+            **hedge_strategy(mode="first"),
             "num_aligned_days": rows,
         })
         nonoverlap = rolling_betas(simple[target], simple[bench_name], window, window)
@@ -564,13 +634,23 @@ class ToolsFrontierTaskGenerator:
         variant_unbounded.update({
             "hedge_ratio": round(h_unc, 6),
             "hedged_ann_vol": round(hedged_vol(h_unc), 6)})
+
+        def strat_variant(**kw):
+            out = dict(expected)
+            out.update(hedge_strategy(**kw))
+            return out
+
         variants = {"naive_simple_252": naive,
                     "nonoverlapping_rolling": variant_nonoverlap,
                     "weekend_prints_included": variant_weekend,
                     "wrong_benchmark": variant_wrong_bench,
                     "full_sample_instead_of_recent": variant_full_sample,
                     "portfolio_from_price_levels": variant_levels,
-                    "hedge_ratio_unbounded": variant_unbounded}
+                    "hedge_ratio_unbounded": variant_unbounded,
+                    "hedge_strategy_never_reestimated": strat_variant(mode="first"),
+                    "hedge_strategy_unbounded_rolling": strat_variant(mode="unbounded"),
+                    "hedge_strategy_no_cost": strat_variant(apply_cost=False),
+                    "hedge_strategy_fractional_shares": strat_variant(use_lot=False)}
 
         rows_out = []
         for ticker in assets + [bench_name, bench2]:
@@ -609,6 +689,7 @@ section only; honour the governing clause for each field.
 - rolling_correlation: asset={assets[0]}; benchmark={bench_name}; window=30; step=5; return=log
 - worst_day: asset={assets[1]}; return=simple
 - hedge: asset={hedge_asset}; benchmark={bench_name}; window_returns={hedge_window}; return=log; lower_bound={h_lower:.1f}; upper_bound={h_upper:.2f}; periods_per_year=252; ddof=1
+- hedge_strategy: asset={hedge_asset}; benchmark={bench_name}; capital=1000000; window_returns=60; first_rebalance_index=60; rebalance_step=21; hedge_lot=25; cost_bps=25; lower_bound=0.0; upper_bound=1.25
 
 ## Data rules (read before computing)
 - calendar.csv lists the trading dates. prices.csv can contain rows on
@@ -685,6 +766,49 @@ section only; honour the governing clause for each field.
    outside the bounds, the nearest bound is the minimiser.
    hedged_ann_vol is the sample standard deviation (ddof=1) of the
    hedged returns at the reported hedge_ratio, times sqrt(252).
+16. Hedged strategy simulation (stateful; its fields sit at the end
+   of this chain). Dates are the calendar-filtered, date-sorted
+   trading dates, indexed from 0 (index 0 is the first date). At the
+   close of index 0, buy floor(capital / asset close) whole shares
+   of the hedge asset (capital on the hedge_strategy convention
+   line), paying no transaction cost on this initial purchase; the
+   unspent remainder is the cash account and the short position
+   starts at zero shares. Rebalances happen at the close of every
+   index 60, 81, 102, ... (first_rebalance_index, then every
+   rebalance_step indices) that is a valid price index. At each
+   rebalance, in this order: (a) take the last 60 log returns of the
+   asset and of the benchmark ending at that index (the returns
+   whose second price date is that date and the 59 before it) and
+   compute the ratio cov(asset, benchmark) / var(benchmark) over
+   them (ddof=1; ddof cancels), clipped into
+   [lower_bound, upper_bound] exactly as in section 15 - this is
+   that rebalance's hedge ratio, re-solved at every rebalance;
+   (b) the desired short position is
+   floor(hedge_ratio * asset_shares * asset_close / benchmark_close
+   / hedge_lot) * hedge_lot benchmark shares, where asset_shares is
+   the fixed initial purchase and the closes are that date's;
+   (c) the trade is desired minus the current short shares (a
+   positive trade sells benchmark shares short, a negative trade
+   buys them back): cash increases by trade * benchmark_close minus
+   the transaction cost, the cost is cost_bps/10000 times
+   |trade| * benchmark_close, and the short position becomes the
+   desired position. The asset share count never changes and no
+   other trades occur. The strategy NAV on every date (after any
+   rebalance trades on that date) is
+   cash + asset_shares * asset_close - short_shares *
+   benchmark_close. hedge_strategy_final_nav is the NAV on the last
+   date; hedge_strategy_cash_end is the cash account on the last
+   date after that date's trades; hedge_strategy_total_cost is the
+   sum of the rebalance transaction costs;
+   num_hedge_rebalances is the number of rebalance dates;
+   hedge_strategy_final_short_shares is the short position after
+   the last rebalance; hedge_strategy_last_ratio is the hedge ratio
+   solved at the last rebalance. hedge_strategy_ann_vol is the
+   sample standard deviation (ddof=1) of the daily log returns of
+   the full NAV path times sqrt(252), and
+   hedge_strategy_max_drawdown is the max drawdown of that NAV path
+   (negative fraction, same sign convention as section 12: 0.0 only
+   if the NAV never falls).
 
 Prices are in prices.csv (date,ticker,open,high,low,close,volume);
 after the data rules above are applied the series align on {rows}
@@ -926,9 +1050,159 @@ business days.
                 "hedged_nav_max_drawdown": round(h_dd, 6),
             }
 
+        # Monthly rebalanced sleeve strategy (rule 9): a stateful
+        # multi-period simulation stacked on the effective FX rates.
+        # At each monthly rebalance the EU sleeve weight is re-solved
+        # (bounded two-asset minimum variance over trailing sleeve
+        # returns, the EU sleeve measured in USD through the effective
+        # rates), converted to per-asset targets, and traded in lots
+        # with a minimum trade size and costs against a cash account.
+        strat_assets = us_assets + eu_assets
+        strat_lots = {t: (10, 25)[i % 2] for i, t in enumerate(strat_assets)}
+        strat_min_trade, strat_cost_bps = 20, 10.0
+        strat_buffer, strat_window = 0.02, 60
+        strat_lo, strat_hi = 0.25, 0.75
+        price_usd = {}
+        for ds in inner_dates:
+            for t in us_assets:
+                price_usd[(t, ds)] = us_idx[t][ds]
+            for t in eu_assets:
+                price_usd[(t, ds)] = eu_idx[t][ds] * eff[ds]
+
+        def sleeve_returns(fx_adjusted=True):
+            us_r, eu_r = [], []
+            for k in range(len(inner_dates) - 1):
+                d0, d1 = inner_dates[k], inner_dates[k + 1]
+                us_r.append(_mean([us_idx[t][d1] / us_idx[t][d0] - 1
+                                   for t in us_assets]))
+                if fx_adjusted:
+                    eu_r.append(_mean([
+                        (eu_idx[t][d1] * eff[d1]) / (eu_idx[t][d0] * eff[d0]) - 1
+                        for t in eu_assets]))
+                else:
+                    eu_r.append(_mean([eu_idx[t][d1] / eu_idx[t][d0] - 1
+                                       for t in eu_assets]))
+            return us_r, eu_r
+
+        sleeve_usd = sleeve_returns(True)
+        sleeve_eur = sleeve_returns(False)
+        strat_rebalance_idx = [
+            i for i, ds in enumerate(inner_dates)
+            if i >= strat_window
+            and (i == 0 or ds[:7] != inner_dates[i - 1][:7])]
+
+        def strategy_sim(weight_mode="rolling", apply_cost=True,
+                         use_frictions=True, fx_adjusted=True):
+            us_r, eu_r = sleeve_usd if fx_adjusted else sleeve_eur
+            shares = dict.fromkeys(strat_assets, 0)
+            cash = 1_000_000.0
+            total_cost, weights_used = 0.0, []
+            nav_path = []
+            reb_set = set(strat_rebalance_idx)
+            for idx, ds in enumerate(inner_dates):
+                if idx in reb_set:
+                    nav_pre = cash + sum(
+                        shares[t] * price_usd[(t, ds)] for t in strat_assets)
+                    xa = us_r[idx - strat_window:idx]
+                    xb = eu_r[idx - strat_window:idx]
+                    var_us, var_eu = _var(xa, 1), _var(xb, 1)
+                    cov_se = _cov(xa, xb, 1)
+                    denom = var_us + var_eu - 2 * cov_se
+                    w_unc = (var_us - cov_se) / denom if denom else 0.5
+                    if weight_mode == "fixed":
+                        w_eu = 0.5
+                    elif weight_mode == "first" and weights_used:
+                        w_eu = weights_used[0]
+                    else:
+                        w_eu = min(max(w_unc, strat_lo), strat_hi)
+                    weights_used.append(w_eu)
+                    target_w = {t: (1 - w_eu) / len(us_assets)
+                                for t in us_assets}
+                    target_w.update({t: w_eu / len(eu_assets)
+                                     for t in eu_assets})
+                    desired = {t: target_w[t] * nav_pre * (1 - strat_buffer)
+                               for t in strat_assets}
+                    lot_of = {t: strat_lots[t] if use_frictions else 1
+                              for t in strat_assets}
+                    new_shares = {
+                        t: int(desired[t] / price_usd[(t, ds)] // lot_of[t])
+                        * lot_of[t] for t in strat_assets}
+                    cash_left = nav_pre - sum(
+                        new_shares[t] * price_usd[(t, ds)]
+                        for t in strat_assets)
+                    while True:
+                        residuals = {
+                            t: desired[t] - new_shares[t] * price_usd[(t, ds)]
+                            for t in strat_assets}
+                        order = sorted(strat_assets,
+                                       key=lambda t: (-residuals[t], t))
+                        bought = False
+                        for t in order:
+                            lot_cost = lot_of[t] * price_usd[(t, ds)]
+                            if residuals[t] > 1e-9 and cash_left >= lot_cost - 1e-9:
+                                new_shares[t] += lot_of[t]
+                                cash_left -= lot_cost
+                                bought = True
+                                break
+                        if not bought:
+                            break
+                    if use_frictions:
+                        new_shares = {
+                            t: shares[t]
+                            if 0 < abs(new_shares[t] - shares[t])
+                            < strat_min_trade else new_shares[t]
+                            for t in strat_assets}
+                    traded = sum(abs(new_shares[t] - shares[t])
+                                 * price_usd[(t, ds)] for t in strat_assets)
+                    cash_left = nav_pre - sum(
+                        new_shares[t] * price_usd[(t, ds)]
+                        for t in strat_assets)
+                    cost = traded * strat_cost_bps / 10000 if apply_cost else 0.0
+                    while cash_left - cost < 0 and any(
+                            new_shares[t] > 0 for t in strat_assets):
+                        excess = {t: new_shares[t] * price_usd[(t, ds)]
+                                  - desired[t] for t in strat_assets}
+                        pick = min(strat_assets, key=lambda t: (-excess[t], t))
+                        if new_shares[pick] <= 0:
+                            pick = max(strat_assets, key=lambda t: new_shares[t])
+                        new_shares[pick] -= lot_of[pick]
+                        cash_left += lot_of[pick] * price_usd[(pick, ds)]
+                        traded = sum(abs(new_shares[t] - shares[t])
+                                     * price_usd[(t, ds)] for t in strat_assets)
+                        cost = traded * strat_cost_bps / 10000 \
+                            if apply_cost else 0.0
+                    cash = cash_left - cost
+                    total_cost += cost
+                    shares = new_shares
+                nav_path.append(cash + sum(
+                    shares[t] * price_usd[(t, ds)] for t in strat_assets))
+            s_dd, _tr = _max_drawdown(nav_path)
+            s_log = [math.log(b / a)
+                     for a, b in zip(nav_path, nav_path[1:], strict=False)]
+            last_ds = inner_dates[-1]
+            eu_value = sum(shares[t] * price_usd[(t, last_ds)]
+                           for t in eu_assets)
+            return {
+                "strategy_final_nav": round(nav_path[-1], 6),
+                "strategy_ann_vol": round(
+                    _std(s_log, 1) * math.sqrt(252), 6) if len(s_log) > 1 else 0.0,
+                "strategy_max_drawdown": round(s_dd, 6),
+                "strategy_total_cost": round(total_cost, 6),
+                "num_strategy_rebalances": len(weights_used),
+                "strategy_final_shares": {t: int(shares[t])
+                                          for t in strat_assets},
+                "strategy_last_eu_weight": round(weights_used[-1], 6),
+                "strategy_cash_end": round(cash, 6),
+                "strategy_eu_weight_final": round(
+                    eu_value / nav_path[-1], 6) if nav_path[-1] else 0.0,
+            }
+
+        strat_expected = strategy_sim()
+
         expected = {f"nav_{d.replace('-', '')}": round(navs[d], 6) for d in probe}
         expected.update({
             **hedge_sim(eff, navs),
+            **strat_expected,
             "total_return_usd": round(total_ret, 6),
             "fx_pnl_contribution": round(fx_contrib, 6),
             "dates_dropped_by_alignment": len(union_dates) - len(inner_dates),
@@ -955,7 +1229,11 @@ business days.
             "nav_drawdown_trough_date", "nav_ann_vol",
             "num_late_fixes", "num_inverted_fix_rows", "num_weekend_prints",
             "hedge_pnl_total", "num_hedge_resets",
-            "hedged_nav_ann_vol", "hedged_nav_max_drawdown"]
+            "hedged_nav_ann_vol", "hedged_nav_max_drawdown",
+            "strategy_final_nav", "strategy_ann_vol",
+            "strategy_max_drawdown", "strategy_total_cost",
+            "strategy_final_shares", "strategy_last_eu_weight",
+            "strategy_cash_end", "strategy_eu_weight_final"]
 
         def variant_answer(eff_v, calendar="inner", hedge_mode="monthly"):
             n = nav_series(eff_v, calendar)
@@ -1004,6 +1282,19 @@ business days.
                 effective_rates(key_by_stamp_date=True)),
             "hedge_never_reset": variant_answer(eff, hedge_mode="never"),
         }
+
+        def strat_variant(**kw):
+            out = dict(expected)
+            out.update(strategy_sim(**kw))
+            return out
+
+        variants.update({
+            "strategy_fixed_equal_sleeves": strat_variant(weight_mode="fixed"),
+            "strategy_weights_never_reestimated": strat_variant(weight_mode="first"),
+            "strategy_eu_sleeve_in_eur": strat_variant(fx_adjusted=False),
+            "strategy_no_cost": strat_variant(apply_cost=False),
+            "strategy_no_lots_or_min_trade": strat_variant(use_frictions=False),
+        })
         problems = ["currency_inverted_quote_segment", "timezone_mixed_utc_offsets",
                     "calendar_exchange_holidays"]
 
@@ -1033,6 +1324,7 @@ holdings: {json.dumps(holdings, sort_keys=True)}
 - nav_dates: {", ".join(probe)}
 - fx_detail_date: {late_probe_date}
 - fx_hedge: sleeve=EU; hedge_ratio=0.75; reset=first_union_date_of_each_calendar_month
+- strategy: capital=1000000; window_returns=60; eu_weight_bounds=0.25,0.75; cash_buffer_pct=0.02; min_trade_shares=20; cost_bps=10; lots: {", ".join(f"{t}={strat_lots[t]}" for t in strat_assets)}
 
 ## Rules
 1. Convert each European close to USD with the FX fix for the same trade
@@ -1110,6 +1402,72 @@ holdings: {json.dumps(holdings, sort_keys=True)}
    the daily log returns of the hedged NAV over the inner calendar,
    times sqrt(252), and hedged_nav_max_drawdown is the hedged NAV's
    max drawdown (same sign convention as rule 6).
+9. Monthly rebalanced sleeve strategy (stateful; this section is a
+   separate paper portfolio from rules 3 and 8, and its fields sit
+   at the end of this chain). The strategy starts with
+   capital = 1000000 USD in cash on the first inner date and holds
+   no shares. Its trading calendar is the inner calendar. For each
+   inner date, an asset's USD price is its close for US assets, and
+   its EUR close times that date's effective rate (rules 1-2) for
+   EU assets. The US sleeve return for an inner date pair is the
+   mean of the US assets' simple returns over that pair; the EU
+   sleeve return in USD is the mean of the EU assets' simple
+   returns measured in USD (close times effective rate on each
+   date of the pair). Rebalances happen at the close of the first
+   inner date of each calendar month whose inner-calendar index
+   (the first inner date is index 0) is at least 60. At each
+   rebalance, in exactly this order:
+   (a) solve the EU sleeve weight: take the last 60 sleeve returns
+   whose second date is on or before the rebalance date (the return
+   into the rebalance date and the 59 before it) and form their
+   sample variances and covariance (ddof=1); the unconstrained
+   minimum-variance EU weight is
+   (var_US - cov) / (var_US + var_EU - 2*cov) (if the denominator
+   were zero the weight would be 0.5), clipped into
+   [0.25, 0.75]. This weight is re-solved at every rebalance.
+   strategy_last_eu_weight is the weight solved at the last one.
+   (b) Target weights: the US sleeve weight 1 - w_EU is split
+   equally among the US assets and w_EU equally among the EU
+   assets. NAV_pre is the strategy NAV (cash plus holdings at
+   that date's USD prices) at the rebalance close, before trading.
+   Each asset's desired USD value is target weight * NAV_pre *
+   (1 - cash_buffer_pct).
+   (c) Convert desired values to shares: floor each desired value
+   divided by the asset's USD price to a whole multiple of that
+   asset's lot size (strategy convention line); then greedy
+   allocation: repeatedly take the asset with the largest residual
+   (desired value minus allocated value at that date's USD price;
+   ties by ticker, alphabetically first) and, if its residual is
+   positive and one lot costs no more than the remaining cash
+   (NAV_pre minus allocated value), buy one lot for it, until no
+   asset qualifies.
+   (d) Minimum trade size: an asset whose absolute share change
+   from step (c) is nonzero but smaller than min_trade_shares does
+   not trade: it keeps its previous share count.
+   (e) Transaction cost: traded notional is the sum over assets of
+   |new shares - old shares| * USD price; the cost is
+   cost_bps/10000 times that notional. Cash after trading is
+   NAV_pre minus the new holdings value minus the cost. If that
+   cash would be negative, first return lots: repeatedly remove
+   one lot from the asset whose allocated value most exceeds its
+   step-(b) desired value (ties by ticker, alphabetically first;
+   recompute traded notional and cost after each removal; lots
+   returned here are not re-tested against step (d)) until cash
+   after cost is >= 0, then deduct the cost.
+   Between rebalances share counts and cash are constant. The
+   strategy NAV on every inner date (after any rebalance trades
+   on that date) is cash plus holdings at that date's USD prices.
+   strategy_final_nav is the NAV on the last inner date,
+   strategy_cash_end the cash then, strategy_final_shares the
+   share counts after the last rebalance (a JSON object keyed by
+   ticker), strategy_total_cost the sum of the step-(e) costs,
+   num_strategy_rebalances the number of rebalance dates,
+   strategy_eu_weight_final the EU holdings' USD value on the
+   last inner date divided by strategy_final_nav,
+   strategy_ann_vol the sample standard deviation (ddof=1) of the
+   daily log returns of the full strategy NAV path times
+   sqrt(252), and strategy_max_drawdown its max drawdown (same
+   sign convention as rule 6).
 
 ## Allowed problem codes (report exactly these, under exactly these rules)
 The problems array may contain only: currency, timezone, calendar.
@@ -1134,7 +1492,11 @@ eu_sleeve_weight_last_probe, max_nav_value, max_nav_date,
 nav_max_drawdown, nav_drawdown_trough_date, nav_ann_vol,
 num_late_fixes, num_inverted_fix_rows, num_weekend_prints,
 hedge_pnl_total, num_hedge_resets, hedged_nav_ann_vol,
-hedged_nav_max_drawdown and
+hedged_nav_max_drawdown,
+strategy_final_nav, strategy_ann_vol, strategy_max_drawdown,
+strategy_total_cost, num_strategy_rebalances,
+strategy_final_shares, strategy_last_eu_weight,
+strategy_cash_end, strategy_eu_weight_final and
 num_inner_days, plus the problems array defined above.
 """
         files = {
@@ -1385,31 +1747,8 @@ num_inner_days, plus the problems array defined above.
 
         rp_tickers = tickers[:3]
 
-        def rp_weights(res, mode="parity"):
-            """Risk-parity weights on the reconciled series.
-
-            Aligns the three tickers' resolved closes on their common
-            dates, builds the log-return covariance (ddof=1), and for
-            ``parity`` solves min 0.5 w' Sigma w - sum(ln w_i) by
-            Newton's method (its minimiser has w_i (Sigma w)_i equal
-            for all i), then normalises.  ``equal`` / ``inverse_vol``
-            are the trap answers.
-            """
-            per = {t: {} for t in rp_tickers}
-            for (t, ds), v in res.items():
-                if t in per:
-                    per[t][ds] = v
-            days = sorted(set.intersection(
-                *[set(per[t]) for t in rp_tickers]))
-            closes_rp = [[per[t][d] for d in days] for t in rp_tickers]
-            rets = [[math.log(b / a)
-                     for a, b in zip(c, c[1:], strict=False)]
-                    for c in closes_rp]
-            m = len(rets[0])
-            means = [_mean(r) for r in rets]
-            cov = [[sum((rets[i][k] - means[i]) * (rets[j][k] - means[j])
-                        for k in range(m)) / (m - 1)
-                    for j in range(3)] for i in range(3)]
+        def parity_weights_from_cov(cov, mode="parity"):
+            """Weights from a 3x3 covariance: parity / equal / inverse-vol."""
             if mode == "equal":
                 return [1.0 / 3.0] * 3
             if mode == "inverse_vol":
@@ -1454,12 +1793,159 @@ num_inner_days, plus the problems array defined above.
             total = sum(w)
             return [x / total for x in w]
 
-        def finish(res, p, rp_mode="parity"):
+        def rp_weights(res, mode="parity"):
+            """Risk-parity weights on the reconciled series.
+
+            Aligns the three tickers' resolved closes on their common
+            dates, builds the log-return covariance (ddof=1), and for
+            ``parity`` solves min 0.5 w' Sigma w - sum(ln w_i) by
+            Newton's method (its minimiser has w_i (Sigma w)_i equal
+            for all i), then normalises.  ``equal`` / ``inverse_vol``
+            are the trap answers.
+            """
+            per = {t: {} for t in rp_tickers}
+            for (t, ds), v in res.items():
+                if t in per:
+                    per[t][ds] = v
+            days = sorted(set.intersection(
+                *[set(per[t]) for t in rp_tickers]))
+            closes_rp = [[per[t][d] for d in days] for t in rp_tickers]
+            rets = [[math.log(b / a)
+                     for a, b in zip(c, c[1:], strict=False)]
+                    for c in closes_rp]
+            m = len(rets[0])
+            means = [_mean(r) for r in rets]
+            cov = [[sum((rets[i][k] - means[i]) * (rets[j][k] - means[j])
+                        for k in range(m)) / (m - 1)
+                    for j in range(3)] for i in range(3)]
+            return parity_weights_from_cov(cov, mode)
+
+        # Rolling risk-parity strategy (Derived fields): the parity
+        # solve is repeated on trailing windows and its weights are
+        # traded, in lots with a minimum trade size and costs, on the
+        # reconciled closes themselves.  The scored fields sit at the
+        # end of the chain (reconcile -> rolling solve -> trading).
+        rp_lots = {rp_tickers[0]: 10, rp_tickers[1]: 25, rp_tickers[2]: 5}
+        rp_min_trade, rp_cost_bps, rp_buffer = 15, 10.0, 0.02
+        rp_window, rp_first_idx, rp_step = 60, 60, 21
+
+        def rp_strategy(res, target_mode="parity", apply_cost=True,
+                        use_frictions=True):
+            per = {t: {} for t in rp_tickers}
+            for (t, ds), v in res.items():
+                if t in per:
+                    per[t][ds] = v
+            days = sorted(set.intersection(
+                *[set(per[t]) for t in rp_tickers]))
+            closes = [[per[t][d] for d in days] for t in rp_tickers]
+
+            def window_weights(idx, mode):
+                rets = [[math.log(b / a) for a, b in zip(
+                    c[idx - rp_window:idx + 1],
+                    c[idx - rp_window:idx + 1][1:], strict=False)]
+                    for c in closes]
+                m = len(rets[0])
+                means = [_mean(r) for r in rets]
+                cov = [[sum((rets[i][k] - means[i]) * (rets[j][k] - means[j])
+                            for k in range(m)) / (m - 1)
+                        for j in range(3)] for i in range(3)]
+                return parity_weights_from_cov(cov, mode)
+
+            shares = [0, 0, 0]
+            cash, total_cost, last_w = 1_000_000.0, 0.0, None
+            nav_path, n_reb = [], 0
+            reb_set = set(range(rp_first_idx, len(days), rp_step))
+            for idx in range(len(days)):
+                px = [closes[i][idx] for i in range(3)]
+                if idx in reb_set:
+                    nav_pre = cash + sum(s * p for s, p in
+                                         zip(shares, px, strict=True))
+                    if target_mode == "first" and last_w is not None:
+                        w = last_w
+                    elif target_mode == "first":
+                        w = window_weights(idx, "parity")
+                    else:
+                        w = window_weights(idx, target_mode)
+                    last_w, n_reb = w, n_reb + 1
+                    desired = [wi * nav_pre * (1 - rp_buffer) for wi in w]
+                    lot_of = [rp_lots[t] if use_frictions else 1
+                              for t in rp_tickers]
+                    new_shares = [
+                        int(desired[i] / px[i] // lot_of[i]) * lot_of[i]
+                        for i in range(3)]
+                    cash_left = nav_pre - sum(
+                        s * p for s, p in zip(new_shares, px, strict=True))
+                    while True:
+                        residuals = [desired[i] - new_shares[i] * px[i]
+                                     for i in range(3)]
+                        order = sorted(range(3), key=lambda i: (
+                            -residuals[i], rp_tickers[i]))
+                        bought = False
+                        for i in order:
+                            lot_cost = lot_of[i] * px[i]
+                            if residuals[i] > 1e-9 \
+                                    and cash_left >= lot_cost - 1e-9:
+                                new_shares[i] += lot_of[i]
+                                cash_left -= lot_cost
+                                bought = True
+                                break
+                        if not bought:
+                            break
+                    if use_frictions:
+                        new_shares = [
+                            shares[i] if 0 < abs(new_shares[i] - shares[i])
+                            < rp_min_trade else new_shares[i]
+                            for i in range(3)]
+                    traded = sum(abs(ns - s) * p for ns, s, p in
+                                 zip(new_shares, shares, px, strict=True))
+                    cash_left = nav_pre - sum(
+                        s * p for s, p in zip(new_shares, px, strict=True))
+                    cost = traded * rp_cost_bps / 10000 if apply_cost else 0.0
+                    while cash_left - cost < 0 and any(s > 0 for s in new_shares):
+                        excess = [new_shares[i] * px[i] - desired[i]
+                                  for i in range(3)]
+                        pick = min(range(3), key=lambda i: (
+                            -excess[i], rp_tickers[i]))
+                        if new_shares[pick] <= 0:
+                            pick = max(range(3), key=lambda i: new_shares[i])
+                        new_shares[pick] -= lot_of[pick]
+                        cash_left += lot_of[pick] * px[pick]
+                        traded = sum(abs(ns - s) * p for ns, s, p in
+                                     zip(new_shares, shares, px, strict=True))
+                        cost = traded * rp_cost_bps / 10000 \
+                            if apply_cost else 0.0
+                    cash = cash_left - cost
+                    total_cost += cost
+                    shares = new_shares
+                nav_path.append(cash + sum(
+                    s * p for s, p in zip(shares, px, strict=True)))
+            s_dd, _tr = _max_drawdown(nav_path)
+            s_log = [math.log(b / a)
+                     for a, b in zip(nav_path, nav_path[1:], strict=False)]
+            return {
+                "rp_strategy_final_nav": round(nav_path[-1], 6),
+                "rp_strategy_ann_vol": round(
+                    _std(s_log, 1) * math.sqrt(252), 6),
+                "rp_strategy_max_drawdown": round(s_dd, 6),
+                "rp_strategy_total_cost": round(total_cost, 6),
+                "num_rp_rebalances": n_reb,
+                "rp_final_shares": {t: int(s) for t, s in
+                                    zip(rp_tickers, shares, strict=True)},
+                "rp_last_weights": {t: round(float(wi), 10) for t, wi in
+                                    zip(rp_tickers, last_w, strict=True)},
+                "rp_strategy_cash_end": round(cash, 6),
+            }
+
+        def finish(res, p, rp_mode="parity", strat_mode=None,
+                   strat_cost=True, strat_frictions=True):
+            if strat_mode is None:
+                strat_mode = rp_mode
             """Full answer for one resolution outcome (key or variant)."""
             s, c, d2, tr = metrics(res)
             p_dates, p_closes = ticker_series(res, probe_ticker)
             p_dd, p_tr = _max_drawdown(p_closes)
             rp = rp_weights(res, rp_mode)
+            strat = rp_strategy(res, strat_mode, strat_cost, strat_frictions)
             out = {
                 "resolved_by_correction": p["correction"],
                 "resolved_by_vendor_a": p["vendor_a"],
@@ -1476,6 +1962,7 @@ num_inner_days, plus the problems array defined above.
                     1 for e in corr_entries if e["utc"] > report_time),
                 **{f"risk_parity_weight_{t}": round(wi, 6)
                    for t, wi in zip(rp_tickers, rp, strict=True)},
+                **strat,
                 "num_resolved_days": len(c),
             }
             for d in probe_dates:
@@ -1495,6 +1982,10 @@ num_inner_days, plus the problems array defined above.
                 "probe_ticker_drawdown_trough_date",
                 "num_correction_rows_late"] + \
             [f"risk_parity_weight_{t}" for t in rp_tickers] + \
+            ["rp_strategy_final_nav", "rp_strategy_ann_vol",
+             "rp_strategy_max_drawdown", "rp_strategy_total_cost",
+             "rp_final_shares", "rp_last_weights",
+             "rp_strategy_cash_end"] + \
             [k for k in expected if k.startswith("resolved_close_")]
 
         def variant(mode):
@@ -1573,7 +2064,17 @@ num_inner_days, plus the problems array defined above.
                     "risk_parity_equal_weights": finish(
                         resolved, paths, "equal"),
                     "risk_parity_inverse_vol": finish(
-                        resolved, paths, "inverse_vol")}
+                        resolved, paths, "inverse_vol"),
+                    "rp_strategy_equal_weights": finish(
+                        resolved, paths, "parity", strat_mode="equal"),
+                    "rp_strategy_inverse_vol": finish(
+                        resolved, paths, "parity", strat_mode="inverse_vol"),
+                    "rp_strategy_weights_never_reestimated": finish(
+                        resolved, paths, "parity", strat_mode="first"),
+                    "rp_strategy_no_cost": finish(
+                        resolved, paths, "parity", strat_cost=False),
+                    "rp_strategy_no_lots_or_min_trade": finish(
+                        resolved, paths, "parity", strat_frictions=False)}
         problems = ["source_conflict_vendor_disagreement", "unit_change_vendor_b_unit_column",
                     "duplicate_vendor_a_rows"]
         # The memo's missing rule, applied to the key exactly as stated:
@@ -1595,6 +2096,7 @@ probe_dates: {", ".join(probe_dates)}
 probe_ticker_2: {probe_ticker_2}
 probe_dates_2: {", ".join(probe_dates_2)}
 risk_parity_tickers: {", ".join(rp_tickers)}
+rp_strategy: capital=1000000; window_returns=60; first_rebalance_index=60; rebalance_step=21; cash_buffer_pct=0.02; min_trade_shares=15; cost_bps=10; lots: {", ".join(f"{t}={rp_lots[t]}" for t in rp_tickers)}
 
 Files: vendor_a.csv (date,ticker,close,status; closes in dollars),
 vendor_b.csv (date,ticker,close,unit; the unit column states dollars or
@@ -1674,13 +2176,70 @@ duplicate, missing. Report a code if and only if its rule is met:
   all three tickers. Report each as risk_parity_weight_<ticker>.
   (Equal weights and inverse-volatility weights do not in general
   satisfy this condition; the weights must actually be solved for.)
+- Rolling risk-parity strategy (stateful; a separate paper
+  portfolio whose fields sit at the end of the chain
+  reconcile -> rolling solve -> trading). Align the three
+  risk-parity tickers' resolved closes on the dates present for
+  all three (the aligned dates, indexed from 0). The strategy
+  starts with capital = 1000000 in cash and no shares.
+  Rebalances happen at the close of every aligned index 60, 81,
+  102, ... (first_rebalance_index, then every rebalance_step
+  indices). At each rebalance, in exactly this order:
+  (a) take the last 60 log returns of each ticker ending at that
+  index (the 61 aligned closes from index-60 to the rebalance
+  index), form their sample covariance Sigma (ddof=1), and solve
+  the risk-parity weights on Sigma exactly as defined above
+  (unique positive weights summing to 1 with equal
+  w_i * (Sigma w)_i). The weights are re-solved at every
+  rebalance; rp_last_weights is the weight vector solved at the
+  last rebalance, as a JSON object keyed by ticker.
+  (b) NAV_pre is the strategy NAV (cash plus shares times that
+  date's resolved closes) before trading. Each ticker's desired
+  value is its weight * NAV_pre * (1 - cash_buffer_pct).
+  (c) Floor each desired value divided by that date's resolved
+  close to a whole multiple of that ticker's lot size (rp_strategy
+  line); then greedy allocation: repeatedly take the ticker with
+  the largest residual (desired value minus allocated value; ties
+  by ticker, alphabetically first) and, if its residual is
+  positive and one lot costs no more than the remaining cash
+  (NAV_pre minus allocated value), buy one lot for it, until no
+  ticker qualifies.
+  (d) Minimum trade size: a ticker whose absolute share change
+  from step (c) is nonzero but smaller than min_trade_shares does
+  not trade: it keeps its previous share count.
+  (e) Transaction cost: traded notional is the sum of
+  |new shares - old shares| * resolved close; the cost is
+  cost_bps/10000 times that notional. Cash after trading is
+  NAV_pre minus the new holdings value minus the cost. If that
+  cash would be negative, first return lots: repeatedly remove
+  one lot from the ticker whose allocated value most exceeds its
+  step-(b) desired value (ties by ticker, alphabetically first;
+  recompute traded notional and cost after each removal; lots
+  returned here are not re-tested against step (d)) until cash
+  after cost is >= 0, then deduct the cost.
+  Between rebalances share counts and cash are constant, and
+  trades execute at the resolved close of the rebalance date.
+  The strategy NAV on every aligned date (after any rebalance
+  trades on that date) is cash plus shares times resolved
+  closes. rp_strategy_final_nav is the NAV on the last aligned
+  date, rp_strategy_cash_end the cash then, rp_final_shares the
+  share counts after the last rebalance (a JSON object keyed by
+  ticker), rp_strategy_total_cost the sum of the step-(e) costs,
+  num_rp_rebalances the number of rebalance dates,
+  rp_strategy_ann_vol the sample standard deviation (ddof=1) of
+  the daily log returns of the strategy NAV path times
+  sqrt(252), and rp_strategy_max_drawdown its max drawdown
+  (same sign convention as above).
 
 Report the three path counts over conflicted keys only,
 num_conflicted_keys, the resolved closes for the probe ticker on the
 probe dates and for probe_ticker_2 on probe_dates_2, probe_ann_vol,
 probe_ticker_max_drawdown with its trough date,
 num_correction_rows_total, num_correction_rows_late, the
-risk-parity weights, and, from the
+risk-parity weights, rp_strategy_final_nav, rp_strategy_ann_vol,
+rp_strategy_max_drawdown, rp_strategy_total_cost,
+num_rp_rebalances, rp_final_shares, rp_last_weights,
+rp_strategy_cash_end, and, from the
 resolved series aligned on dates present for every ticker, the
 equal-weight buy-and-hold total return (mean of last/first close
 minus 1) and the max drawdown of the mean normalised price path with
@@ -1782,12 +2341,24 @@ its trough date, plus the problems array defined above.
         term_lot_sizes = {assets[i]: (5, 10, 25)[i % 3]
                           for i in range(len(assets))}
         term_min_trade = 20
+        # Periodic equal-weight rebalances (memo rule 9) inside the
+        # holdings simulation itself: they trade at the rebalance
+        # close against a spendable cash account, create lots whose
+        # settlement dates govern later split entitlement, and sell
+        # FIFO, so split entitlement, cost basis and the TWR path all
+        # depend on the rebalance chain.
+        rebalance_dates = [date_strs[i] for i in (90, 150, 210, 270)]
+        rebalance_cost_bps = 10.0
 
         def simulate(entitlement="settlement", apply_splits=True, lifo=False,
                      first_event_only=False, terminal_min_trade=True,
-                     terminal_lots=True):
+                     terminal_lots=True, periodic_rebalance=True,
+                     rebalance_cost=True, rebalance_frictions=True):
             lots = {t: [] for t in assets}  # [shares, cost_per_share, settlement]
             cash_lieu, realised = 0.0, 0.0
+            cash_balance = 0.0
+            rebalance_cost_total, rebalance_traded_total = 0.0, 0.0
+            rebalance_trade_count, periodic_count = 0, 0
             lieu_events = 0
             remaining_cost = 0.0
             daily_value, daily_flow = [], []
@@ -1822,6 +2393,7 @@ its trough date, plus the problems array defined above.
                             frac = new_shares - whole
                             if frac > 1e-9:
                                 cash_lieu += frac * price_at[t][ds]
+                                cash_balance += frac * price_at[t][ds]
                                 lieu_events += 1
                             lot[0] = whole
                             lot[1] = lot[1] / ratio
@@ -1842,7 +2414,74 @@ its trough date, plus the problems array defined above.
                             lot[0] -= take
                             to_sell -= take
                         lots[t] = [lot for lot in lots[t] if lot[0] > 0]
-                value = cash_lieu + sum(
+                if periodic_rebalance and ds in rebalance_dates:
+                    periodic_count += 1
+                    px_now = {t: price_at[t][ds] for t in assets}
+                    current = {t: int(round(sum(
+                        lot[0] for lot in lots[t]))) for t in assets}
+                    total_v = cash_balance + sum(
+                        current[t] * px_now[t] for t in assets)
+                    target_dollar = total_v / len(assets)
+                    target = {t: int(math.floor(
+                        target_dollar / px_now[t])) for t in assets}
+                    if rebalance_frictions:
+                        target = {
+                            t: int(target[t] // term_lot_sizes[t])
+                            * term_lot_sizes[t] for t in assets}
+                        target = {
+                            t: current[t]
+                            if 0 < abs(target[t] - current[t]) < term_min_trade
+                            else target[t] for t in assets}
+
+                    traded_rb = sum(abs(target[t] - current[t]) * px_now[t]
+                                    for t in assets)
+                    cost_rb = traded_rb * rebalance_cost_bps / 10000 \
+                        if rebalance_cost else 0.0
+                    leftover_rb = total_v - sum(
+                        target[t] * px_now[t] for t in assets)
+                    while leftover_rb < cost_rb and any(
+                            target[t] > current[t] for t in assets):
+                        buys = [t for t in assets if target[t] > current[t]]
+                        pick = min(buys, key=lambda t: (
+                            -(target[t] * px_now[t] - target_dollar), t))
+                        lot_sz = term_lot_sizes[pick] \
+                            if rebalance_frictions else 1
+                        target[pick] = max(current[pick],
+                                           target[pick] - lot_sz)
+                        traded_rb = sum(abs(target[t] - current[t]) * px_now[t]
+                                        for t in assets)
+                        cost_rb = traded_rb * rebalance_cost_bps / 10000 \
+                            if rebalance_cost else 0.0
+                        leftover_rb = total_v - sum(
+                            target[t] * px_now[t] for t in assets)
+                    # Sells first (FIFO, rule 3), then buys; both at
+                    # this date's close, against the cash account.
+                    for t in assets:
+                        if target[t] < current[t]:
+                            px = px_now[t]
+                            to_sell = current[t] - target[t]
+                            order = list(reversed(lots[t]) if lifo else lots[t])
+                            for lot in order:
+                                if to_sell <= 0:
+                                    break
+                                take = min(lot[0], to_sell)
+                                realised += take * (px - lot[1])
+                                lot[0] -= take
+                                to_sell -= take
+                            lots[t] = [lot for lot in lots[t] if lot[0] > 0]
+                            cash_balance += (current[t] - target[t]) * px
+                            rebalance_trade_count += 1
+                    for t in assets:
+                        if target[t] > current[t]:
+                            diff = target[t] - current[t]
+                            lots[t].append([float(diff), px_now[t],
+                                            add_business(ds, 2)])
+                            cash_balance -= diff * px_now[t]
+                            rebalance_trade_count += 1
+                    cash_balance -= cost_rb
+                    rebalance_cost_total += cost_rb
+                    rebalance_traded_total += traded_rb
+                value = cash_balance + sum(
                     sum(lot[0] for lot in lots[t]) * price_at[t][ds] for t in assets)
                 daily_value.append(value)
                 daily_flow.append(flow)
@@ -1879,7 +2518,7 @@ its trough date, plus the problems array defined above.
                 r = idx_series[j] / idx_series[j - 20] - 1
                 if worst_roll is None or r < worst_roll:
                     worst_roll, worst_roll_end = r, j
-            total_value = end_mv + cash_lieu
+            total_value = end_mv + cash_balance
             n_assets = len(assets)
             target_shares = {t: int(math.floor(
                 (total_value / n_assets) / prices[t][-1])) for t in assets}
@@ -1911,6 +2550,10 @@ its trough date, plus the problems array defined above.
                 if worst_roll_end is not None else date_strs[-1],
                 "num_cash_in_lieu_events": lieu_events,
                 "num_lots_end": sum(len(lots[t]) for t in assets),
+                "cash_end": round(cash_balance, 6),
+                "rebalance_total_cost": round(rebalance_cost_total, 6),
+                "num_periodic_rebalances": periodic_count,
+                "num_rebalance_trades": rebalance_trade_count,
                 "rebalance_target_shares": target_shares,
                 "rebalance_trade_shares": {
                     t: target_shares[t] - end_shares[t] for t in assets},
@@ -1924,8 +2567,9 @@ its trough date, plus the problems array defined above.
             "realised_pnl_fifo", "unrealised_pnl", "cash_in_lieu",
             "twr_total_return", "max_drawdown", "max_drawdown_trough_date",
             "twr_ann_vol", "worst_rolling_20d_return",
-            "worst_rolling_20d_end_date", "num_cash_in_lieu_events",
-            "num_lots_end", "rebalance_target_shares",
+            "worst_rolling_20d_end_date",             "num_cash_in_lieu_events",
+            "num_lots_end", "cash_end", "rebalance_total_cost",
+            "num_rebalance_trades", "rebalance_target_shares",
             "rebalance_trade_shares", "rebalance_leftover_cash"]
         variants = {
             "split_not_applied_to_holdings": simulate(apply_splits=False),
@@ -1934,6 +2578,10 @@ its trough date, plus the problems array defined above.
             "second_split_ignored": simulate(first_event_only=True),
             "terminal_min_trade_ignored": simulate(terminal_min_trade=False),
             "terminal_lots_ignored": simulate(terminal_lots=False),
+            "periodic_rebalance_never": simulate(periodic_rebalance=False),
+            "periodic_rebalance_no_cost": simulate(rebalance_cost=False),
+            "periodic_rebalance_no_lots_or_min_trade": simulate(
+                rebalance_frictions=False),
         }
         problems = []
         for _t, ds, a, b in events:
@@ -1984,10 +2632,13 @@ executions at that price). Positions are in shares as booked.
 4. Unrealised P&L is end market value of remaining shares (last close)
    minus their remaining cost basis; cash is excluded.
 5. Time-weighted return: build a daily index starting at 1.0 on the
-   first date with positive holdings value (share value plus
-   cash-in-lieu, after that date's trades). Each later date's return is
+   first date with positive holdings value (share value plus the
+   cash balance of rule 9, after that date's trades and any periodic
+   rebalance on that date). Each later date's return is
    (value - net trade flow that date) / previous positive value - 1,
    where a buy is a positive flow of shares*price and a sell negative.
+   Only trades.csv trades are flows; periodic-rebalance trades
+   (rule 9) are internal to the portfolio and are NOT flows.
    Modified Dietz is not used. Max drawdown is on this index, reported
    as a negative fraction (for example -0.083 means the index fell 8.3%
    from its running peak; 0.0 only if it never falls). Do not report a
@@ -2004,7 +2655,9 @@ executions at that price). Positions are in shares as booked.
    max_drawdown is reached.
 7. Terminal rebalance (a reporting calculation on the end state only;
    it changes no earlier field): let V be the end market value of the
-   remaining shares (at the last close) plus the cash-in-lieu held.
+   remaining shares (at the last close) plus the cash balance held at
+   the end (rule 9; this is cash_end, not the cumulative cash-in-lieu
+   of rule 2, part of which may have been spent by rule 9).
    n is the number of distinct tickers in prices.csv (n = 5 in this
    task), so the target dollar value per asset is V/n. Each asset
    also has a lot size, in shares: LOT_SIZES_LINE. The minimum
@@ -2020,6 +2673,7 @@ executions at that price). Positions are in shares as booked.
 8. num_cash_in_lieu_events is the number of (split event, lot) pairs
    that produced a fractional cash-out. num_lots_end is the number of
    lots still held on the last date.
+9. Periodic rebalances: dates are REBALANCE_DATES_LINE; cost_bps=10; lot sizes and the minimum trade size are exactly as stated in rule 7. On each of these dates, after that date's splits (rules 1-2) and that date's trades.csv trades, the portfolio is rebalanced to equal weights at that date's closes, in exactly this order: (a) the cash account starts at 0 before the first date, receives every cash-in-lieu payment (rule 2) when it is paid, and is otherwise changed only by this rule; the portfolio value Vp is the cash balance plus the market value of all lots held, at that date's closes; the target dollar value per asset is Vp/n (n as in rule 7); each asset's target share count is floor(Vp/n / close), rounded DOWN to a whole multiple of its lot size (rule 7), except that if the resulting trade (target minus current shares) is nonzero but smaller than the minimum trade size (rule 7) in absolute value, that asset does not trade and its target is its current share count; (b) the transaction cost is cost_bps/10000 times the traded notional (sum over assets of |target - current| * close); if the leftover cash (Vp minus the target holdings value) would be less than that cost, reduce buy targets before executing: repeatedly take the asset whose target market value most exceeds its target dollar value (ties by ticker) among assets whose target exceeds their current count, and reduce its target by one lot (not below its current count), recomputing traded notional, cost and leftover after each reduction, until the leftover is at least the cost or no such asset remains (a reduced buy is not re-tested against the minimum trade size); (c) execute the sells first, first-in first-out at that date's close under rule 3 (their proceeds are added to the cash account and their realised P&L is part of realised_pnl_fifo), then the buys at that date's close (their cost is paid from the cash account; each buy is a new lot whose booked date is the rebalance date, so its settlement date under rule 1 is the rebalance date plus 2 business days and governs its entitlement to later splits), then deduct the transaction cost from the cash account. cash_end is the cash balance after the last date (cash-in-lieu received minus periodic-rebalance buys and costs plus periodic-rebalance sell proceeds); rebalance_total_cost is the sum of the periodic-rebalance transaction costs; num_periodic_rebalances is the number of rule-9 rebalance dates; num_rebalance_trades is the total number of assets whose share count actually changed at a periodic rebalance, summed over the rebalance dates.
 
 ## Allowed problem codes (report exactly these, under exactly these rules)
 The problems array may contain only: split, reverse_split.
@@ -2036,13 +2690,17 @@ No other category code may be reported for this task.
 Report end share counts per asset, realised_pnl_fifo, unrealised_pnl,
 cash_in_lieu, twr_total_return, max_drawdown, max_drawdown_trough_date,
 twr_ann_vol, worst_rolling_20d_return, worst_rolling_20d_end_date,
-num_cash_in_lieu_events, num_lots_end, rebalance_target_shares,
+num_cash_in_lieu_events, num_lots_end, cash_end,
+rebalance_total_cost, num_periodic_rebalances, num_rebalance_trades,
+rebalance_target_shares,
 rebalance_trade_shares, rebalance_leftover_cash, num_trades,
 num_splits and the problems array defined above.
 """
         spec = spec.replace(
             "LOT_SIZES_LINE",
             ", ".join(f"{t}={term_lot_sizes[t]}" for t in assets))
+        spec = spec.replace(
+            "REBALANCE_DATES_LINE", ", ".join(rebalance_dates))
         files = {
             "prices.csv": _csv(["date", "ticker", "open", "high", "low", "close", "volume"], rows_out),
             "splits.csv": _csv(["date", "ticker", "ratio"], split_rows),

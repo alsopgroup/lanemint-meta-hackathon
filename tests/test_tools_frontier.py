@@ -777,7 +777,9 @@ class TestComputationHardening:
                 tickers = sorted(last_close)
                 end_mv = sum(expected[f"shares_{t}"] * last_close[t]
                              for t in tickers)
-                total = end_mv + expected["cash_in_lieu"]
+                # Terminal V uses the end cash balance (round 6:
+                # periodic rebalances may have spent cash-in-lieu).
+                total = end_mv + expected["cash_end"]
                 # Terminal rebalance identity (memo rule 7): floor to
                 # the asset's lot size, and a sub-minimum trade is not
                 # made (target stays at the end share count).
@@ -1314,3 +1316,322 @@ class TestOptimisationHardening:
                 "--output-dir", str(tmp_path / f"out_{tier}")])
             assert runner_mod.main() == 0
             assert seen["max_turns"] == want, (tier, seen["max_turns"])
+
+
+# ------------------------------------------------ multi-stage chains
+
+class TestMultiStageChains:
+    """Round-6 hardening (seed 7801 pilot: Spark 1.3 28/30 with only
+    T5 misses at the turn limit and T1-T4 saturated): every family
+    now ends in a multi-stage, stateful chain - rolling
+    re-estimation feeding a trading simulation with lots, minimum
+    trade sizes and costs - and the core fields sit at the end of
+    each chain.  These tests recompute chain outputs independently
+    from the raw task files."""
+
+    def test_t1_hedge_strategy_chain_recomputed(self, dev_sets):
+        import csv as csv_mod
+        import math as math_mod
+        import re as re_mod
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_convention_risk":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                ms = re_mod.search(
+                    r"- hedge_strategy: asset=(\w+); benchmark=(\w+); "
+                    r"capital=(\d+); window_returns=(\d+); "
+                    r"first_rebalance_index=(\d+); rebalance_step=(\d+); "
+                    r"hedge_lot=(\d+); cost_bps=([\d.]+); "
+                    r"lower_bound=([\d.]+); upper_bound=([\d.]+)", spec)
+                asset, bench = ms.group(1), ms.group(2)
+                capital, window = float(ms.group(3)), int(ms.group(4))
+                first, step, lot = int(ms.group(5)), int(ms.group(6)), \
+                    int(ms.group(7))
+                cost_bps = float(ms.group(8))
+                lo, hi = float(ms.group(9)), float(ms.group(10))
+                trading = {r["date"] for r in csv_mod.DictReader(
+                    open(task_dir / "calendar.csv"))}
+                series = {}
+                for r in csv_mod.DictReader(open(task_dir / "prices.csv")):
+                    if r["date"] in trading:
+                        series.setdefault(r["ticker"], {})[r["date"]] = \
+                            float(r["close"])
+                dates_a = sorted(series[asset])
+                ca = [series[asset][d] for d in dates_a]
+                cb = [series[bench][d] for d in dates_a]
+
+                def log_rets(cs):
+                    return [math_mod.log(b / a)
+                            for a, b in zip(cs, cs[1:], strict=False)]
+
+                la, lb = log_rets(ca), log_rets(cb)
+                shares_a = int(capital // ca[0])
+                cash = capital - shares_a * ca[0]
+                short, total_cost, ratios, navs = 0.0, 0.0, [], []
+                for idx in range(len(ca)):
+                    if idx >= first and (idx - first) % step == 0:
+                        xa, xb = la[idx - window:idx], lb[idx - window:idx]
+                        ma, mb = sum(xa) / len(xa), sum(xb) / len(xb)
+                        cov = sum((x - ma) * (y - mb) for x, y in
+                                  zip(xa, xb, strict=True)) / (len(xa) - 1)
+                        var = sum((y - mb) ** 2 for y in xb) / (len(xb) - 1)
+                        h = min(max(cov / var, lo), hi)
+                        ratios.append(h)
+                        desired = float(int(
+                            h * shares_a * ca[idx] / cb[idx] // lot) * lot)
+                        trade = desired - short
+                        cst = abs(trade) * cb[idx] * cost_bps / 10000
+                        cash += trade * cb[idx] - cst
+                        total_cost += cst
+                        short = desired
+                    navs.append(cash + shares_a * ca[idx] - short * cb[idx])
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert key["num_hedge_rebalances"] == len(ratios) == 10
+                assert abs(key["hedge_strategy_final_nav"] - navs[-1]) < 1e-4
+                assert abs(key["hedge_strategy_total_cost"] - total_cost) < 1e-4
+                assert abs(key["hedge_strategy_last_ratio"] - ratios[-1]) < 1e-6
+                assert key["hedge_strategy_final_short_shares"] == int(short)
+                assert int(short) % lot == 0
+                assert total_cost > 0
+                assert {"hedge_strategy_never_reestimated",
+                        "hedge_strategy_unbounded_rolling",
+                        "hedge_strategy_no_cost",
+                        "hedge_strategy_fractional_shares"} \
+                    <= set(task["trap_variants"])
+
+    def test_t2_strategy_weight_and_structure(self, dev_sets):
+        import csv as csv_mod
+        import re as re_mod
+        from datetime import UTC
+        from datetime import datetime as dt
+
+        def read(task_dir, name):
+            return list(csv_mod.DictReader(open(task_dir / name)))
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_fx_calendar":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                assert "Monthly rebalanced sleeve strategy" in spec
+                mst = re_mod.search(
+                    r"- strategy: .*window_returns=(\d+); "
+                    r"eu_weight_bounds=([\d.]+),([\d.]+); .*lots: (.+)$",
+                    spec, re_mod.MULTILINE)
+                window, lo, hi = int(mst.group(1)), float(mst.group(2)), \
+                    float(mst.group(3))
+                lots = {t: int(v) for t, v in re_mod.findall(
+                    r"(\w+)=(\d+)", mst.group(4))}
+                # Effective FX per union date (walk-back rule).
+                union = sorted(
+                    {r["date"] for r in read(task_dir, "us_prices.csv")}
+                    | {r["date"] for r in read(task_dir, "eu_prices.csv")})
+                by_utc = {}
+                for r in read(task_dir, "fx.csv"):
+                    inst = dt.fromisoformat(
+                        r["timestamp"].replace("Z", "+00:00")).astimezone(UTC)
+                    by_utc[inst.strftime("%Y-%m-%d")] = (r, inst)
+                eff, prev_on_time = {}, None
+                for ds in union:
+                    row, inst = by_utc[ds]
+                    rate = float(row["rate"])
+                    e = rate if row["quote"] == "EURUSD" else 1 / rate
+                    on_time = (inst.hour * 60 + inst.minute) <= 16 * 60
+                    eff[ds] = e if on_time else prev_on_time
+                    if on_time:
+                        prev_on_time = e
+                us = {}
+                for r in read(task_dir, "us_prices.csv"):
+                    us.setdefault(r["ticker"], {})[r["date"]] = float(r["close"])
+                eu = {}
+                for r in read(task_dir, "eu_prices.csv"):
+                    eu.setdefault(r["ticker"], {})[r["date"]] = float(r["close"])
+                inner = sorted(set(next(iter(us.values())))
+                               & set(next(iter(eu.values()))))
+                us_t, eu_t = sorted(us), sorted(eu)
+
+                def mean(xs):
+                    return sum(xs) / len(xs)
+
+                us_r, eu_r = [], []
+                for k in range(len(inner) - 1):
+                    d0, d1 = inner[k], inner[k + 1]
+                    us_r.append(mean([us[t][d1] / us[t][d0] - 1 for t in us_t]))
+                    eu_r.append(mean([
+                        (eu[t][d1] * eff[d1]) / (eu[t][d0] * eff[d0]) - 1
+                        for t in eu_t]))
+                reb = [i for i, ds in enumerate(inner)
+                       if i >= window
+                       and (i == 0 or ds[:7] != inner[i - 1][:7])]
+                idx = reb[-1]
+                xa, xb = us_r[idx - window:idx], eu_r[idx - window:idx]
+
+                def var(xs):
+                    m = mean(xs)
+                    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+
+                mx, my = mean(xa), mean(xb)
+                cov = sum((x - mx) * (y - my) for x, y in
+                          zip(xa, xb, strict=True)) / (len(xa) - 1)
+                denom = var(xa) + var(xb) - 2 * cov
+                w_unc = (var(xa) - cov) / denom if denom else 0.5
+                want = min(max(w_unc, lo), hi)
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                # The optimiser field at the end of the chain, to
+                # optimiser precision, from raw files only.
+                assert abs(key["strategy_last_eu_weight"] - want) < 1e-6
+                assert key["num_strategy_rebalances"] == len(reb) >= 7
+                for t, s in key["strategy_final_shares"].items():
+                    assert s % lots[t] == 0, (task["id"], t)
+                assert key["strategy_cash_end"] >= 0
+                assert key["strategy_total_cost"] > 0
+                assert 0.0 < key["strategy_eu_weight_final"] < 1.0
+                assert {"strategy_fixed_equal_sleeves",
+                        "strategy_weights_never_reestimated",
+                        "strategy_eu_sleeve_in_eur",
+                        "strategy_no_cost",
+                        "strategy_no_lots_or_min_trade"} \
+                    <= set(task["trap_variants"])
+
+    def test_t3_rp_strategy_weights_and_structure(self, dev_sets):
+        import csv as csv_mod
+        import math as math_mod
+        import re as re_mod
+        from datetime import UTC
+        from datetime import datetime as dt
+
+        def instant(stamp):
+            return dt.fromisoformat(
+                stamp.replace("Z", "+00:00")).astimezone(UTC)
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_reconciliation":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                assert "Rolling risk-parity strategy" in spec
+                rp_tickers = re_mod.search(
+                    r"risk_parity_tickers: (.+)", spec).group(1).split(", ")
+                lots = {t: int(v) for t, v in re_mod.findall(
+                    r"(\w+)=(\d+)", re_mod.search(
+                        r"rp_strategy: .*lots: (.+)$", spec,
+                        re_mod.MULTILINE).group(1))}
+                report = instant(re_mod.search(
+                    r"report_time: (\S+)", spec).group(1))
+
+                def first_wins(name, value_fn, _dir=task_dir):
+                    out, status = {}, {}
+                    for r in csv_mod.DictReader(open(_dir / name)):
+                        k = (r["ticker"], r["date"])
+                        if k not in out:
+                            out[k] = value_fn(r)
+                            status[k] = r.get("status")
+                    return out, status
+
+                a_val, a_status = first_wins(
+                    "vendor_a.csv", lambda r: float(r["close"]))
+                b_val, _ = first_wins(
+                    "vendor_b.csv",
+                    lambda r: float(r["close"]) / 100
+                    if r["unit"] == "cents" else float(r["close"]))
+                corr = {}
+                for r in csv_mod.DictReader(open(task_dir / "corrections.csv")):
+                    when = instant(r["as_of"])
+                    k = (r["ticker"], r["date"])
+                    if when <= report and (
+                            k not in corr or when > corr[k][1]):
+                        corr[k] = (float(r["close"]), when)
+                resolved = {}
+                for k in sorted(set(a_val) | set(b_val)):
+                    av, bv = a_val.get(k), b_val.get(k)
+                    if k in corr:
+                        resolved[k] = corr[k][0]
+                    elif av is not None and a_status.get(k) != "indicative":
+                        resolved[k] = av
+                    else:
+                        avail = sorted(v for v in (av, bv)
+                                       if v is not None)
+                        resolved[k] = avail[len(avail) // 2] \
+                            if len(avail) % 2 else (avail[0] + avail[-1]) / 2
+                by = {t: {d: v for (tt, d), v in resolved.items() if tt == t}
+                      for t in rp_tickers}
+                days = sorted(set.intersection(
+                    *[set(by[t]) for t in rp_tickers]))
+                reb = list(range(60, len(days), 21))
+                idx = reb[-1]
+                # Trailing-window covariance at the last rebalance.
+                rets = {}
+                for t in rp_tickers:
+                    seg = [by[t][d] for d in days[idx - 60:idx + 1]]
+                    rets[t] = [math_mod.log(b / a) for a, b in
+                               zip(seg, seg[1:], strict=False)]
+                m = 60
+                means = {t: sum(rets[t]) / m for t in rp_tickers}
+                cov = {(a, b): sum(
+                    (rets[a][k] - means[a]) * (rets[b][k] - means[b])
+                    for k in range(m)) / (m - 1)
+                    for a in rp_tickers for b in rp_tickers}
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                w = {t: key["rp_last_weights"][t] for t in rp_tickers}
+                assert abs(sum(w.values()) - 1.0) < 1e-9
+                assert all(x > 0 for x in w.values())
+                # Equal risk contributions on the trailing window:
+                # the rolling optimiser key, verified independently.
+                rc = {a: w[a] * sum(cov[(a, b)] * w[b] for b in rp_tickers)
+                      for a in rp_tickers}
+                assert max(rc.values()) - min(rc.values()) < 1e-7, (
+                    task["id"], rc)
+                assert key["num_rp_rebalances"] == len(reb)
+                for t, s in key["rp_final_shares"].items():
+                    assert s % lots[t] == 0, (task["id"], t)
+                assert key["rp_strategy_cash_end"] >= 0
+                assert key["rp_strategy_total_cost"] > 0
+                assert {"rp_strategy_equal_weights",
+                        "rp_strategy_inverse_vol",
+                        "rp_strategy_weights_never_reestimated",
+                        "rp_strategy_no_cost",
+                        "rp_strategy_no_lots_or_min_trade"} \
+                    <= set(task["trap_variants"])
+
+    def test_t4_periodic_rebalance_structure(self, dev_sets):
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_split_holdings":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                assert "Periodic rebalances: dates are" in spec
+                assert "cost_bps=10" in spec
+                assert "cash_end, not the cumulative" in \
+                    " ".join(spec.split())
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert key["num_periodic_rebalances"] == 4
+                assert key["num_rebalance_trades"] >= 4
+                assert key["rebalance_total_cost"] > 0
+                assert key["cash_end"] >= 0
+                assert {"periodic_rebalance_never",
+                        "periodic_rebalance_no_cost",
+                        "periodic_rebalance_no_lots_or_min_trade"} \
+                    <= set(task["trap_variants"])
+
+    def test_variant_counts_per_family(self, dev_sets):
+        want = {
+            "tools_frontier_convention_risk": 11,
+            "tools_frontier_fx_calendar": 11,
+            "tools_frontier_reconciliation": 12,
+            "tools_frontier_split_holdings": 9,
+            "tools_frontier_portfolio_construction": 4,
+        }
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                assert len(task["trap_variants"]) == want[task["type"]], (
+                    task["id"], task["type"])
