@@ -241,14 +241,22 @@ class ToolsFrontierTaskGenerator:
         self.task_id += 1
         task_id = f"task_tf_{self.task_id:03d}"
         expected = dict(expected)
+        # Optimiser outputs (portfolio weights, risk-parity weights)
+        # are graded at rtol 1e-4 like other optimiser weights; the
+        # keys themselves are computed to ~1e-12 (see the T5 solver).
+        field_rtol = {}
+        if family == "portfolio_construction":
+            field_rtol = {"weights_first_rebalance": 1e-4,
+                          "weights_last_rebalance": 1e-4}
+        elif family == "reconciliation":
+            field_rtol = {f"risk_parity_weight_REC{i}": 1e-4
+                          for i in (1, 2, 3)}
         expected["_tools_frontier"] = {
             "family": FAMILY_TYPES[family],
             "core": core,
             "rtol": _RTOL,
             "atol": _ATOL,
-            "field_rtol": {"weights_first_rebalance": 1e-4,
-                           "weights_last_rebalance": 1e-4}
-            if family == "portfolio_construction" else {},
+            "field_rtol": field_rtol,
         }
         if problems is not None:
             expected["problems_found"] = sorted(problems)
@@ -279,8 +287,10 @@ class ToolsFrontierTaskGenerator:
         bench2_rets = [0.4 * r + rng.gauss(0, 0.009) for r in bench_rets]
         series[bench2] = _closes(rng, rng.uniform(90, 130), [0.0] + bench2_rets)
         asset_rets = {}
+        betas = {}
         for asset in assets:
             beta = rng.uniform(0.6, 1.5)
+            betas[asset] = beta
             rets = [beta * r + rng.gauss(0, 0.008) for r in bench_rets]
             asset_rets[asset] = rets
             series[asset] = _closes(rng, rng.uniform(40, 170), [0.0] + rets)
@@ -397,6 +407,23 @@ class ToolsFrontierTaskGenerator:
         worst_i = min(range(len(simple[assets[1]])),
                       key=lambda i: simple[assets[1]][i])
 
+        # Bounded minimum-tracking-error hedge (section 15): a small
+        # constrained optimisation.  The hedged asset is the one with
+        # the largest constructed beta to the benchmark, so its
+        # unconstrained ratio typically sits above the stated upper
+        # bound and the bound genuinely binds (the reseeding gate
+        # discards the rare task where it does not).
+        hedge_asset = max(assets, key=lambda a: betas[a])
+        hedge_window, h_lower, h_upper = 120, 0.0, 1.25
+        h_a = _returns(series[hedge_asset], "log")[-hedge_window:]
+        h_b = _returns(series[bench_name], "log")[-hedge_window:]
+        h_unc = _cov(h_a, h_b, 1) / _var(h_b, 1)
+        h_opt = min(max(h_unc, h_lower), h_upper)
+
+        def hedged_vol(h):
+            return _std([a - h * b for a, b in zip(h_a, h_b, strict=True)],
+                        1) * math.sqrt(252)
+
         # Pitfall rows that only appear on inspection: weekend prints for
         # the first asset (their dates are absent from calendar.csv and
         # the memo excludes them) and, below, one ticker's rows shuffled.
@@ -435,6 +462,8 @@ class ToolsFrontierTaskGenerator:
             "rolling_max_correlation_end_date": _dstr(dates[max_corr_end + 1]),
             "worst_day_return": round(simple[assets[1]][worst_i], 6),
             "worst_day_date": _dstr(dates[worst_i + 1]),
+            "hedge_ratio": round(h_opt, 6),
+            "hedged_ann_vol": round(hedged_vol(h_opt), 6),
             "num_aligned_days": rows,
         })
         core = [f"ann_vol_{a}" for a in assets] + [
@@ -447,7 +476,8 @@ class ToolsFrontierTaskGenerator:
             "portfolio_ann_vol", "portfolio_max_drawdown",
             "portfolio_max_drawdown_trough_date", "portfolio_sharpe",
             "rolling_max_correlation", "rolling_max_correlation_end_date",
-            "worst_day_return", "worst_day_date"]
+            "worst_day_return", "worst_day_date",
+            "hedge_ratio", "hedged_ann_vol"]
 
         def _corr(kind):
             ra = _returns(series[assets[0]], kind)
@@ -498,6 +528,10 @@ class ToolsFrontierTaskGenerator:
             "worst_day_date": _dstr(dates[
                 _returns(series[assets[1]], "log").index(
                     min(_returns(series[assets[1]], "log"))) + 1]),
+            # The naive answer also skips the bounded optimisation and
+            # reports the unconstrained ratio.
+            "hedge_ratio": round(h_unc, 6),
+            "hedged_ann_vol": round(hedged_vol(h_unc), 6),
             "num_aligned_days": rows,
         })
         nonoverlap = rolling_betas(simple[target], simple[bench_name], window, window)
@@ -524,12 +558,19 @@ class ToolsFrontierTaskGenerator:
         level_series = [sum(series[a][i] for a in assets) for i in range(rows)]
         variant_levels = dict(expected)
         variant_levels.update(portfolio_fields(_returns(level_series, "simple")))
+        # Unbounded-hedge trap: the variance-minimising ratio without
+        # the stated [lower, upper] bounds (and the vol at that ratio).
+        variant_unbounded = dict(expected)
+        variant_unbounded.update({
+            "hedge_ratio": round(h_unc, 6),
+            "hedged_ann_vol": round(hedged_vol(h_unc), 6)})
         variants = {"naive_simple_252": naive,
                     "nonoverlapping_rolling": variant_nonoverlap,
                     "weekend_prints_included": variant_weekend,
                     "wrong_benchmark": variant_wrong_bench,
                     "full_sample_instead_of_recent": variant_full_sample,
-                    "portfolio_from_price_levels": variant_levels}
+                    "portfolio_from_price_levels": variant_levels,
+                    "hedge_ratio_unbounded": variant_unbounded}
 
         rows_out = []
         for ticker in assets + [bench_name, bench2]:
@@ -567,6 +608,7 @@ section only; honour the governing clause for each field.
 - portfolio: assets={",".join(assets)}; weighting=equal; return=simple; periods_per_year=252; ddof=1
 - rolling_correlation: asset={assets[0]}; benchmark={bench_name}; window=30; step=5; return=log
 - worst_day: asset={assets[1]}; return=simple
+- hedge: asset={hedge_asset}; benchmark={bench_name}; window_returns={hedge_window}; return=log; lower_bound={h_lower:.1f}; upper_bound={h_upper:.2f}; periods_per_year=252; ddof=1
 
 ## Data rules (read before computing)
 - calendar.csv lists the trading dates. prices.csv can contain rows on
@@ -633,6 +675,16 @@ section only; honour the governing clause for each field.
 14. Worst day: worst_day_return is the smallest simple daily return of
    {assets[1]} over the full sample, and worst_day_date is its date
    (the second price date of the return pair).
+15. Minimum-tracking-error hedge: over the LAST {hedge_window} log
+   returns of {hedge_asset} and {bench_name} (aligned by date),
+   consider the hedged returns r_asset - h * r_benchmark.
+   hedge_ratio is the value of h in [{h_lower:.1f}, {h_upper:.2f}]
+   that minimises the sample variance (ddof=1) of the hedged
+   returns. The unconstrained minimiser is cov(asset, benchmark) /
+   var(benchmark) over those returns (ddof cancels); if it lies
+   outside the bounds, the nearest bound is the minimiser.
+   hedged_ann_vol is the sample standard deviation (ddof=1) of the
+   hedged returns at the reported hedge_ratio, times sqrt(252).
 
 Prices are in prices.csv (date,ticker,open,high,low,close,volume);
 after the data rules above are applied the series align on {rows}
@@ -829,8 +881,54 @@ business days.
             "num_inverted_fix_rows": sum(1 for r in fx_rows if r[1] == "USDEUR"),
             "num_weekend_prints": len(fx_rows) - len(union_dates),
         }
+        # Monthly FX hedge on the EU sleeve (rule 8): a stateful
+        # multi-period simulation.  On the first union date of each
+        # calendar month, a forward sale of hedge_ratio times the EU
+        # sleeve's EUR value (most recent closes) is struck at that
+        # date's effective rate; it settles at the next reset date (or
+        # the last union date) and the USD cash P&L is held uninvested.
+        hedge_ratio = 0.75
+        eu_eur_filled, _last_eu = {}, {}
+        for day in union_dates:
+            ds = _dstr(day)
+            for t in eu_assets:
+                if ds in eu_idx[t]:
+                    _last_eu[t] = eu_idx[t][ds]
+            eu_eur_filled[ds] = sum(
+                holdings[t] * _last_eu.get(t, 0.0) for t in eu_assets)
+
+        def hedge_sim(eff_map, nav_map, mode="monthly"):
+            resets, seen_months = [], set()
+            for day in union_dates:
+                if (day.year, day.month) not in seen_months:
+                    seen_months.add((day.year, day.month))
+                    resets.append(_dstr(day))
+            if mode == "never":
+                resets = resets[:1]
+            settlements = []
+            for k, r_ds in enumerate(resets):
+                settle_ds = resets[k + 1] if k + 1 < len(resets) \
+                    else _dstr(union_dates[-1])
+                notional = hedge_ratio * eu_eur_filled[r_ds]
+                settlements.append((settle_ds, notional
+                                    * (eff_map[r_ds] - eff_map[settle_ds])))
+            days = sorted(nav_map)
+            h_series = [nav_map[ds] + sum(
+                p for d2, p in settlements if d2 <= ds) for ds in days]
+            h_dd, _ = _max_drawdown(h_series)
+            h_log = [math.log(b / a)
+                     for a, b in zip(h_series, h_series[1:], strict=False)]
+            return {
+                "hedge_pnl_total": round(sum(p for _d, p in settlements), 6),
+                "num_hedge_resets": len(resets),
+                "hedged_nav_ann_vol": round(
+                    _std(h_log, 1) * math.sqrt(252), 6) if len(h_log) > 1 else 0.0,
+                "hedged_nav_max_drawdown": round(h_dd, 6),
+            }
+
         expected = {f"nav_{d.replace('-', '')}": round(navs[d], 6) for d in probe}
         expected.update({
+            **hedge_sim(eff, navs),
             "total_return_usd": round(total_ret, 6),
             "fx_pnl_contribution": round(fx_contrib, 6),
             "dates_dropped_by_alignment": len(union_dates) - len(inner_dates),
@@ -855,9 +953,11 @@ business days.
             eu_field, us_field, "eu_sleeve_weight_last_probe",
             "max_nav_value", "max_nav_date", "nav_max_drawdown",
             "nav_drawdown_trough_date", "nav_ann_vol",
-            "num_late_fixes", "num_inverted_fix_rows", "num_weekend_prints"]
+            "num_late_fixes", "num_inverted_fix_rows", "num_weekend_prints",
+            "hedge_pnl_total", "num_hedge_resets",
+            "hedged_nav_ann_vol", "hedged_nav_max_drawdown"]
 
-        def variant_answer(eff_v, calendar="inner"):
+        def variant_answer(eff_v, calendar="inner", hedge_mode="monthly"):
             n = nav_series(eff_v, calendar)
             ks = sorted(n)
             out = {}
@@ -887,6 +987,7 @@ business days.
                 "nav_drawdown_trough_date": ks[v_tr],
                 "nav_ann_vol": round(_std(v_log, 1) * math.sqrt(252), 6)
                 if len(v_log) > 1 else 0.0,
+                **hedge_sim(eff_v, n, hedge_mode),
                 **fix_counts,
                 "num_inner_days": len(ks)})
             return out
@@ -901,6 +1002,7 @@ business days.
                 effective_rates(method="prev_date")),
             "fx_filed_by_stamp_local_date": variant_answer(
                 effective_rates(key_by_stamp_date=True)),
+            "hedge_never_reset": variant_answer(eff, hedge_mode="never"),
         }
         problems = ["currency_inverted_quote_segment", "timezone_mixed_utc_offsets",
                     "calendar_exchange_holidays"]
@@ -930,6 +1032,7 @@ holdings: {json.dumps(holdings, sort_keys=True)}
 - portfolio_calendar: inner (dates present on both exchanges)
 - nav_dates: {", ".join(probe)}
 - fx_detail_date: {late_probe_date}
+- fx_hedge: sleeve=EU; hedge_ratio=0.75; reset=first_union_date_of_each_calendar_month
 
 ## Rules
 1. Convert each European close to USD with the FX fix for the same trade
@@ -985,6 +1088,28 @@ holdings: {json.dumps(holdings, sort_keys=True)}
    under rule 1. num_inverted_fix_rows is the number of fx.csv rows
    whose quote is USDEUR. num_weekend_prints is the number of fx.csv
    rows whose UTC date is not a union trade date.
+8. Monthly FX hedge on the European sleeve. On the first union date
+   of each calendar month (a reset date; the first union date is a
+   reset date), a forward sale is struck: its notional, in EUR, is
+   0.75 * (the EU sleeve's value in EUR on the reset date), where the
+   EU sleeve EUR value is the sum over European holdings of
+   shares * EUR close, using each asset's most recent close on or
+   before that date; the forward rate is the effective rate of rules
+   1-2 on the reset date (the forward is struck at that date's
+   effective spot rate - there are no forward points). Each forward
+   settles on the next reset date, or on the last union date if
+   there is no later reset: the settlement P&L, in USD, is
+   notional * (forward rate - the effective rate on the settlement
+   date), received as USD cash on the settlement date and held
+   uninvested thereafter. hedge_pnl_total is the sum of all
+   settlement P&Ls, including the final settlement.
+   num_hedge_resets is the number of reset dates. The hedged NAV on
+   an inner date is that date's NAV (rule 3) plus every settlement
+   P&L whose settlement date is on or before it;
+   hedged_nav_ann_vol is the sample standard deviation (ddof=1) of
+   the daily log returns of the hedged NAV over the inner calendar,
+   times sqrt(252), and hedged_nav_max_drawdown is the hedged NAV's
+   max drawdown (same sign convention as rule 6).
 
 ## Allowed problem codes (report exactly these, under exactly these rules)
 The problems array may contain only: currency, timezone, calendar.
@@ -1007,7 +1132,9 @@ dates_dropped_by_alignment, effective_fx_rate_mid_probe,
 value, the US sleeve value on the last nav_date,
 eu_sleeve_weight_last_probe, max_nav_value, max_nav_date,
 nav_max_drawdown, nav_drawdown_trough_date, nav_ann_vol,
-num_late_fixes, num_inverted_fix_rows, num_weekend_prints and
+num_late_fixes, num_inverted_fix_rows, num_weekend_prints,
+hedge_pnl_total, num_hedge_resets, hedged_nav_ann_vol,
+hedged_nav_max_drawdown and
 num_inner_days, plus the problems array defined above.
 """
         files = {
@@ -1256,11 +1383,83 @@ num_inner_days, plus the problems array defined above.
             items = sorted((ds, v) for (tt, ds), v in res.items() if tt == t)
             return [d for d, _v in items], [v for _d, v in items]
 
-        def finish(res, p):
+        rp_tickers = tickers[:3]
+
+        def rp_weights(res, mode="parity"):
+            """Risk-parity weights on the reconciled series.
+
+            Aligns the three tickers' resolved closes on their common
+            dates, builds the log-return covariance (ddof=1), and for
+            ``parity`` solves min 0.5 w' Sigma w - sum(ln w_i) by
+            Newton's method (its minimiser has w_i (Sigma w)_i equal
+            for all i), then normalises.  ``equal`` / ``inverse_vol``
+            are the trap answers.
+            """
+            per = {t: {} for t in rp_tickers}
+            for (t, ds), v in res.items():
+                if t in per:
+                    per[t][ds] = v
+            days = sorted(set.intersection(
+                *[set(per[t]) for t in rp_tickers]))
+            closes_rp = [[per[t][d] for d in days] for t in rp_tickers]
+            rets = [[math.log(b / a)
+                     for a, b in zip(c, c[1:], strict=False)]
+                    for c in closes_rp]
+            m = len(rets[0])
+            means = [_mean(r) for r in rets]
+            cov = [[sum((rets[i][k] - means[i]) * (rets[j][k] - means[j])
+                        for k in range(m)) / (m - 1)
+                    for j in range(3)] for i in range(3)]
+            if mode == "equal":
+                return [1.0 / 3.0] * 3
+            if mode == "inverse_vol":
+                inv = [1.0 / math.sqrt(cov[i][i]) for i in range(3)]
+                s_inv = sum(inv)
+                return [x / s_inv for x in inv]
+
+            def solve3(mat, vec):
+                a = [row[:] + [vec[i]] for i, row in enumerate(mat)]
+                for col in range(3):
+                    piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
+                    a[col], a[piv] = a[piv], a[col]
+                    for r in range(3):
+                        if r != col:
+                            f = a[r][col] / a[col][col]
+                            for cc in range(col, 4):
+                                a[r][cc] -= f * a[col][cc]
+                return [a[i][3] / a[i][i] for i in range(3)]
+
+            def obj(w):
+                return 0.5 * sum(w[i] * cov[i][j] * w[j]
+                                 for i in range(3) for j in range(3)) \
+                    - sum(math.log(x) for x in w)
+
+            w = [1.0 / math.sqrt(cov[i][i]) for i in range(3)]
+            for _it in range(200):
+                sw = [sum(cov[i][j] * w[j] for j in range(3))
+                      for i in range(3)]
+                grad = [sw[i] - 1.0 / w[i] for i in range(3)]
+                if max(abs(g) for g in grad) < 1e-13:
+                    break
+                hess = [[cov[i][j] + (1.0 / w[i] ** 2 if i == j else 0.0)
+                         for j in range(3)] for i in range(3)]
+                step = solve3(hess, [-g for g in grad])
+                t_step, f0 = 1.0, obj(w)
+                for _ls in range(80):
+                    cand = [w[i] + t_step * step[i] for i in range(3)]
+                    if all(x > 0 for x in cand) and obj(cand) <= f0:
+                        break
+                    t_step *= 0.5
+                w = [w[i] + t_step * step[i] for i in range(3)]
+            total = sum(w)
+            return [x / total for x in w]
+
+        def finish(res, p, rp_mode="parity"):
             """Full answer for one resolution outcome (key or variant)."""
             s, c, d2, tr = metrics(res)
             p_dates, p_closes = ticker_series(res, probe_ticker)
             p_dd, p_tr = _max_drawdown(p_closes)
+            rp = rp_weights(res, rp_mode)
             out = {
                 "resolved_by_correction": p["correction"],
                 "resolved_by_vendor_a": p["vendor_a"],
@@ -1275,6 +1474,8 @@ num_inner_days, plus the problems array defined above.
                 "num_correction_rows_total": len(corr_rows),
                 "num_correction_rows_late": sum(
                     1 for e in corr_entries if e["utc"] > report_time),
+                **{f"risk_parity_weight_{t}": round(wi, 6)
+                   for t, wi in zip(rp_tickers, rp, strict=True)},
                 "num_resolved_days": len(c),
             }
             for d in probe_dates:
@@ -1293,6 +1494,7 @@ num_inner_days, plus the problems array defined above.
                 "probe_ticker_max_drawdown",
                 "probe_ticker_drawdown_trough_date",
                 "num_correction_rows_late"] + \
+            [f"risk_parity_weight_{t}" for t in rp_tickers] + \
             [k for k in expected if k.startswith("resolved_close_")]
 
         def variant(mode):
@@ -1367,7 +1569,11 @@ num_inner_days, plus the problems array defined above.
                     "no_corrections": variant("no_corrections"),
                     "ignore_indicative_flag": variant("ignore_indicative"),
                     "first_correction_wins": variant("first_correction_wins"),
-                    "asof_string_compare": variant("asof_string_compare")}
+                    "asof_string_compare": variant("asof_string_compare"),
+                    "risk_parity_equal_weights": finish(
+                        resolved, paths, "equal"),
+                    "risk_parity_inverse_vol": finish(
+                        resolved, paths, "inverse_vol")}
         problems = ["source_conflict_vendor_disagreement", "unit_change_vendor_b_unit_column",
                     "duplicate_vendor_a_rows"]
         # The memo's missing rule, applied to the key exactly as stated:
@@ -1388,6 +1594,7 @@ probe_ticker: {probe_ticker}
 probe_dates: {", ".join(probe_dates)}
 probe_ticker_2: {probe_ticker_2}
 probe_dates_2: {", ".join(probe_dates_2)}
+risk_parity_tickers: {", ".join(rp_tickers)}
 
 Files: vendor_a.csv (date,ticker,close,status; closes in dollars),
 vendor_b.csv (date,ticker,close,unit; the unit column states dollars or
@@ -1447,22 +1654,33 @@ duplicate, missing. Report a code if and only if its rule is met:
 - num_conflicted_keys is the total number of conflicted keys: the sum
   of the three path counts below.
 - num_correction_rows_total is the number of rows in corrections.csv.
-  num_correction_rows_late is the number of those rows whose as_of
-  instant is after report_time (the non-applicable rows of the
-  definition in rule 1).
+   num_correction_rows_late is the number of those rows whose as_of
+   instant is after report_time (the non-applicable rows of the
+   definition in rule 1).
 - probe_ann_vol is the annualised volatility of the probe ticker's
-  resolved closes: the sample standard deviation (ddof=1) of their log
-  returns, taken over that ticker's resolved dates in date order,
-  times   sqrt(252). probe_ticker_max_drawdown is the max drawdown of
+   resolved closes: the sample standard deviation (ddof=1) of their log
+   returns, taken over that ticker's resolved dates in date order,
+   times sqrt(252). probe_ticker_max_drawdown is the max drawdown of
   the probe ticker's resolved close series itself (same sign
   convention as above), and probe_ticker_drawdown_trough_date is the
   date of its trough.
+- Risk-parity weights: for the three tickers on the
+  risk_parity_tickers line, align their resolved closes on the dates
+  present for all three, take log returns between consecutive
+  aligned dates, and form their sample covariance matrix Sigma
+  (ddof=1). The risk-parity weights are the unique weights w, one
+  per ticker, each strictly positive and summing to 1, that equalise
+  the risk contributions: w_i * (Sigma w)_i is the same number for
+  all three tickers. Report each as risk_parity_weight_<ticker>.
+  (Equal weights and inverse-volatility weights do not in general
+  satisfy this condition; the weights must actually be solved for.)
 
 Report the three path counts over conflicted keys only,
 num_conflicted_keys, the resolved closes for the probe ticker on the
 probe dates and for probe_ticker_2 on probe_dates_2, probe_ann_vol,
 probe_ticker_max_drawdown with its trough date,
-num_correction_rows_total, num_correction_rows_late, and, from the
+num_correction_rows_total, num_correction_rows_late, the
+risk-parity weights, and, from the
 resolved series aligned on dates present for every ticker, the
 equal-weight buy-and-hold total return (mean of last/first close
 minus 1) and the max drawdown of the mean normalised price path with
@@ -1557,8 +1775,17 @@ its trough date, plus the problems array defined above.
         trade_rows = [[ds, t, sh, f"{price_at[t][ds]:.2f}"]
                       for ds, t, sh in trades]
 
+        # Terminal-rebalance trading frictions (memo rule 7): each
+        # asset's target is rounded down to a whole multiple of its own
+        # lot size, and a resulting trade smaller than the minimum
+        # trade size is not made at all.
+        term_lot_sizes = {assets[i]: (5, 10, 25)[i % 3]
+                          for i in range(len(assets))}
+        term_min_trade = 20
+
         def simulate(entitlement="settlement", apply_splits=True, lifo=False,
-                     first_event_only=False):
+                     first_event_only=False, terminal_min_trade=True,
+                     terminal_lots=True):
             lots = {t: [] for t in assets}  # [shares, cost_per_share, settlement]
             cash_lieu, realised = 0.0, 0.0
             lieu_events = 0
@@ -1656,6 +1883,15 @@ its trough date, plus the problems array defined above.
             n_assets = len(assets)
             target_shares = {t: int(math.floor(
                 (total_value / n_assets) / prices[t][-1])) for t in assets}
+            if terminal_lots:
+                target_shares = {
+                    t: int(target_shares[t] // term_lot_sizes[t])
+                    * term_lot_sizes[t] for t in assets}
+            if terminal_min_trade:
+                target_shares = {
+                    t: end_shares[t]
+                    if 0 < abs(target_shares[t] - end_shares[t]) < term_min_trade
+                    else target_shares[t] for t in assets}
             leftover = total_value - sum(
                 target_shares[t] * prices[t][-1] for t in assets)
             return {
@@ -1696,6 +1932,8 @@ its trough date, plus the problems array defined above.
             "settlement_ignored_booked_only": simulate(entitlement="booked"),
             "lifo_instead_of_fifo": simulate(lifo=True),
             "second_split_ignored": simulate(first_event_only=True),
+            "terminal_min_trade_ignored": simulate(terminal_min_trade=False),
+            "terminal_lots_ignored": simulate(terminal_lots=False),
         }
         problems = []
         for _t, ds, a, b in events:
@@ -1758,20 +1996,27 @@ executions at that price). Positions are in shares as booked.
    first positive-value date onward. twr_ann_vol is the sample
    standard deviation (ddof=1) of the index's daily simple returns
    times sqrt(252). worst_rolling_20d_return is the smallest, over
-   every window of 20 consecutive index points, of
-   index[end]/index[end-20] - 1; worst_rolling_20d_end_date is the
-   date of that window's last index point. max_drawdown_trough_date
-   is the date of the index point where max_drawdown is reached.
+   every window of 20 consecutive daily returns (that is, 21
+   consecutive index points), of index[end]/index[end-20] - 1, where
+   end is the last index point of the window;
+   worst_rolling_20d_end_date is the date of that last index point.
+   max_drawdown_trough_date is the date of the index point where
+   max_drawdown is reached.
 7. Terminal rebalance (a reporting calculation on the end state only;
    it changes no earlier field): let V be the end market value of the
    remaining shares (at the last close) plus the cash-in-lieu held.
-   With n assets, the target dollar value per asset is V/n.
-   rebalance_target_shares is the per-asset share count
-   floor(target value / last close), as a JSON object keyed by
-   ticker. rebalance_trade_shares is, per asset, the target shares
-   minus the end shares (signed; a JSON object keyed by ticker).
-   rebalance_leftover_cash is V minus the sum over assets of
-   target shares * last close.
+   n is the number of distinct tickers in prices.csv (n = 5 in this
+   task), so the target dollar value per asset is V/n. Each asset
+   also has a lot size, in shares: LOT_SIZES_LINE. The minimum
+   trade size is 20 shares. rebalance_target_shares is, per asset,
+   floor(V/n / last close) rounded DOWN to a whole multiple of that
+   asset's lot size - except that if the resulting trade (target
+   shares minus end shares) is nonzero but smaller than the minimum
+   trade size in absolute value, the trade is not made and that
+   asset's target is its end share count. rebalance_trade_shares is,
+   per asset, the target shares minus the end shares (signed; a JSON
+   object keyed by ticker). rebalance_leftover_cash is V minus the
+   sum over assets of target shares * last close.
 8. num_cash_in_lieu_events is the number of (split event, lot) pairs
    that produced a fractional cash-out. num_lots_end is the number of
    lots still held on the last date.
@@ -1795,6 +2040,9 @@ num_cash_in_lieu_events, num_lots_end, rebalance_target_shares,
 rebalance_trade_shares, rebalance_leftover_cash, num_trades,
 num_splits and the problems array defined above.
 """
+        spec = spec.replace(
+            "LOT_SIZES_LINE",
+            ", ".join(f"{t}={term_lot_sizes[t]}" for t in assets))
         files = {
             "prices.csv": _csv(["date", "ticker", "open", "high", "low", "close", "volume"], rows_out),
             "splits.csv": _csv(["date", "ticker", "ratio"], split_rows),
@@ -1824,7 +2072,7 @@ num_splits and the problems array defined above.
         # is not traded at all.
         lot_sizes = {assets[i]: (10, 5, 25)[i % 3] for i in range(n)}
         min_trade = 15
-        cap_asset = 0.30
+        cap_asset = 0.30  # placeholder; recalibrated below so it binds
         # Sector caps are set per task below (after a first look at the
         # unconstrained optimum) so that the dominant sector's cap
         # actually binds at the first rebalance.
@@ -1844,6 +2092,7 @@ num_splits and the problems array defined above.
 
             ``equalities`` is a list of (member indices, target) rows that
             include the fixed assets' contributions on the right side.
+            The KKT system is solved exactly (no iterative tolerance).
             """
             free = [i for i in range(n) if i not in fixed]
             w = np.zeros(n)
@@ -1863,78 +2112,121 @@ num_splits and the problems array defined above.
             kkt[:len(free), :len(free)] = 2 * cov[np.ix_(free, free)]
             kkt[:len(free), len(free):] = a_mat.T
             kkt[len(free):, :len(free)] = a_mat
-            sol = np.linalg.solve(
-                kkt, np.concatenate([np.zeros(len(free)), b_vec]))
+            # The gradient at the free assets includes the fixed
+            # assets' contribution: stationarity over the free block
+            # is 2*Sigma_ff w_f + 2*Sigma_f,fixed w_fixed + A' lam = 0.
+            # (Omitting the middle term - as a naive KKT assembly does -
+            # solves the wrong QP whenever anything is fixed, which is
+            # what left the old solver ~2e-5 from the optimum.)
+            fixed_idx = [i for i in range(n) if i in fixed]
+            grad_fixed = (2 * cov[np.ix_(free, fixed_idx)]
+                          @ np.array([fixed[i] for i in fixed_idx])) \
+                if fixed_idx else np.zeros(len(free))
+            rhs = np.concatenate([-grad_fixed, b_vec])
+            try:
+                sol = np.linalg.solve(kkt, rhs)
+            except np.linalg.LinAlgError:  # degenerate working set
+                sol = np.linalg.lstsq(kkt, rhs, rcond=None)[0]
             for i, v in zip(free, sol[:len(free)], strict=True):
                 w[i] = v
             return w, sol[len(free):]
 
-        def _min_var_weights(cov, capped, enforce_sector=True):
-            """Exact min-variance weights: sum=1, 0<=w<=cap, sector caps.
+        sector_of = [sectors[t] for t in assets]
 
-            Active-set solve over asset bounds and, when a sector cap is
-            violated, that sector's sum as an added equality; fixed
-            assets and active sector equalities are released when their
-            KKT multipliers have the wrong sign.  The shrunk covariance
-            is strictly positive definite, so the optimum is unique.
+        def _min_var_weights(cov, capped, enforce_sector=True):
+            """Certified-exact min-variance weights.
+
+            Primal active-set method for min w' Sigma w subject to
+            sum(w)=1, 0<=w<=cap and (when enforced) the sector caps.
+            Starting from a feasible point, each iteration solves the
+            equality-constrained QP on the current working set exactly,
+            steps as far toward it as feasibility allows (adding the
+            blocking constraint), and, once the working-set optimum is
+            reached, drops the constraint whose KKT multiplier has the
+            worst wrong sign.  The loop ends only at a point satisfying
+            the full KKT conditions, which (the shrunk covariance being
+            strictly positive definite) is the unique optimum, exact to
+            linear-algebra precision - there is no gradient-tolerance
+            early stop that could leave the weights ~1e-5 away.
             """
             cap = cap_asset if capped else 1.0
-            active_sectors: list[str] = []
-            w = np.full(n, 1.0 / n)
-            for _outer in range(20):
-                fixed: dict[int, float] = {}
-                lambdas = np.zeros(1 + len(active_sectors))
-                for _inner in range(100):
-                    equalities = [(list(range(n)), 1.0)] + [
-                        (sector_members[s], sector_caps[s]) for s in active_sectors]
-                    w, lambdas = _solve_eq_qp(cov, fixed, equalities)
-                    free = [i for i in range(n) if i not in fixed]
-                    below = [(w[i], i) for i in free if w[i] < -1e-10]
-                    above = [(w[i], i) for i in free if w[i] > cap + 1e-10]
-                    if below:
-                        fixed[min(below)[1]] = 0.0
-                        continue
-                    if above:
-                        fixed[max(above)[1]] = cap
-                        continue
-                    # KKT release check for fixed assets: stationarity
-                    # is grad + A^T lambda (+ bound multiplier) = 0.
+            caps_s = sector_caps if enforce_sector else {}
+            # Feasible start: greedy fill in asset order under all caps.
+            w = np.zeros(n)
+            remaining = 1.0
+            sector_left = dict(caps_s)
+            for i in range(n):
+                room = sector_left.get(sector_of[i], 1.0)
+                take = max(0.0, min(cap, remaining, room))
+                w[i] = take
+                remaining -= take
+                if sector_of[i] in sector_left:
+                    sector_left[sector_of[i]] -= take
+            fixed = {i: float(w[i]) for i in range(n)
+                     if w[i] <= 1e-13 or w[i] >= cap - 1e-13}
+            active = sorted(
+                s for s in caps_s
+                if sum(w[i] for i in sector_members[s]) >= caps_s[s] - 1e-12)
+            for _step in range(1000):
+                equalities = [(list(range(n)), 1.0)] + [
+                    (sector_members[s], caps_s[s]) for s in active]
+                w_star, lambdas = _solve_eq_qp(cov, fixed, equalities)
+                step = w_star - w
+                if float(np.max(np.abs(step))) <= 1e-13:
+                    # Working-set optimum: check every KKT multiplier.
                     grad = 2 * cov @ w
                     at_lam = np.zeros(n)
-                    all_eq = [(list(range(n)), 1.0)] + [
-                        (sector_members[s], sector_caps[s]) for s in active_sectors]
-                    for k, (members, _t) in enumerate(all_eq):
+                    for k, (members, _t) in enumerate(equalities):
                         for i in members:
                             at_lam[i] += lambdas[k]
-                    release, worst = None, 1e-9
+                    drop, worst = None, 1e-11
                     for i, v in fixed.items():
                         resid = grad[i] + at_lam[i]
                         violation = -resid if v == 0.0 else resid
                         if violation > worst:
-                            release, worst = i, violation
-                    if release is None:
-                        break
-                    del fixed[release]
-                if not (capped and enforce_sector):
-                    return w
-                sector_sum = {s: float(sum(w[i] for i in mem))
-                              for s, mem in sector_members.items()}
-                violated = [s for s in sector_sum
-                            if sector_sum[s] > sector_caps[s] + 1e-9
-                            and s not in active_sectors]
-                if violated:
-                    active_sectors.append(
-                        max(violated, key=lambda s: sector_sum[s] - sector_caps[s]))
+                            drop, worst = ("asset", i), violation
+                    for k, s in enumerate(active):
+                        if -lambdas[1 + k] > worst:
+                            drop, worst = ("sector", s), -lambdas[1 + k]
+                    if drop is None:
+                        return w
+                    if drop[0] == "asset":
+                        del fixed[drop[1]]
+                    else:
+                        active.remove(drop[1])
                     continue
-                # An active sector whose multiplier is negative is not
-                # really binding; release the worst such sector.
-                release_sector, worst = None, -1e-9
-                for k, s in enumerate(active_sectors):
-                    if lambdas[1 + k] < worst:
-                        release_sector, worst = s, lambdas[1 + k]
-                if release_sector is None:
-                    return w
-                active_sectors.remove(release_sector)
+                # Longest feasible step toward the working-set optimum.
+                alpha, blocker = 1.0, None
+                for i in range(n):
+                    if i in fixed:
+                        continue
+                    if step[i] > 1e-14:
+                        cand = (cap - w[i]) / step[i]
+                        if cand < alpha:
+                            alpha, blocker = cand, ("asset", i, cap)
+                    elif step[i] < -1e-14:
+                        cand = w[i] / -step[i]
+                        if cand < alpha:
+                            alpha, blocker = cand, ("asset", i, 0.0)
+                for s in caps_s:
+                    if s in active:
+                        continue
+                    members = sector_members[s]
+                    slope = float(sum(step[i] for i in members))
+                    if slope > 1e-14:
+                        slack = caps_s[s] - float(sum(w[i] for i in members))
+                        cand = slack / slope
+                        if cand < alpha:
+                            alpha, blocker = cand, ("sector", s, caps_s[s])
+                w = w + alpha * step
+                w[np.abs(w) < 1e-15] = 0.0
+                if blocker is not None and alpha < 1.0:
+                    if blocker[0] == "asset":
+                        fixed[blocker[1]] = float(blocker[2])
+                        w[blocker[1]] = blocker[2]
+                    else:
+                        active.append(blocker[1])
+                        active.sort()
             return w  # pragma: no cover - active set converges in practice
 
         _weight_cache: dict = {}
@@ -1952,6 +2244,20 @@ num_splits and the problems array defined above.
             _weight_cache[key] = w
             return w
 
+        # Set the per-asset cap just below the largest unconstrained
+        # first-rebalance weight, so the asset cap actually binds there
+        # (with near-independent assets an off-the-shelf cap like 0.30
+        # would never bind, and the no_asset_cap trap variant could not
+        # discriminate).  The memo and constraints file state the cap.
+        _w_unc = estimate_weights(first_idx, capped=False, enforce_sector=False)
+        _w_max = float(max(_w_unc))
+        # The floor keeps the capped problem feasible whatever the
+        # sector caps turn out to be: even with the dominant sector's
+        # cap at its 0.25 floor, sector capacities then sum above 1.
+        cap_asset = round(min(max(_w_max - 0.03, 0.13), 0.30), 4)
+        if cap_asset >= _w_max:
+            cap_asset = round(max(_w_max - 0.01, 4), 4)
+        _weight_cache.clear()
         # Set the dominant sector's cap just below its unconstrained
         # first-rebalance share, so the sector cap binds there (the memo
         # and constraints file state the resulting cap).
@@ -1965,6 +2271,17 @@ num_splits and the problems array defined above.
         if sector_caps[_dominant] >= _sector_sums[_dominant]:
             sector_caps[_dominant] = round(_sector_sums[_dominant] - 0.03, 4)
         _weight_cache.clear()
+        # Feasibility guard: the caps must admit at least one portfolio
+        # (sector capacities - members times the asset cap, capped by
+        # the sector cap - must sum above 1).  Raise the asset cap
+        # until they do; the exact solver assumes a feasible start.
+        def _capacity():
+            return sum(min(len(sector_members[s]) * cap_asset,
+                           sector_caps[s]) for s in sector_caps)
+
+        while _capacity() < 1.02 and cap_asset < 0.30:
+            cap_asset = round(cap_asset + 0.01, 4)
+            _weight_cache.clear()
 
         def allocate(desired_values, nav, prices_now):
             """Floor to lots, then greedy leftover-cash allocation.
@@ -2071,9 +2388,13 @@ num_splits and the problems array defined above.
                         new_cash -= cost
                     total_cost += cost
                     if weights_first is None:
-                        weights_first = {t: round(float(wi), 6) for t, wi in zip(assets, w, strict=True)}
+                        # Weights are stored at 10 decimals: the solver
+                        # is exact to ~1e-12 and the key must sit within
+                        # 1e-7 of the true optimum, which 6-decimal
+                        # storage rounding (up to 5e-7) would break.
+                        weights_first = {t: round(float(wi), 10) for t, wi in zip(assets, w, strict=True)}
                         shares_first = {t: int(s) for t, s in zip(assets, new_shares, strict=True)}
-                    weights_last = {t: round(float(wi), 6) for t, wi in zip(assets, w, strict=True)}
+                    weights_last = {t: round(float(wi), 10) for t, wi in zip(assets, w, strict=True)}
                     shares_last = {t: int(s) for t, s in zip(assets, new_shares, strict=True)}
                     traded_last = sum(
                         1 for ns, s in zip(new_shares, shares, strict=True) if ns != s)
@@ -2196,10 +2517,11 @@ last rebalance, turnover at each rebalance (the actual turnover of
 steps 4-6), num_rebalances, total_cost_paid (the sum of the step-6
 costs over all rebalances), num_assets_traded_last_rebalance (the
 number of assets whose share count actually changed at the last
-rebalance, after all steps), nav_ann_vol (the sample standard
-deviation, ddof=1, of the daily simple returns of the full NAV path -
-including the initial all-cash days, whose returns are zero - times
-sqrt(252)), final_nav, max_drawdown of the daily NAV path and
+rebalance, after all steps), nav_ann_vol (take the full NAV path of
+N days and its N-1 daily simple returns - the first day has no
+return - and report their sample standard deviation, ddof=1, times
+sqrt(252); the initial all-cash days are part of the path and
+contribute zero returns), final_nav, max_drawdown of the daily NAV path and
 cash_left. The turnover_by_rebalance field is a JSON object whose
 keys are the strings "1", "2", ... in rebalance order (the first
 rebalance is "1") and whose values are the actual turnover fractions

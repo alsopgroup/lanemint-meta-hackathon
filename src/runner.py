@@ -490,9 +490,11 @@ def main():
     parser.add_argument(
         '--max-turns',
         type=int,
-        default=12,
+        default=None,
         help='Tool mode: maximum tool-using model turns per task before '
-             'a forced final answer (default: 12)'
+             'a forced final answer (default: 12, or 16 for the '
+             'tools_frontier tier, whose tasks chain several '
+             'computation stages and need the extra turns)'
     )
     parser.add_argument(
         '--sandbox-timeout',
@@ -549,6 +551,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.max_turns is None:
+        # The tools_frontier tier's multi-stage pipelines get a larger
+        # default turn budget; every other tier keeps the default of 12.
+        args.max_turns = 16 if args.tier == 'tools_frontier' else 12
 
     if args.tasks_dir is None:
         args.tasks_dir = {'hard': Path('tasks_hard'),

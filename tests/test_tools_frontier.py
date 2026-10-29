@@ -778,12 +778,31 @@ class TestComputationHardening:
                 end_mv = sum(expected[f"shares_{t}"] * last_close[t]
                              for t in tickers)
                 total = end_mv + expected["cash_in_lieu"]
+                # Terminal rebalance identity (memo rule 7): floor to
+                # the asset's lot size, and a sub-minimum trade is not
+                # made (target stays at the end share count).
+                import re as re_mod
+
+                lot_sizes = {t: int(v) for t, v in re_mod.findall(
+                    r"(\w+)=(\d+)", re_mod.search(
+                        r"lot size, in shares: ([^.]+)\.", spec).group(1))}
+                min_trade = int(re_mod.search(
+                    r"minimum\s+trade\s+size\s+is\s+(\d+)\s+shares",
+                    spec).group(1))
+                assert "n is the number of distinct tickers" in spec
+                assert "20 consecutive daily returns (that is, 21" in spec
+                assert "index[end]/index[end-20] - 1" in spec
                 for t in tickers:
                     want = int((total / len(tickers)) // last_close[t])
+                    want = int(want // lot_sizes[t]) * lot_sizes[t]
+                    if 0 < abs(want - expected[f"shares_{t}"]) < min_trade:
+                        want = expected[f"shares_{t}"]
                     assert expected["rebalance_target_shares"][t] == want, (
                         task["id"], t)
                     assert expected["rebalance_trade_shares"][t] == (
                         want - expected[f"shares_{t}"])
+                    assert want % lot_sizes[t] == 0 or \
+                        want == expected[f"shares_{t}"]
                 leftover = total - sum(
                     expected["rebalance_target_shares"][t] * last_close[t]
                     for t in tickers)
@@ -834,3 +853,464 @@ class TestComputationHardening:
                 assert expected["total_cost_paid"] > 0
                 assert 0 <= expected[
                     "num_assets_traded_last_rebalance"] <= 10
+
+
+# ---------------------------------------------------------------- check 8
+
+def _ipm_min_variance(cov, cap, sector_members, sector_caps):
+    """Independent QP solver used only by the tests.
+
+    Primal-dual interior-point method (Mehrotra predictor-corrector)
+    for min w' Sigma w subject to sum(w)=1, 0<=w<=cap and the sector
+    caps, written from scratch on NumPy: a different algorithm from
+    the active-set solvers in the generator and the reference, so
+    agreement is a genuine cross-check of optimality.
+    """
+    import numpy as np
+
+    n = cov.shape[0]
+    p_mat = 2 * cov
+    rows, rhs = [], []
+    for i in range(n):
+        r = np.zeros(n)
+        r[i] = 1.0
+        rows.append(r)
+        rhs.append(cap)
+        r = np.zeros(n)
+        r[i] = -1.0
+        rows.append(r)
+        rhs.append(0.0)
+    for s_name, mem in sector_members.items():
+        r = np.zeros(n)
+        r[mem] = 1.0
+        rows.append(r)
+        rhs.append(sector_caps[s_name])
+    g_mat, h_vec = np.array(rows), np.array(rhs)
+    a_mat, b_vec = np.ones((1, n)), np.array([1.0])
+    m = g_mat.shape[0]
+    w = np.full(n, 1.0 / n)
+    w = np.minimum(w, cap * 0.99)
+    w = w / w.sum()
+    s = np.maximum(h_vec - g_mat @ w, 1e-4)
+    z = np.full(m, 1.0)
+    y = np.zeros(1)
+
+    def direction(rhs_c, theta, rd, rp, rc):
+        kkt = np.zeros((n + 1, n + 1))
+        kkt[:n, :n] = p_mat + g_mat.T @ np.diag(theta) @ g_mat
+        kkt[:n, n:] = a_mat.T
+        kkt[n:, :n] = a_mat
+        rhs_v = np.concatenate([-rd - g_mat.T @ ((rhs_c + z * rc) / s), -rp])
+        sol = np.linalg.solve(kkt, rhs_v)
+        dw, dy = sol[:n], sol[n:]
+        ds = -rc - g_mat @ dw
+        dz = (rhs_c - z * ds) / s
+        return dw, dy, ds, dz
+
+    def step_len(v, dv):
+        a = 1.0
+        for x, dx in zip(v, dv, strict=True):
+            if dx < 0:
+                a = min(a, -x / dx)
+        return a
+
+    for _ in range(200):
+        rd = p_mat @ w + a_mat.T @ y + g_mat.T @ z
+        rp = a_mat @ w - b_vec
+        rc = g_mat @ w + s - h_vec
+        mu = float(s @ z) / m
+        if max(np.max(np.abs(rd)), np.max(np.abs(rp)),
+               np.max(np.abs(rc)), mu) < 5e-14:
+            break
+        theta = z / s
+        dw, dy, ds, dz = direction(-(s * z), theta, rd, rp, rc)
+        ap, ad = step_len(s, ds), step_len(z, dz)
+        mu_aff = float((s + ap * ds) @ (z + ad * dz)) / m
+        sigma = (mu_aff / mu) ** 3
+        dw, dy, ds, dz = direction(
+            -(s * z) - ds * dz + sigma * mu, theta, rd, rp, rc)
+        ap, ad = step_len(s, ds) * 0.99, step_len(z, dz) * 0.99
+        w += ap * dw
+        y += ad * dy
+        s += ap * ds
+        z += ad * dz
+    # Exact polish (interior-point crossover): take the active set the
+    # IPM identified and solve that equality-constrained QP exactly
+    # with one KKT linear solve.  Accept the polished point only if it
+    # is feasible with correct-sign multipliers; otherwise keep the
+    # IPM iterate.  This removes the IPM's slow tail on degenerate
+    # problems while staying a different method from the production
+    # active-set path.
+    def polish(threshold):
+        fixed = {}
+        for i in range(n):
+            if w[i] < threshold:
+                fixed[i] = 0.0
+            elif cap - w[i] < threshold:
+                fixed[i] = cap
+        active_sec = [s_name for s_name, mem in sector_members.items()
+                      if sector_caps[s_name] - sum(w[i] for i in mem)
+                      < threshold]
+        free = [i for i in range(n) if i not in fixed]
+        if not free:
+            return None
+        eqs = [(list(range(n)), 1.0)] + [
+            (sector_members[s_name], sector_caps[s_name])
+            for s_name in active_sec]
+        mm = len(eqs)
+        a_eq = np.zeros((mm, len(free)))
+        b_eq = np.zeros(mm)
+        for k, (mem, target) in enumerate(eqs):
+            b_eq[k] = target - sum(fixed[i] for i in mem if i in fixed)
+            for j, i in enumerate(free):
+                if i in mem:
+                    a_eq[k, j] = 1.0
+        kkt = np.zeros((len(free) + mm, len(free) + mm))
+        kkt[:len(free), :len(free)] = p_mat[np.ix_(free, free)]
+        kkt[:len(free), len(free):] = a_eq.T
+        kkt[len(free):, :len(free)] = a_eq
+        fixed_idx = [i for i in range(n) if i in fixed]
+        grad_fixed = (p_mat[np.ix_(free, fixed_idx)]
+                      @ np.array([fixed[i] for i in fixed_idx])) \
+            if fixed_idx else np.zeros(len(free))
+        rhs = np.concatenate([-grad_fixed, b_eq])
+        try:
+            sol = np.linalg.solve(kkt, rhs)
+        except np.linalg.LinAlgError:
+            sol = None
+        if sol is not None:
+            cand = np.zeros(n)
+            for i, v in fixed.items():
+                cand[i] = v
+            for i, v in zip(free, sol[:len(free)], strict=True):
+                cand[i] = v
+            lam = sol[len(free):]
+            grad = p_mat @ cand
+            at_lam = np.zeros(n)
+            for k, (mem, _t) in enumerate(eqs):
+                for i in mem:
+                    at_lam[i] += lam[k]
+            ok = abs(float(cand.sum()) - 1.0) < 1e-9 \
+                and float(cand.min()) >= -1e-9 \
+                and float(cand.max()) <= cap + 1e-9 \
+                and all(sum(cand[i] for i in mem)
+                        <= sector_caps[s_name] + 1e-9
+                        for s_name, mem in sector_members.items()) \
+                and all(lam[1 + k] >= -1e-9
+                        for k in range(len(active_sec))) \
+                and all((grad[i] + at_lam[i] >= -1e-9) if v == 0.0
+                        else (grad[i] + at_lam[i] <= 1e-9)
+                        for i, v in fixed.items())
+            if ok:
+                return cand
+        return None
+    best = None
+    for threshold in (1e-4, 1e-5, 1e-6, 1e-7):
+        cand = polish(threshold)
+        if cand is not None and (best is None
+                                 or float(cand @ p_mat @ cand)
+                                 < float(best @ p_mat @ best)):
+            best = cand
+    return best if best is not None else w
+
+
+class TestOptimisationHardening:
+    """Round-5 hardening (seed 7601 pilot: Spark 1.3 24/30 with T5 at
+    0/6 and T1-T4 saturated): every family gains a field that needs a
+    small constrained optimisation or a stateful multi-period
+    simulation, the T5 optimiser is certified exact, and the tier's
+    default turn budget rises to 16."""
+
+    def test_t5_key_weights_match_independent_solver(self, dev_sets):
+        import csv as csv_mod
+
+        import numpy as np
+
+        checked = 0
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_portfolio_construction":
+                    continue
+                task_dir = root / task["data_dir"]
+                cfg = json.loads((task_dir / "constraints.json").read_text())
+                closes = {}
+                for r in csv_mod.DictReader(open(task_dir / "prices.csv")):
+                    closes.setdefault(r["ticker"], []).append(float(r["close"]))
+                assets = sorted(closes)
+                members = {}
+                for t in assets:
+                    members.setdefault(cfg["sectors"][t], []).append(
+                        assets.index(t))
+                rets_all = {
+                    t: [b / a - 1 for a, b in zip(closes[t], closes[t][1:], strict=False)]
+                    for t in assets}
+                look = cfg["lookback_returns"]
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                for field, idx1 in (
+                        ("weights_first_rebalance",
+                         cfg["rebalance_row_indices_1based"][0]),
+                        ("weights_last_rebalance",
+                         cfg["rebalance_row_indices_1based"][-1])):
+                    end = idx1 - 1  # 1-based row -> 0-based index
+                    rets = np.array(
+                        [rets_all[t][end - look:end] for t in assets]).T
+                    cov = np.cov(rets, rowvar=False, ddof=1)
+                    delta = cfg["shrinkage_delta"]
+                    cov = (1 - delta) * cov + delta * np.diag(np.diag(cov))
+                    w_key = np.array([key[field][t] for t in assets])
+                    # Primal feasibility of the stored key.
+                    assert abs(float(w_key.sum()) - 1.0) < 1e-9
+                    assert float(w_key.min()) >= -1e-12
+                    assert float(w_key.max()) <= cfg["per_asset_cap"] + 1e-9
+                    for s_name, mem in members.items():
+                        assert sum(w_key[i] for i in mem) \
+                            <= cfg["sector_caps"][s_name] + 1e-9
+                    # The independent interior-point optimum agrees to
+                    # 1e-7 (the old solver sat ~2.1e-5 away).
+                    w_ipm = _ipm_min_variance(
+                        cov, cfg["per_asset_cap"], members,
+                        cfg["sector_caps"])
+                    diff = float(np.max(np.abs(w_key - w_ipm)))
+                    assert diff <= 1e-7, (task["id"], field, diff)
+                    # KKT certificate: multipliers on the active set
+                    # reproduce the gradient with the right signs.
+                    grad = 2 * cov @ w_key
+                    cols = [np.ones(len(assets))]
+                    for s_name, mem in members.items():
+                        if cfg["sector_caps"][s_name] - sum(
+                                w_key[i] for i in mem) < 1e-7:
+                            c = np.zeros(len(assets))
+                            c[mem] = 1.0
+                            cols.append(c)
+                    for i in range(len(assets)):
+                        if w_key[i] < 1e-7:
+                            c = np.zeros(len(assets))
+                            c[i] = -1.0
+                            cols.append(c)
+                        elif cfg["per_asset_cap"] - w_key[i] < 1e-7:
+                            c = np.zeros(len(assets))
+                            c[i] = 1.0
+                            cols.append(c)
+                    mat = np.array(cols).T
+                    mult, *_ = np.linalg.lstsq(mat, -grad, rcond=None)
+                    resid = float(np.max(np.abs(mat @ mult + grad)))
+                    assert resid <= 1e-8, (task["id"], field, resid)
+                    assert float(mult[1:].min(initial=0.0)) >= -1e-7
+                    checked += 1
+        assert checked == 120
+
+    def test_t1_bounded_hedge_ratio(self, dev_sets):
+        import csv as csv_mod
+        import math as math_mod
+        import re as re_mod
+
+        binds = 0
+        total = 0
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_convention_risk":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                mh = re_mod.search(
+                    r"- hedge: asset=(\w+); benchmark=(\w+); "
+                    r"window_returns=(\d+); return=(\w+); "
+                    r"lower_bound=([\d.]+); upper_bound=([\d.]+)", spec)
+                asset, bench = mh.group(1), mh.group(2)
+                window = int(mh.group(3))
+                lo, hi = float(mh.group(5)), float(mh.group(6))
+                trading = {r["date"] for r in csv_mod.DictReader(
+                    open(task_dir / "calendar.csv"))}
+                series = {}
+                for r in csv_mod.DictReader(open(task_dir / "prices.csv")):
+                    if r["date"] in trading:
+                        series.setdefault(r["ticker"], {})[r["date"]] = \
+                            float(r["close"])
+                def log_rets(t, _series=series):
+                    ds = sorted(_series[t])
+                    cs = [_series[t][d] for d in ds]
+                    return [math_mod.log(b / a)
+                            for a, b in zip(cs, cs[1:], strict=False)]
+                ra = log_rets(asset)[-window:]
+                rb = log_rets(bench)[-window:]
+                ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+                cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb, strict=True)) \
+                    / (len(ra) - 1)
+                var = sum((y - mb) ** 2 for y in rb) / (len(rb) - 1)
+                unc = cov / var
+                want = min(max(unc, lo), hi)
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert abs(key["hedge_ratio"] - want) < 1e-6, task["id"]
+                hedged = [a - want * b for a, b in zip(ra, rb, strict=True)]
+                mh_ = sum(hedged) / len(hedged)
+                sd = math_mod.sqrt(
+                    sum((x - mh_) ** 2 for x in hedged) / (len(hedged) - 1))
+                assert abs(key["hedged_ann_vol"]
+                           - sd * math_mod.sqrt(252)) < 1e-6
+                assert "hedge_ratio_unbounded" in task["trap_variants"]
+                total += 1
+                binds += want == hi and unc > hi
+        assert total == 60
+        # The construction picks the highest-beta asset, so the upper
+        # bound genuinely binds on most tasks (else the gate variant
+        # could not discriminate and the task would be reseeded).
+        assert binds >= 40, binds
+
+    def test_t2_monthly_hedge_resets(self, dev_sets):
+        import csv as csv_mod
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_fx_calendar":
+                    continue
+                task_dir = root / task["data_dir"]
+                union = sorted(
+                    {r["date"] for r in csv_mod.DictReader(
+                        open(task_dir / "us_prices.csv"))}
+                    | {r["date"] for r in csv_mod.DictReader(
+                        open(task_dir / "eu_prices.csv"))})
+                months = {d[:7] for d in union}
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert key["num_hedge_resets"] == len(months), task["id"]
+                assert {"hedge_pnl_total", "hedged_nav_ann_vol",
+                        "hedged_nav_max_drawdown"} <= set(key)
+                assert key["hedge_pnl_total"] != 0.0
+                assert key["hedged_nav_max_drawdown"] <= 0.0
+                assert "hedge_never_reset" in task["trap_variants"]
+                spec = (task_dir / "spec.md").read_text()
+                assert "Monthly FX hedge" in spec
+
+    def test_t3_risk_parity_weights(self, dev_sets):
+        import csv as csv_mod
+        import math as math_mod
+        import re as re_mod
+        from datetime import UTC
+        from datetime import datetime as dt
+
+        def instant(stamp):
+            return dt.fromisoformat(
+                stamp.replace("Z", "+00:00")).astimezone(UTC)
+
+        not_equal_weight = 0
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_reconciliation":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                rp_tickers = re_mod.search(
+                    r"risk_parity_tickers: (.+)", spec).group(1).split(", ")
+                assert len(rp_tickers) == 3
+                report = instant(re_mod.search(
+                    r"report_time: (\S+)", spec).group(1))
+                # Compact independent resolution (memo rules 0-5).
+                def first_wins(name, value_fn, _dir=task_dir):
+                    out, status = {}, {}
+                    for r in csv_mod.DictReader(open(_dir / name)):
+                        k = (r["ticker"], r["date"])
+                        if k not in out:
+                            out[k] = value_fn(r)
+                            status[k] = r.get("status")
+                    return out, status
+                a_val, a_status = first_wins(
+                    "vendor_a.csv", lambda r: float(r["close"]))
+                b_val, _ = first_wins(
+                    "vendor_b.csv",
+                    lambda r: float(r["close"]) / 100
+                    if r["unit"] == "cents" else float(r["close"]))
+                corr = {}
+                for r in csv_mod.DictReader(open(task_dir / "corrections.csv")):
+                    when = instant(r["as_of"])
+                    k = (r["ticker"], r["date"])
+                    if when <= report and (
+                            k not in corr or when > corr[k][1]):
+                        corr[k] = (float(r["close"]), when)
+                resolved = {}
+                for k in sorted(set(a_val) | set(b_val)):
+                    av, bv = a_val.get(k), b_val.get(k)
+                    if k in corr:
+                        resolved[k] = corr[k][0]
+                    elif av is not None and a_status.get(k) != "indicative":
+                        resolved[k] = av
+                    else:
+                        avail = sorted(v for v in (av, bv)
+                                       if v is not None)
+                        resolved[k] = avail[len(avail) // 2] \
+                            if len(avail) % 2 else (avail[0] + avail[-1]) / 2
+                by = {t: {d: v for (tt, d), v in resolved.items() if tt == t}
+                      for t in rp_tickers}
+                days = sorted(set.intersection(
+                    *[set(by[t]) for t in rp_tickers]))
+                rets = {t: [math_mod.log(by[t][b] / by[t][a])
+                            for a, b in zip(days, days[1:], strict=False)]
+                        for t in rp_tickers}
+                m = len(days) - 1
+                means = {t: sum(rets[t]) / m for t in rp_tickers}
+                cov = {(a, b): sum(
+                    (rets[a][k] - means[a]) * (rets[b][k] - means[b])
+                    for k in range(m)) / (m - 1)
+                    for a in rp_tickers for b in rp_tickers}
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                w = {t: key[f"risk_parity_weight_{t}"] for t in rp_tickers}
+                assert abs(sum(w.values()) - 1.0) < 1e-5
+                assert all(0.0 < x < 1.0 for x in w.values())
+                # Equal risk contributions on the independent series.
+                rc = {a: w[a] * sum(cov[(a, b)] * w[b] for b in rp_tickers)
+                      for a in rp_tickers}
+                assert max(rc.values()) - min(rc.values()) < 1e-6, (
+                    task["id"], rc)
+                not_equal_weight += any(
+                    abs(x - 1.0 / 3.0) > 1e-3 for x in w.values())
+                assert "risk_parity_equal_weights" in task["trap_variants"]
+                assert "risk_parity_inverse_vol" in task["trap_variants"]
+        # Risk parity is a real optimisation here, not 1/3 weights.
+        assert not_equal_weight >= 50, not_equal_weight
+
+    def test_t4_terminal_rebalance_variants(self, dev_sets):
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_split_holdings":
+                    continue
+                assert "terminal_min_trade_ignored" in task["trap_variants"]
+                assert "terminal_lots_ignored" in task["trap_variants"]
+                # The gate only passes when the minimum-trade rule
+                # actually bites: some asset's lot-floored target must
+                # have been reverted to its end share count.
+                key = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                variant = task["trap_variants"][
+                    "terminal_min_trade_ignored"]
+                assert variant["rebalance_trade_shares"] != \
+                    key["rebalance_trade_shares"], task["id"]
+
+    def test_tools_frontier_default_max_turns_16(self, monkeypatch, tmp_path):
+        import sys
+
+        from src import runner as runner_mod
+        from src import tool_runner as tool_mod
+
+        class FakeToolRunner:
+            seen = {}
+
+            def __init__(self, **kwargs):
+                FakeToolRunner.seen.update(kwargs)
+
+            def run_all_tasks(self, **kwargs):
+                return []
+
+        for tier, want in (("tools_frontier", 16), ("frontier", 12)):
+            FakeToolRunner.seen = {}
+            seen = FakeToolRunner.seen
+            monkeypatch.setattr(tool_mod, "ToolTaskRunner", FakeToolRunner)
+            tasks = tmp_path / f"tasks_{tier}"
+            tasks.mkdir(exist_ok=True)
+            monkeypatch.setattr(sys, "argv", [
+                "runner", "--dry-run", "--tools", "python",
+                "--tier", tier, "--tasks-dir", str(tasks),
+                "--output-dir", str(tmp_path / f"out_{tier}")])
+            assert runner_mod.main() == 0
+            assert seen["max_turns"] == want, (tier, seen["max_turns"])

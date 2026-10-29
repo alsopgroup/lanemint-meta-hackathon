@@ -256,6 +256,24 @@ def _solve_t1(task_dir: Path) -> dict:
     answer["worst_day_return"] = round(wrets[wi], 6)
     answer["worst_day_date"] = series[mwd.group(1)][0][wi + 1]
 
+    # Bounded minimum-tracking-error hedge (memo section 15): the
+    # unconstrained minimiser is cov/var over the last window_returns
+    # returns; the reported ratio clips it into the stated bounds.
+    mh = re.search(r"- hedge: asset=(\w+); benchmark=(\w+); window_returns=(\d+); "
+                   r"return=(\w+); lower_bound=([\d.]+); upper_bound=([\d.]+); "
+                   r"periods_per_year=(\d+); ddof=(\d+)", spec)
+    ha = _returns(series[mh.group(1)][1], mh.group(4))[-int(mh.group(3)):]
+    hb = _returns(series[mh.group(2)][1], mh.group(4))[-int(mh.group(3)):]
+    mha, mhb = _mean(ha), _mean(hb)
+    cov_h = sum((x - mha) * (y - mhb)
+                for x, y in zip(ha, hb, strict=True)) / (len(ha) - 1)
+    var_h = sum((y - mhb) ** 2 for y in hb) / (len(hb) - 1)
+    h = min(max(cov_h / var_h, float(mh.group(5))), float(mh.group(6)))
+    answer["hedge_ratio"] = round(h, 6)
+    hedged = [a - h * b for a, b in zip(ha, hb, strict=True)]
+    answer["hedged_ann_vol"] = round(
+        _std(hedged, int(mh.group(8))) * math.sqrt(int(mh.group(7))), 6)
+
     any_ticker = tickers[0]
     answer["num_aligned_days"] = len(series[any_ticker][0])
     return answer
@@ -329,6 +347,35 @@ def _solve_t2(task_dir: Path) -> dict:
         holdings[t] * dict(zip(*us[t], strict=True))[probe[-1]] for t in us)
     nav_log_rets = [math.log(navs[b] / navs[a])
                     for a, b in zip(inner_dates, inner_dates[1:], strict=False)]
+    # Monthly FX hedge on the EU sleeve (memo rule 8): on the first
+    # union date of each month, sell forward hedge_ratio times the EU
+    # sleeve's EUR value (most recent closes) at that date's effective
+    # rate; settle at the next reset (or the last union date); hold
+    # the USD cash P&L uninvested.
+    hedge_ratio = float(re.search(
+        r"- fx_hedge: .*hedge_ratio=([\d.]+)", spec).group(1))
+    eu_maps = {t: dict(zip(*eu[t], strict=True)) for t in eu}
+    eu_filled, last_eu = {}, {}
+    for ds in union_dates:
+        for t in eu:
+            if ds in eu_maps[t]:
+                last_eu[t] = eu_maps[t][ds]
+        eu_filled[ds] = sum(holdings[t] * last_eu.get(t, 0.0) for t in eu)
+    resets, seen_months = [], set()
+    for ds in union_dates:
+        if ds[:7] not in seen_months:
+            seen_months.add(ds[:7])
+            resets.append(ds)
+    settlements = []
+    for k, r_ds in enumerate(resets):
+        settle = resets[k + 1] if k + 1 < len(resets) else union_dates[-1]
+        settlements.append((settle, hedge_ratio * eu_filled[r_ds]
+                            * (effective[r_ds] - effective[settle])))
+    hedged_series = [navs[ds] + sum(p for d2, p in settlements if d2 <= ds)
+                     for ds in inner_dates]
+    h_dd, _h_trough = _drawdown(hedged_series)
+    h_log = [math.log(b / a)
+             for a, b in zip(hedged_series, hedged_series[1:], strict=False)]
     union_set = set(union_dates)
     answer = {f"nav_{d.replace('-', '')}": round(navs[d], 6) for d in probe}
     answer.update({
@@ -352,6 +399,10 @@ def _solve_t2(task_dir: Path) -> dict:
         "num_weekend_prints": sum(
             1 for r in fx_rows
             if to_utc(r["timestamp"]).strftime("%Y-%m-%d") not in union_set),
+        "hedge_pnl_total": round(sum(p for _d, p in settlements), 6),
+        "num_hedge_resets": len(resets),
+        "hedged_nav_ann_vol": round(_std(h_log, 1) * math.sqrt(252), 6),
+        "hedged_nav_max_drawdown": round(h_dd, 6),
         "num_inner_days": len(inner_dates),
         "problems": _t2_problems(task_dir, fx_rows, us_dates, eu_dates),
     })
@@ -381,6 +432,8 @@ def _solve_t3(task_dir: Path) -> dict:
     probe_dates = re.search(r"probe_dates: (.+)", spec).group(1).split(", ")
     probe_ticker_2 = re.search(r"probe_ticker_2: (\S+)", spec).group(1)
     probe_dates_2 = re.search(r"probe_dates_2: (.+)", spec).group(1).split(", ")
+    rp_tickers = re.search(
+        r"risk_parity_tickers: (.+)", spec).group(1).split(", ")
 
     def first_wins(rows, value_fn):
         out, status = {}, {}
@@ -441,6 +494,57 @@ def _solve_t3(task_dir: Path) -> dict:
 
     tickers = sorted({t for t, _ in resolved})
     by = {t: {d: v for (tt, d), v in resolved.items() if tt == t} for t in tickers}
+    # Risk-parity weights (memo Derived fields): unique positive
+    # weights summing to 1 with w_i (Sigma w)_i equal across the three
+    # tickers, Sigma the ddof=1 log-return covariance on the dates
+    # present for all three.  Solved via the strictly convex
+    # reformulation min 0.5 w' Sigma w - sum(ln w_i) (Newton +
+    # backtracking), whose minimiser has exactly equal contributions.
+    rp_days = sorted(set.intersection(*[set(by[t]) for t in rp_tickers]))
+    rp_rets = {t: _returns([by[t][d] for d in rp_days], "log")
+               for t in rp_tickers}
+    n_rp = len(rp_days) - 1
+    rp_mean = {t: _mean(rp_rets[t]) for t in rp_tickers}
+    rp_cov = [[sum((rp_rets[a][k] - rp_mean[a]) * (rp_rets[b][k] - rp_mean[b])
+                   for k in range(n_rp)) / (n_rp - 1)
+               for b in rp_tickers] for a in rp_tickers]
+
+    def _solve3(mat, vec):
+        a = [row[:] + [vec[i]] for i, row in enumerate(mat)]
+        for col in range(3):
+            piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
+            a[col], a[piv] = a[piv], a[col]
+            for r in range(3):
+                if r != col:
+                    f = a[r][col] / a[col][col]
+                    for cc in range(col, 4):
+                        a[r][cc] -= f * a[col][cc]
+        return [a[i][3] / a[i][i] for i in range(3)]
+
+    def _rp_obj(w):
+        return 0.5 * sum(w[i] * rp_cov[i][j] * w[j]
+                         for i in range(3) for j in range(3)) \
+            - sum(math.log(x) for x in w)
+
+    rp_w = [1.0 / math.sqrt(rp_cov[i][i]) for i in range(3)]
+    for _it in range(200):
+        sw = [sum(rp_cov[i][j] * rp_w[j] for j in range(3)) for i in range(3)]
+        grad = [sw[i] - 1.0 / rp_w[i] for i in range(3)]
+        if max(abs(g) for g in grad) < 1e-13:
+            break
+        hess = [[rp_cov[i][j] + (1.0 / rp_w[i] ** 2 if i == j else 0.0)
+                 for j in range(3)] for i in range(3)]
+        step = _solve3(hess, [-g for g in grad])
+        t_step, f0 = 1.0, _rp_obj(rp_w)
+        for _ls in range(80):
+            cand = [rp_w[i] + t_step * step[i] for i in range(3)]
+            if all(x > 0 for x in cand) and _rp_obj(cand) <= f0:
+                break
+            t_step *= 0.5
+        rp_w = [rp_w[i] + t_step * step[i] for i in range(3)]
+    _rp_total = sum(rp_w)
+    rp_weights = {t: rp_w[i] / _rp_total
+                  for i, t in enumerate(rp_tickers)}
     common = sorted(set.intersection(*[set(by[t]) for t in tickers]))
     path = [_mean([by[t][d] / by[t][common[0]] for t in tickers]) for d in common]
     dd, trough = _drawdown(path)
@@ -462,6 +566,8 @@ def _solve_t3(task_dir: Path) -> dict:
         "probe_ticker_drawdown_trough_date": p_dates[p_trough],
         "num_correction_rows_total": len(corr_rows),
         "num_correction_rows_late": n_corr_late,
+        **{f"risk_parity_weight_{t}": round(rp_weights[t], 6)
+           for t in rp_tickers},
         "num_resolved_days": len(common),
         "problems": _t3_problems(task_dir, resolved, a_val, b_val),
     }
@@ -592,9 +698,26 @@ def _solve_t4(task_dir: Path) -> dict:
         if worst_roll is None or r < worst_roll:
             worst_roll, worst_roll_end = r, j
     total_value = end_mv + cash_lieu
+    # Terminal rebalance (memo rule 7): n is the number of distinct
+    # tickers in prices.csv; targets are floored to whole multiples of
+    # each asset's lot size, and a trade smaller than the minimum
+    # trade size is not made (target stays at the end share count).
     n_assets = len(assets)
+    spec = _spec(task_dir)
+    lot_sizes = {t: int(v) for t, v in re.findall(
+        r"(\w+)=(\d+)", re.search(
+            r"lot size, in shares: ([^.]+)\.", spec).group(1))}
+    term_min_trade = int(re.search(
+        r"minimum\s+trade\s+size\s+is\s+(\d+)\s+shares", spec).group(1))
     target_shares = {t: int(math.floor(
         (total_value / n_assets) / price_at[t][dates[-1]])) for t in assets}
+    target_shares = {
+        t: int(target_shares[t] // lot_sizes[t]) * lot_sizes[t]
+        for t in assets}
+    target_shares = {
+        t: end_shares[t]
+        if 0 < abs(target_shares[t] - end_shares[t]) < term_min_trade
+        else target_shares[t] for t in assets}
     answer = {
         **{f"shares_{t}": end_shares[t] for t in assets},
         "realised_pnl_fifo": round(realised, 6),
@@ -651,81 +774,125 @@ def _solve_t5(task_dir: Path) -> dict:
         cov = np.cov(rets, rowvar=False, ddof=1)
         cov = (1 - delta) * cov + delta * np.diag(np.diag(cov))
         n, cap = len(assets), cfg["per_asset_cap"]
-        # Active-set solve for min w' Sigma w subject to sum(w)=1,
-        # 0<=w<=per-asset cap and every sector cap in constraints.json:
-        # sector sums enter as added equalities whenever violated, and
-        # fixed assets / active sectors are released on wrong-sign KKT
-        # multipliers.
-        active_sectors: list[str] = []
-        w = np.full(n, 1.0 / n)
-        for _outer in range(20):
-            fixed: dict[int, float] = {}
-            lambdas = np.zeros(1 + len(active_sectors))
-            for _inner in range(100):
-                equalities = [(list(range(n)), 1.0)] + [
-                    (sector_members[s], cfg["sector_caps"][s]) for s in active_sectors]
-                free = [i for i in range(n) if i not in fixed]
-                w = np.zeros(n)
-                for i, v in fixed.items():
-                    w[i] = v
-                if free:
-                    m = len(equalities)
-                    a_mat = np.zeros((m, len(free)))
-                    b_vec = np.zeros(m)
-                    for k, (members, target) in enumerate(equalities):
-                        b_vec[k] = target - sum(fixed[i] for i in members if i in fixed)
-                        for j, i in enumerate(free):
-                            if i in members:
-                                a_mat[k, j] = 1.0
-                    kkt = np.zeros((len(free) + m, len(free) + m))
-                    kkt[:len(free), :len(free)] = 2 * cov[np.ix_(free, free)]
-                    kkt[:len(free), len(free):] = a_mat.T
-                    kkt[len(free):, :len(free)] = a_mat
-                    sol = np.linalg.solve(
-                        kkt, np.concatenate([np.zeros(len(free)), b_vec]))
-                    for i, v in zip(free, sol[:len(free)], strict=True):
-                        w[i] = v
-                    lambdas = sol[len(free):]
-                below = [(w[i], i) for i in range(n)
-                         if i not in fixed and w[i] < -1e-10]
-                above = [(w[i], i) for i in range(n)
-                         if i not in fixed and w[i] > cap + 1e-10]
-                if below:
-                    fixed[min(below)[1]] = 0.0
-                    continue
-                if above:
-                    fixed[max(above)[1]] = cap
-                    continue
+        caps_s = cfg["sector_caps"]
+        sector_of = [cfg["sectors"][t] for t in assets]
+
+        def solve_eq(fixed, equalities):
+            free = [i for i in range(n) if i not in fixed]
+            w = np.zeros(n)
+            for i, v in fixed.items():
+                w[i] = v
+            if not free:
+                return w, np.zeros(len(equalities))
+            m = len(equalities)
+            a_mat = np.zeros((m, len(free)))
+            b_vec = np.zeros(m)
+            for k, (members, target) in enumerate(equalities):
+                b_vec[k] = target - sum(fixed[i] for i in members if i in fixed)
+                for j, i in enumerate(free):
+                    if i in members:
+                        a_mat[k, j] = 1.0
+            kkt = np.zeros((len(free) + m, len(free) + m))
+            kkt[:len(free), :len(free)] = 2 * cov[np.ix_(free, free)]
+            kkt[:len(free), len(free):] = a_mat.T
+            kkt[len(free):, :len(free)] = a_mat
+            # Stationarity over the free block includes the fixed
+            # assets' gradient contribution 2*Sigma_f,fixed w_fixed;
+            # omitting it solves the wrong QP whenever anything is
+            # fixed (the old solver's ~2e-5 optimality gap).
+            fixed_idx = [i for i in range(n) if i in fixed]
+            grad_fixed = (2 * cov[np.ix_(free, fixed_idx)]
+                          @ np.array([fixed[i] for i in fixed_idx])) \
+                if fixed_idx else np.zeros(len(free))
+            rhs = np.concatenate([-grad_fixed, b_vec])
+            try:
+                sol = np.linalg.solve(kkt, rhs)
+            except np.linalg.LinAlgError:
+                sol = np.linalg.lstsq(kkt, rhs, rcond=None)[0]
+            for i, v in zip(free, sol[:len(free)], strict=True):
+                w[i] = v
+            return w, sol[len(free):]
+
+        # Primal active-set method for min w' Sigma w subject to
+        # sum(w)=1, 0<=w<=cap and the sector caps: from a feasible
+        # start, solve the working-set equality QP exactly, step as far
+        # as feasibility allows, and drop the worst wrong-sign KKT
+        # multiplier at the working-set optimum.  Ends only at a full
+        # KKT point - the unique optimum, exact to linear-algebra
+        # precision (no gradient-tolerance early stop).
+        w = np.zeros(n)
+        remaining = 1.0
+        sector_left = dict(caps_s)
+        for i in range(n):
+            take = max(0.0, min(cap, remaining,
+                                sector_left.get(sector_of[i], 1.0)))
+            w[i] = take
+            remaining -= take
+            if sector_of[i] in sector_left:
+                sector_left[sector_of[i]] -= take
+        fixed = {i: float(w[i]) for i in range(n)
+                 if w[i] <= 1e-13 or w[i] >= cap - 1e-13}
+        active = sorted(
+            s for s in caps_s
+            if sum(w[i] for i in sector_members[s]) >= caps_s[s] - 1e-12)
+        for _step in range(1000):
+            equalities = [(list(range(n)), 1.0)] + [
+                (sector_members[s], caps_s[s]) for s in active]
+            w_star, lambdas = solve_eq(fixed, equalities)
+            step = w_star - w
+            if float(np.max(np.abs(step))) <= 1e-13:
                 grad = 2 * cov @ w
                 at_lam = np.zeros(n)
                 for k, (members, _t) in enumerate(equalities):
                     for i in members:
                         at_lam[i] += lambdas[k]
-                release, worst = None, 1e-9
+                drop, worst = None, 1e-11
                 for i, v in fixed.items():
                     resid = grad[i] + at_lam[i]
                     violation = -resid if v == 0.0 else resid
                     if violation > worst:
-                        release, worst = i, violation
-                if release is None:
-                    break
-                del fixed[release]
-            sector_sum = {s: float(sum(w[i] for i in mem))
-                          for s, mem in sector_members.items()}
-            violated = [s for s in sector_sum
-                        if sector_sum[s] > cfg["sector_caps"][s] + 1e-9
-                        and s not in active_sectors]
-            if violated:
-                active_sectors.append(
-                    max(violated, key=lambda s: sector_sum[s] - cfg["sector_caps"][s]))
+                        drop, worst = ("asset", i), violation
+                for k, s in enumerate(active):
+                    if -lambdas[1 + k] > worst:
+                        drop, worst = ("sector", s), -lambdas[1 + k]
+                if drop is None:
+                    return w
+                if drop[0] == "asset":
+                    del fixed[drop[1]]
+                else:
+                    active.remove(drop[1])
                 continue
-            release_sector, worst = None, -1e-9
-            for k, s in enumerate(active_sectors):
-                if lambdas[1 + k] < worst:
-                    release_sector, worst = s, lambdas[1 + k]
-            if release_sector is None:
-                return w
-            active_sectors.remove(release_sector)
+            alpha, blocker = 1.0, None
+            for i in range(n):
+                if i in fixed:
+                    continue
+                if step[i] > 1e-14:
+                    cand = (cap - w[i]) / step[i]
+                    if cand < alpha:
+                        alpha, blocker = cand, ("asset", i, cap)
+                elif step[i] < -1e-14:
+                    cand = w[i] / -step[i]
+                    if cand < alpha:
+                        alpha, blocker = cand, ("asset", i, 0.0)
+            for s in caps_s:
+                if s in active:
+                    continue
+                members = sector_members[s]
+                slope = float(sum(step[i] for i in members))
+                if slope > 1e-14:
+                    slack = caps_s[s] - float(sum(w[i] for i in members))
+                    cand = slack / slope
+                    if cand < alpha:
+                        alpha, blocker = cand, ("sector", s, caps_s[s])
+            w = w + alpha * step
+            w[np.abs(w) < 1e-15] = 0.0
+            if blocker is not None and alpha < 1.0:
+                if blocker[0] == "asset":
+                    fixed[blocker[1]] = float(blocker[2])
+                    w[blocker[1]] = blocker[2]
+                else:
+                    active.append(blocker[1])
+                    active.sort()
         return w
 
     def allocate(desired, nav, px):
