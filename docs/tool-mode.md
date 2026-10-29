@@ -18,12 +18,20 @@ assistant's plain JSON content, scored the usual way.
 - The model makes at most one tool call per turn, up to `--max-turns`
   tool-using turns. After that (or when a guard trips) the harness
   makes one forced-final call and records `forced_final: true`.
-- Each `run_python` call is a fresh bubblewrap process: no network,
-  an empty environment (`env -i`, so no API keys are visible),
-  read-only system/Python binds, only that task's CSV bound at
-  `/data/task.csv`, a per-task `/tmp` that persists across that task's
-  calls, and wall-clock/CPU/memory/process/file-size limits. Output
-  is truncated head+tail. The sandbox never binds the repository,
+- Each `run_python` call is a fresh bubblewrap process: no network;
+  the child starts with an empty environment (`env -i`), and the
+  host-side launcher chain (bubblewrap is PID 1 inside the sandbox,
+  so its own `/proc/1/environ` matters) is itself started with a
+  fixed `PATH`/`LANG`-only environment, with bubblewrap's options
+  passed over an fd rather than argv, so no host secret value or
+  host path is readable via `/proc/*/environ`, `/proc/*/cmdline` or
+  open fds. Read-only system/Python binds (interpreter directories
+  outside the system prefix, such as a venv or user site-packages,
+  are bound at neutral `/opt/py` paths, and `PYTHONPATH` names only
+  in-sandbox paths), only that task's CSV bound at `/data/task.csv`,
+  everything except a per-task `/tmp` mounted read-only, and
+  wall-clock/CPU/memory/process/file-size limits. Output is
+  truncated head+tail. The sandbox never binds the repository,
   `answers/`, `tests/`, `src/`, the home directory or the workspace.
 - Results stay scorer-compatible: `results.jsonl`/`results.json` keep
   the usual fields and add `turns`, `tool_calls`, `tool_errors`,
