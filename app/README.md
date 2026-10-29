@@ -41,12 +41,12 @@ returned to the browser.
 
 ## Live endpoint abuse limits
 
-`POST /api/check` spends real Meta credits, so it is guarded
+`POST /api/check` calls the live model, so it is guarded
 (`rate_limit.py`, in-memory — resets on redeploy and per replica,
 which fits a single Railway replica but is not a distributed limiter):
 
 - The **model is pinned server-side** (`META_MODEL_NAME`); any model a
-  client sends is ignored, so callers cannot pick a pricier model.
+  client sends is ignored, so callers cannot pick a different model.
 - Hard caps: 80 KB request body, 64,000-char CSV, 500 rows, 20 columns;
   `max_tokens` defaults to 4,096 and `META_MAX_TOKENS` is capped at
   8,192; upstream timeout 30s; at most 2 concurrent live calls.
@@ -54,10 +54,10 @@ which fits a single Railway replica but is not a distributed limiter):
   the visitor address it observed), falling back to the first
   `X-Forwarded-For` hop, then the TCP peer. The last forwarded hop
   is never used: it can be Railway's own edge address, which would
-  bucket every visitor together. 5/min, 30/hour. Global daily caps: 300 live calls and an estimated
-  $5/day spend. Before each call the worst-case cost (full prompt +
-  max output tokens at $1.25/$4.25 per 1M) is **reserved** against
-  the budget and settled afterwards — successful calls settle at the
+  bucket every visitor together. 5/min, 30/hour. Global daily caps: 300 live calls and a configurable
+  daily budget (`LIVE_DAILY_BUDGET_USD`). Before each call the
+  worst-case cost (full prompt + max output tokens) is **reserved**
+  against the budget and settled afterwards — successful calls settle at the
   actual token usage, failed calls settle at the reserved worst case,
   so billed-but-malformed responses cannot slip past the cap. The
   client uses `max_retries=0`, so one request is one billed attempt.
@@ -67,7 +67,7 @@ which fits a single Railway replica but is not a distributed limiter):
   `429` + `Retry-After`.
 - **The daily counters reset on every redeploy** (and at UTC
   midnight): they live in process memory, so a redeploy restarts the
-  $5/day budget from zero. Keep that in mind when redeploying often;
+  daily budget from zero. Keep that in mind when redeploying often;
   the per-IP windows and the upstream account limits still apply.
 - Cross-origin browser calls are rejected (`403`) unless the origin is
   same-host or listed in `ALLOWED_ORIGINS`. Non-browser clients can

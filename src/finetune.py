@@ -260,7 +260,7 @@ def main():
         print(f"  {command}")
     print("\nAfter training, evaluate on the locked seeds (42/1001/"
           "1002) at low reasoning effort, then tear down the "
-          "deployment (see README 'Fine-Tune on Fireworks').")
+          "deployment (see docs/BENCHMARK.md 'Fine-Tune on Fireworks').")
     return 0
 
 
