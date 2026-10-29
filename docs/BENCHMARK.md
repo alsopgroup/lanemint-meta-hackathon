@@ -415,6 +415,51 @@ python -m src.scorer output/pilot_f4/results.json tasks_frontier_pilot/answers
 
 ---
 
+### Tools-Frontier Tier (`tools_frontier`, T1–T5)
+
+The tools-frontier tier (`src/tools_frontier_tier.py`, task IDs `task_tf_*`) is the harder tools-on tier specified in SCOPE.md. Each task is a **directory of 3–5 files** (price CSVs, auxiliary tables such as `fx.csv` / `splits.csv` / `calendar.csv` / `constraints.json`, and a `spec.md` methodology memo) instead of a single CSV. The prompt names only the directory and the output schema; the memo states the governing conventions in prose and in a convention table, and different output sections may use different conventions (a section clause overrides the desk default stated earlier in the same memo). The prompt never says which problem codes do or do not apply. There are **30 tasks per seed** (5 families × 6). Knobs per family live in `TOOLS_FRONTIER_SETTINGS`.
+
+| Family | Type | Files | Task |
+|---|---|---|---|
+| T1 | `tools_frontier_convention_risk` | `prices.csv`, `calendar.csv`, `spec.md` | Convention-switch risk report (~220 rows, 3 assets + benchmark): per-asset annualised vol under its own section convention (simple/log, 252/260, ddof 1/0), maximum overlapping rolling beta (window 20, step 5) and its end date, weekly (W-FRI) tracking error, EWMA vol (λ=0.94), Sharpe with stated risk-free compounding |
+| T2 | `tools_frontier_fx_calendar` | `us_prices.csv`, `eu_prices.csv`, `fx.csv`, `calendar.csv`, `spec.md` | Multi-currency NAV: EUR closes converted at the same-date FX fix as of the 16:00 UTC cut-off (previous fix when the timestamp — in mixed `Z`/`+00:00`/`+01:00` forms — is after the cut-off), a contiguous inverted-quote (`USDEUR`) segment flagged only by the `quote` column, inner-calendar USD NAV on 3 probe dates, total USD return, FX P&L contribution, dates dropped by alignment, problem codes (`currency`, `timezone`, `calendar`) |
+| T3 | `tools_frontier_reconciliation` | `vendor_a.csv`, `vendor_b.csv`, `corrections.csv`, `spec.md` | Conflicting-duplicate reconciliation: precedence is latest correction with `as_of` ≤ report time, else Vendor A unless flagged `indicative`, else the median of available; Vendor B switches units mid-file via an explicit `unit` column; graded on the 3 resolution-path counts, probe resolved closes, reconciled total return, max drawdown with trough date, problem codes |
+| T4 | `tools_frontier_split_holdings` | `prices.csv`, `splits.csv`, `trades.csv`, `spec.md` | Split-table corporate actions (forward + reverse, explicit table only) on holdings: lots receive a split only when their T+2 settlement date is before the ex-date, fractional shares are cashed out at the ex-date close, FIFO realised P&L, unrealised P&L, cash-in-lieu, daily time-weighted return (no Modified Dietz), max drawdown |
+| T5 | `tools_frontier_portfolio_construction` | `prices.csv`, `constraints.json`, `spec.md` | Constrained construction pipeline (6 assets): shrunk covariance (δ=0.2 to the diagonal) on a 60-return lookback → unique min-variance weights under long-only/per-asset/sector caps → round lots (floor, then greedy leftover-cash allocation by largest residual, ties by ticker) → rebalances with a turnover cap (scaled targets) and cost in bps → daily NAV path; graded on first-rebalance weights/shares, turnover per rebalance, final NAV, max drawdown, cash left |
+
+**Wrong-method-collision reseeding (discriminator guarantee):** for every task the generator also computes the answer under each family's plausible wrong methods (stored as `trap_variants` in `tasks.json`: e.g. naive simple/252 for T1, ignoring the FX inversion or the cut-off for T2, Vendor-A-always / no corrections for T3, splits not applied to holdings / settlement ignored / LIFO for T4, no shrinkage / no caps / no turnover cap or cost for T5). If any variant would land within 50× scoring tolerance of a core field it is meant to change, the task is discarded and regenerated with fresh draws until every variant misses at least one core field.
+
+**Grading:** field-level scoring reuses `src/scorer.py`. Tools-frontier answer keys carry a `_tools_frontier` schema (family, `core` vs secondary fields, tolerances) — the one justified change to that protected file, together with the `--tier tools_frontier` entry point in `src/generate_tasks.py`, both required by the SCOPE.md build brief; existing tiers' scoring behaviour is unchanged and covered by their existing suites (the CI protected-file guard was updated accordingly and still guards the existing tier generators and all generated task files). Float tolerances are rtol 1e-6 / atol 1e-8, except optimiser weights at rtol 1e-4; integers, share counts and dates are exact. **Task pass = every core field correct + the problem set exact (where the family has one).**
+
+**Constraints honoured:** no security-level events other than explicit `splits.csv` rows in T4; holidays are absent rows, never repeated values, and consecutive closes for a ticker are never equal in any generated price series; histories are always longer than every lookback the memo requires. Generation seeds **42, 1001 and 1002 are reserved for evaluation**: `ToolsFrontierTaskGenerator` (and both CLIs) refuse them unless `--eval` / `allow_eval=True` is passed explicitly. Development/calibration uses seeds 7001–7010.
+
+**Offline verification (SCOPE.md §6, `tests/test_tools_frontier.py`, no model or API calls):** the independent reference solver `src/tools_frontier_ref.py` (reads only the files in a task directory plus `spec.md`; imports nothing from the generator) scores **100% (300/300) on seeds 7001–7010**; empty/zero baselines pass **0%** and every stored naive/single-trap variant passes **0%** on its family (requirement: ≤5%); the same seed regenerates byte-identical files (SHA-256 checked); a banned-feature lint covers the generator/reference sources and all generated outputs; and the reference computation runs inside the existing bubblewrap sandbox within its timeout with stdout under the truncation limit (skipped automatically where bubblewrap is unavailable, as in the existing sandbox tests).
+
+**Running it (tool mode):**
+
+```bash
+# Generate a development set (30 tasks; eval seeds are refused without --eval)
+python -m src.generate_tasks --tier tools_frontier --seed 7001 --count 30
+# (equivalently: python -m src.tools_frontier_tier --seed 7001 --count 30)
+
+# Tool mode: /data/ is the whole task directory (memo + data files), read-only
+python -m src.runner --tier tools_frontier --tools python \
+  --max-turns 12 --sandbox-timeout 30 \
+  --base-url https://api.meta.ai/v1 --model <model-id> \
+  --output-dir output/tools_frontier_tool
+
+# Score exactly like the other tiers
+python -m src.scorer output/tools_frontier_tool/results.json tasks_tools_frontier/answers
+
+# Offline / dry-run wiring check (stub model, no API calls)
+python -m src.runner --tier tools_frontier --tools python --dry-run \
+  --output-dir output/tools_frontier_dry
+```
+
+Useful flags: `--family tools_frontier_fx_calendar` (repeatable) restricts a run to one family, `--per-family 6` selects the first 6 tasks of each type, and `--tool-protocol text` uses the fenced-python protocol instead of native tool calls. Without `--tools`, the runner inlines the whole task directory (memo plus files, under `===== FILE: … =====` headers) into the prompt as before.
+
+---
+
 ## Testing
 
 Run unit tests:

@@ -523,6 +523,23 @@ class TaskScorer:
             return {'task_id': task_id, 'passed': False, 'score': 0.0,
                     'feedback': parsed['error']}
         scores, feedback = {}, []
+        # Tools-frontier schema (justified protected-file change: the
+        # SCOPE.md build brief requires per-family core/secondary schemas
+        # in this scorer).  A ``_tools_frontier`` entry in the answer key
+        # is metadata, not a scored field: it names the core fields, the
+        # relative/absolute float tolerances, and any per-field rtol
+        # overrides.  Task pass for such tasks is all core fields correct
+        # plus the exact problem set (where present); existing tiers are
+        # completely unaffected.
+        tf_schema = expected.get('_tools_frontier') \
+            if isinstance(expected.get('_tools_frontier'), dict) else None
+
+        def tf_tolerance(field, exp_value):
+            rtol = (tf_schema.get('field_rtol') or {}).get(
+                field, tf_schema.get('rtol', 1e-6))
+            return max(float(tf_schema.get('atol', 1e-8)),
+                       float(rtol) * abs(float(exp_value)))
+
         if 'problems_found' in expected:
             actual_problems = parsed.get('problems', parsed.get('problems_found', []))
             prob_score, prob_feedback = self.score_problems_found(
@@ -550,15 +567,19 @@ class TaskScorer:
         for field, exp_val in expected.items():
             if field == 'problems_found':
                 continue
+            if field == '_tools_frontier':
+                continue
             if isinstance(exp_val, dict):
                 actual_map = parsed.get(field)
                 for key, sub in exp_val.items():
                     comp = f"{field}.{key}"
                     actual_val = actual_map.get(key) \
                         if isinstance(actual_map, dict) else None
+                    dict_tol = tf_tolerance(field, sub) \
+                        if tf_schema is not None else 1e-4
                     if isinstance(actual_val, (int, float)) \
                             and not isinstance(actual_val, bool) \
-                            and self.compare_float(actual_val, sub, 1e-4):
+                            and self.compare_float(actual_val, sub, dict_tol):
                         scores[comp] = 1.0
                     else:
                         scores[comp] = 0.0
@@ -573,7 +594,9 @@ class TaskScorer:
                     feedback.append(
                         f"{field}: expected {exp_val}, got {parsed.get(field)}")
             elif isinstance(exp_val, float):
-                tolerance = 0.01 if field == 'final_price' \
+                tolerance = tf_tolerance(field, exp_val) \
+                    if tf_schema is not None else \
+                    0.01 if field == 'final_price' \
                     or field.endswith('_price') else \
                     5e-5 if field == 'r_squared' else \
                     1e-3 if field in ('reconciled_max_drawdown',
@@ -643,6 +666,21 @@ class TaskScorer:
             feedback.append(
                 f"Core field(s) not correct: {', '.join(core_failed)}")
         passed = overall >= 0.8 and problems_ok and core_ok
+        if tf_schema is not None:
+            # Tools-frontier pass rule (SCOPE.md section 4): every core
+            # field correct (dict cores expand to their entries) and the
+            # problem set exact where present.
+            tf_failed = []
+            for field in tf_schema.get('core') or []:
+                if isinstance(expected.get(field), dict):
+                    tf_failed += [f"{field}.{k}" for k in expected[field]
+                                  if scores.get(f"{field}.{k}", 0.0) < 1.0]
+                elif scores.get(field, 0.0) < 1.0:
+                    tf_failed.append(field)
+            if tf_failed:
+                feedback.append(
+                    f"Core field(s) not correct: {', '.join(tf_failed)}")
+            passed = not tf_failed and problems_ok
         if not passed and not feedback:
             # A failure must never read as success: if no per-field or
             # core message explains it, say so explicitly rather than

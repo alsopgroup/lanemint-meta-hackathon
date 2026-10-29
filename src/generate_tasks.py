@@ -525,9 +525,16 @@ def main():
     parser.add_argument(
         '--tier',
         type=str,
-        choices=['easy', 'hard', 'frontier'],
+        choices=['easy', 'hard', 'frontier', 'tools_frontier'],
         default='easy',
-        help='Difficulty tier: easy (default), hard or frontier'
+        help='Difficulty tier: easy (default), hard, frontier or tools_frontier'
+    )
+    parser.add_argument(
+        '--eval',
+        action='store_true',
+        dest='allow_eval',
+        help='tools_frontier only: allow a reserved evaluation seed '
+             '(42, 1001, 1002); never use for training/dev data'
     )
 
     args = parser.parse_args()
@@ -542,6 +549,20 @@ def main():
         from src.hard_tier import HardTaskGenerator
         print("Generating HARD tier tasks...")
         generator = HardTaskGenerator(seed=args.seed)
+    elif args.tier == 'tools_frontier':
+        # Justified protected-file change: the SCOPE.md build brief asks
+        # for a `--tier tools_frontier` generation entry point alongside
+        # the existing tiers.  The generator itself (including the
+        # reserved-eval-seed refusal) lives in src/tools_frontier_tier.py.
+        from src.tools_frontier_tier import ToolsFrontierTaskGenerator
+        print("Generating TOOLS-FRONTIER tier tasks...")
+        try:
+            generator = ToolsFrontierTaskGenerator(
+                seed=args.seed, allow_eval=args.allow_eval)
+        except ValueError as exc:
+            # Reserved eval seed: refuse cleanly, non-zero exit, no traceback.
+            print(f"Error: {exc}")
+            raise SystemExit(1) from None
     elif args.tier == 'frontier':
         from src.frontier_tier import FrontierTaskGenerator
         print("Generating FRONTIER tier tasks...")
@@ -551,7 +572,8 @@ def main():
         generator = TaskGenerator(seed=args.seed)
 
     output_dir = args.output_dir or {'hard': Path('tasks_hard'),
-                                     'frontier': Path('tasks_frontier')}.get(
+                                     'frontier': Path('tasks_frontier'),
+                                     'tools_frontier': Path('tasks_tools_frontier')}.get(
                                          args.tier, Path('tasks'))
     tasks = generator.generate_all_tasks(output_dir, num_tasks=args.count)
     print(f"Created {len(tasks)} {args.tier} tier tasks with seed {args.seed}")

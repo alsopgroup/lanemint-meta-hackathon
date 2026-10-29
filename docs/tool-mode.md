@@ -15,6 +15,10 @@ assistant's plain JSON content, scored the usual way.
   lines; pandas and numpy are available; values should be computed
   with the tool and reported at full precision. The CSV is not pasted
   into the prompt.
+- Multi-file (`tools_frontier`) tasks instead bind the whole task
+  directory read-only at `/data/` (the `spec.md` methodology memo plus
+  its data files, e.g. `/data/fx.csv`); the preamble lists the files
+  with their sizes and no file contents are pasted into the prompt.
 - The model makes at most one tool call per turn, up to `--max-turns`
   tool-using turns. After that (or when a guard trips) the harness
   makes one forced-final call and records `forced_final: true`.

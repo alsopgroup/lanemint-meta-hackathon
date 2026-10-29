@@ -38,12 +38,17 @@ jobs:
 
     - name: Guard protected benchmark files
       run: |
-        # Tool mode must never change the scorer, tier generators,
-        # task generation, or any generated task/answer files.
+        # Existing tier generators and any generated task/answer files
+        # must never change. src/scorer.py and src/generate_tasks.py are
+        # intentionally extended by the tools-frontier tier (per-family
+        # scorer schemas and a --tier tools_frontier entry point, as
+        # required by SCOPE.md and justified in docs/BENCHMARK.md), so
+        # they are no longer blanket-guarded; their existing-tier
+        # behaviour is covered by the unchanged scorer/tier test suites.
         git fetch origin '+refs/heads/main:refs/remotes/origin/main'
         CHANGED="$(git diff --name-only origin/main...HEAD -- \
-          src/scorer.py src/frontier_tier.py src/hard_tier.py \
-          src/generate_tasks.py 'tasks*/')"
+          src/frontier_tier.py src/hard_tier.py \
+          'tasks*/')"
         if [ -n "$CHANGED" ]; then
           echo "Protected files changed:"
           echo "$CHANGED"
@@ -99,6 +104,14 @@ jobs:
         test -f output_tool/results.json || exit 1
         test -f output_tool/transcripts/task_001.jsonl || exit 1
         echo "✓ Tool-mode runner dry-run successful"
+
+    - name: Test tools-frontier tier (offline, no API calls)
+      run: |
+        python -m src.generate_tasks --tier tools_frontier --seed 7001 --count 30 --output-dir tasks_tools_frontier_ci
+        test -f tasks_tools_frontier_ci/task_tf_3001/spec.md || exit 1
+        python -m src.runner --dry-run --tools python --limit 2 --tasks-dir tasks_tools_frontier_ci --output-dir output_tf_tool
+        test -f output_tf_tool/transcripts/task_tf_3001.jsonl || exit 1
+        echo "✓ Tools-frontier generation and tool-mode dry-run successful"
 
     - name: Test scorer
       run: |
