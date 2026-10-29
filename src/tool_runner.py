@@ -62,10 +62,12 @@ RUN_PYTHON_TOOL = {
     "function": {
         "name": "run_python",
         "description": (
-            "Run Python code in a sandbox. The task CSV is read-only at "
-            "/data/task.csv; pandas and numpy are available. Prints and "
-            "stderr are returned. Stateless per call except files you "
-            "write under /tmp, which persist for this task only."),
+            "Run Python code in a sandbox. The task data is read-only "
+            "under /data/ (a single CSV at /data/task.csv, or, for "
+            "multi-file tasks, the task's files directly in /data/); "
+            "pandas and numpy are available. Prints and stderr are "
+            "returned. Stateless per call except files you write under "
+            "/tmp, which persist for this task only."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -310,6 +312,12 @@ class ToolTaskRunner(TaskRunner):
 
     def _resolve_csv(self, task: dict, data: str,
                      tmp_root: Path) -> Path:
+        # Multi-file (tools-frontier) tasks: bind the whole task
+        # directory read-only at /data/ in the sandbox.
+        if self.tasks_dir is not None and task.get("data_dir"):
+            candidate = self.tasks_dir / task["data_dir"]
+            if candidate.is_dir():
+                return candidate
         if self.tasks_dir is not None and task.get("data_file"):
             candidate = self.tasks_dir / task["data_file"]
             if candidate.is_file():
@@ -347,6 +355,27 @@ class ToolTaskRunner(TaskRunner):
         })
 
     def _preamble(self, task: dict, data: str) -> str:
+        if task.get("data_dir"):
+            # Multi-file task: /data/ holds the memo and data files.
+            listing = []
+            if self.tasks_dir is not None:
+                task_dir = self.tasks_dir / task["data_dir"]
+                if task_dir.is_dir():
+                    listing = [f"{p.name} ({p.stat().st_size} bytes)"
+                               for p in sorted(task_dir.iterdir()) if p.is_file()]
+            lines = [
+                task["prompt"],
+                "",
+                "Tool available: run_python(code) runs Python in a sandbox.",
+                "The task files are read-only in /data/ (for example "
+                "/data/spec.md). Do not expect the file contents in this "
+                "prompt; read them with the tool.",
+                "Files in /data/: " + (", ".join(listing) or task["data_dir"]),
+                "pandas and numpy are available. Compute with the tool and "
+                "report values at full precision (round only as the task "
+                "states). Files written under /tmp persist for this task.",
+            ]
+            return self._finish_preamble(lines)
         header, row_count, first_lines = _csv_preview(data)
         lines = [
             task["prompt"],
@@ -362,6 +391,9 @@ class ToolTaskRunner(TaskRunner):
             "report values at full precision (round only as the task "
             "states). Files written under /tmp persist for this task.",
         ]
+        return self._finish_preamble(lines)
+
+    def _finish_preamble(self, lines: list[str]) -> str:
         if self.protocol_preference == "text":
             lines.append(
                 "To compute, reply with exactly one fenced ```python "

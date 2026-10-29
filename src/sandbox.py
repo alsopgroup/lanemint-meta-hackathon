@@ -291,7 +291,11 @@ def build_sandbox_command(code: str, csv_path: Path, workdir: Path | None,
         "--proc", "/proc",
         "--dev", "/dev",
         "--dir", "/data",
-        "--ro-bind", str(csv_path), "/data/task.csv",
+        # One task CSV at /data/task.csv (existing tiers), or, for the
+        # multi-file tools-frontier tier, one task directory read-only
+        # at /data/ itself (spec.md plus its data files, nothing else).
+        *(["--ro-bind", str(csv_path), "/data"] if Path(csv_path).is_dir()
+          else ["--ro-bind", str(csv_path), "/data/task.csv"]),
         "--dir", "/tmp",
         # Everything mounted so far (and the root itself) goes
         # read-only; only the /tmp mount below stays writable.
@@ -426,7 +430,13 @@ def run_python(code: str, csv_path: str | Path,
             max_open_files=limits.max_open_files,
             max_output_chars=limits.max_output_chars,
         )
-    csv = validate_csv_path(csv_path)
+    if Path(csv_path).expanduser().is_dir():
+        # Multi-file task directory: bind the directory itself at /data.
+        # It must be a real directory and must not live under a forbidden
+        # component (answers/tests/src), exactly like the single-CSV case.
+        csv = _check_bind_path(Path(csv_path), what="task data directory")
+    else:
+        csv = validate_csv_path(csv_path)
 
     work: Path | None = None
     if workdir is not None:

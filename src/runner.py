@@ -102,8 +102,21 @@ class TaskRunner:
             return json.load(f)
 
     def load_data(self, tasks_dir: Path, data_file: str) -> str:
-        """Load CSV data for a task."""
+        """Load data for a task.
+
+        ``data_file`` may name a directory (tools-frontier tier): every
+        file in it is returned, in name order, under a
+        ``===== FILE: <name> =====`` header so the non-tool prompt still
+        carries the full task (memo plus data files).
+        """
         data_path = Path(tasks_dir) / data_file
+        if data_path.is_dir():
+            parts = []
+            for entry in sorted(data_path.iterdir()):
+                if entry.is_file():
+                    parts.append(f"===== FILE: {entry.name} =====\n"
+                                 f"{entry.read_text()}")
+            return "\n".join(parts)
         with open(data_path) as f:
             return f.read()
 
@@ -119,8 +132,8 @@ class TaskRunner:
         env = os.getenv('META_MAX_TOKENS')
         if env:
             return int(env)
-        return 32000 if str(task.get('id', '')).startswith(('task_h_', 'task_f_')) \
-            else 16000
+        return 32000 if str(task.get('id', '')).startswith(
+            ('task_h_', 'task_f_', 'task_tf_')) else 16000
 
     def run_task(self, task: dict, data: str) -> dict:
         """Run a single task."""
@@ -356,7 +369,8 @@ class TaskRunner:
                     continue
                 print(f"[{i}/{len(tasks)}] Running {task['id']}...")
                 try:
-                    data = self.load_data(tasks_dir, task['data_file'])
+                    data = self.load_data(
+                        tasks_dir, task.get('data_dir') or task['data_file'])
                     result = self.run_task(task, data)
                 except Exception as exc:  # one failure must not lose the run
                     result = self._error_result(task, exc)
@@ -394,10 +408,10 @@ def main():
     )
     parser.add_argument(
         '--tier',
-        choices=['easy', 'hard', 'frontier'],
+        choices=['easy', 'hard', 'frontier', 'tools_frontier'],
         default=None,
         help='Task tier; sets the default tasks directory (tasks/, tasks_hard/, '
-             'tasks_frontier/) when --tasks-dir is not given'
+             'tasks_frontier/, tasks_tools_frontier/) when --tasks-dir is not given'
     )
     parser.add_argument(
         '--output-dir',
@@ -476,9 +490,11 @@ def main():
     parser.add_argument(
         '--max-turns',
         type=int,
-        default=12,
+        default=None,
         help='Tool mode: maximum tool-using model turns per task before '
-             'a forced final answer (default: 12)'
+             'a forced final answer (default: 12, or 16 for the '
+             'tools_frontier tier, whose tasks chain several '
+             'computation stages and need the extra turns)'
     )
     parser.add_argument(
         '--sandbox-timeout',
@@ -536,9 +552,15 @@ def main():
 
     args = parser.parse_args()
 
+    if args.max_turns is None:
+        # The tools_frontier tier's multi-stage pipelines get a larger
+        # default turn budget; every other tier keeps the default of 12.
+        args.max_turns = 16 if args.tier == 'tools_frontier' else 12
+
     if args.tasks_dir is None:
         args.tasks_dir = {'hard': Path('tasks_hard'),
-                          'frontier': Path('tasks_frontier')}.get(
+                          'frontier': Path('tasks_frontier'),
+                          'tools_frontier': Path('tasks_tools_frontier')}.get(
                               args.tier, Path('tasks'))
 
     if not args.tasks_dir.exists():
