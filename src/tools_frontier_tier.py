@@ -271,6 +271,12 @@ class ToolsFrontierTaskGenerator:
         bench = "BMK"
         bench_rets = [rng.gauss(0.0003, 0.010) for _ in range(rows - 1)]
         series = {bench: _closes(rng, rng.uniform(90, 130), [0.0] + bench_rets)}
+        # A second benchmark, only partly correlated with the first:
+        # one section below is governed by BMK2, not BMK, and using the
+        # desk's first benchmark there is a scored error.
+        bench2 = "BMK2"
+        bench2_rets = [0.4 * r + rng.gauss(0, 0.009) for r in bench_rets]
+        series[bench2] = _closes(rng, rng.uniform(90, 130), [0.0] + bench2_rets)
         asset_rets = {}
         for asset in assets:
             beta = rng.uniform(0.6, 1.5)
@@ -329,6 +335,16 @@ class ToolsFrontierTaskGenerator:
         # Second rolling section: a different asset, window and step.
         rb2 = rolling_betas(simple[assets[1]], simple[bench_name], 15, 1)
         max_beta2, max_end2 = max(rb2, key=lambda p: p[0])
+        # Third rolling section: another asset against the SECOND
+        # benchmark (window 25, step 5).
+        rb3 = rolling_betas(simple[assets[2]], simple[bench2], 25, 5)
+        max_beta3, max_end3 = max(rb3, key=lambda p: p[0])
+        # Recent-window volatility: only the last 60 log returns of the
+        # first asset (after the calendar exclusion), not the full sample.
+        recent_window = 60
+        recent_rets = _returns(series[assets[0]], "log")[-recent_window:]
+        recent_vol = _std(recent_rets, 1) * math.sqrt(252)
+        recent_field = f"recent_vol_last_{recent_window}"
         downside_rets = simple[assets[2]]
         downside_vol = math.sqrt(
             _mean([min(r, 0.0) ** 2 for r in downside_rets])) * math.sqrt(252)
@@ -368,6 +384,9 @@ class ToolsFrontierTaskGenerator:
             "downside_volatility": round(downside_vol, 6),
             "log_return_correlation": round(log_corr, 6),
             "weekly_annualised_log_return": round(weekly_ann, 6),
+            "rolling3_max_beta": round(max_beta3, 6),
+            "rolling3_max_beta_end_date": _dstr(dates[max_end3 + 1]),
+            recent_field: round(recent_vol, 6),
             "num_aligned_days": rows,
         })
         core = [f"ann_vol_{a}" for a in assets] + [
@@ -375,13 +394,19 @@ class ToolsFrontierTaskGenerator:
             "rolling2_max_beta", "rolling2_max_beta_end_date",
             "weekly_tracking_error", "ewma_vol_last", "sharpe_ratio",
             "downside_volatility", "log_return_correlation",
-            "weekly_annualised_log_return"]
+            "weekly_annualised_log_return",
+            "rolling3_max_beta", "rolling3_max_beta_end_date", recent_field]
 
         def _corr(kind):
             ra = _returns(series[assets[0]], kind)
             rbk = _returns(series[bench_name], kind)
             return _cov(ra, rbk, 1) / (_std(ra, 1) * _std(rbk, 1))
 
+        # Section 10 against the first benchmark (the naive benchmark
+        # choice), computed once for both naive-style answers below.
+        rb3_vs_first = max(
+            rolling_betas(simple[assets[2]], simple[bench_name], 25, 5),
+            key=lambda p: p[0])
         naive = {
             f"ann_vol_{a}": round(_ann_vol(series[a], "simple", 252, 1), 6)
             for a in assets
@@ -401,6 +426,11 @@ class ToolsFrontierTaskGenerator:
             "log_return_correlation": round(_corr("simple"), 6),
             "weekly_annualised_log_return": round(
                 _mean(_returns(weekly_closes(assets[0]), "simple")) * 52, 6),
+            # Naive also reaches for the first benchmark in section 10
+            # and uses the full sample in section 11.
+            "rolling3_max_beta": round(rb3_vs_first[0], 6),
+            "rolling3_max_beta_end_date": _dstr(dates[rb3_vs_first[1] + 1]),
+            recent_field: round(_ann_vol(series[assets[0]], "simple", 252, 1), 6),
             "num_aligned_days": rows,
         })
         nonoverlap = rolling_betas(simple[target], simple[bench_name], window, window)
@@ -411,20 +441,33 @@ class ToolsFrontierTaskGenerator:
             "rolling_max_beta_end_date": _dstr(dates[no_end + 1])})
         variant_weekend = dict(expected)
         variant_weekend[f"ann_vol_{assets[0]}"] = round(weekend_ann_vol, 6)
+        # Wrong-benchmark trap: section 10 computed against BMK instead
+        # of the BMK2 named in its convention-table row.
+        variant_wrong_bench = dict(expected)
+        variant_wrong_bench.update({
+            "rolling3_max_beta": round(rb3_vs_first[0], 6),
+            "rolling3_max_beta_end_date": _dstr(dates[rb3_vs_first[1] + 1])})
+        # Full-sample trap: section 11 over every log return instead of
+        # only the last 60.
+        variant_full_sample = dict(expected)
+        variant_full_sample[recent_field] = round(
+            _ann_vol(series[assets[0]], "log", 252, 1), 6)
         variants = {"naive_simple_252": naive,
                     "nonoverlapping_rolling": variant_nonoverlap,
-                    "weekend_prints_included": variant_weekend}
+                    "weekend_prints_included": variant_weekend,
+                    "wrong_benchmark": variant_wrong_bench,
+                    "full_sample_instead_of_recent": variant_full_sample}
 
         rows_out = []
-        for ticker in assets + [bench_name]:
+        for ticker in assets + [bench_name, bench2]:
             ticker_rows = _price_rows(ticker, dates, series[ticker], rng)
             if ticker == assets[0]:
                 for day, close in weekend_points:
                     ticker_rows.append(_price_rows(ticker, [day], [close], rng)[0])
                 ticker_rows.sort(key=lambda r: r[0])
-            if ticker == assets[1]:
-                # Row order in the file is not date order for this
-                # ticker; the memo requires sorting before any use.
+            if ticker in (assets[1], bench2):
+                # Row order in the file is not date order for these
+                # tickers; the memo requires sorting before any use.
                 rng.shuffle(ticker_rows)
             rows_out += ticker_rows
         spec = f"""# Methodology memo - convention-switch risk report (T1)
@@ -445,6 +488,8 @@ section only; honour the governing clause for each field.
 - downside_vol: asset={assets[2]}; return=simple; periods_per_year=252
 - log_correlation: asset={assets[0]}; benchmark={bench_name}
 - weekly_annualised_log_return: asset={assets[0]}; resample=W-FRI last close; periods_per_year=52
+- rolling_beta3: asset={assets[2]}; benchmark={bench2}; window=25; step=5; return=simple; ddof=1
+- recent_vol: asset={assets[0]}; window_returns={recent_window}; return=log; periods_per_year=252; ddof=1
 
 ## Data rules (read before computing)
 - calendar.csv lists the trading dates. prices.csv can contain rows on
@@ -483,6 +528,15 @@ section only; honour the governing clause for each field.
 9. Weekly annualised log return of {assets[0]}: mean of the log weekly
    returns (W-FRI last close, as in section 3) times 52. This is a mean
    log return, not a compounded growth rate.
+10. Rolling beta, third section: overlapping windows of 25 consecutive
+   simple returns of {assets[2]} against {bench2} - this section's
+   benchmark is {bench2}, NOT {bench_name} - advancing by 5 returns.
+   Report the largest window beta and its end date (same end-date rule
+   as section 2) as rolling3_max_beta and rolling3_max_beta_end_date.
+11. Recent volatility of {assets[0]}: take only the LAST {recent_window}
+   log returns of the (calendar-filtered, date-sorted) series - not the
+   full sample - and report their sample standard deviation (ddof=1)
+   times sqrt(252) as {recent_field}.
 
 Prices are in prices.csv (date,ticker,open,high,low,close,volume);
 after the data rules above are applied the series align on {rows}
@@ -522,14 +576,23 @@ business days.
         inv1 = (inv1[0], inv1[0] + rng.randint(15, 25))
         inv2 = (rng.randint(110, 130), 0)
         inv2 = (inv2[0], inv2[0] + rng.randint(15, 25))
+        # A guaranteed run of consecutive late fixes (2-3 union dates):
+        # every task exercises the walk-back rule below, not just some.
+        late_start = rng.randint(30, 120)
+        late_run = set(range(late_start, late_start + rng.choice([2, 3])))
         base_rate, fx_rows, fx_info = 1.08, [], {}
         for i, day in enumerate(union_dates):
             base_rate = max(0.7, base_rate * (1 + rng.gauss(0, 0.004)))
             inverted = (inv1[0] <= i < inv1[1]) or (inv2[0] <= i < inv2[1])
             quote = "USDEUR" if inverted else "EURUSD"
             rate = (1 / base_rate) if inverted else base_rate
-            form = rng.choice(["+00:00", "Z", "+01:00", "midnight+01"])
-            hour_utc = rng.choice([7, 12, 15, 17])
+            if i in late_run:
+                form, hour_utc = "Z", 17  # after the 16:00 UTC cut-off
+            elif i == 0:
+                form, hour_utc = "Z", 7  # first fix is always on time
+            else:
+                form = rng.choice(["+00:00", "Z", "+01:00", "midnight+01"])
+                hour_utc = rng.choice([7, 12, 15, 17])
             # Render the instant in the chosen offset form.  The
             # "midnight+01" form is stamped 00:30 local on the NEXT
             # calendar day, which is 23:30 UTC on the trade date itself:
@@ -559,29 +622,53 @@ business days.
         for friday in weekend_source:
             saturday = friday + timedelta(days=1)
             fx_rows.append([f"{_dstr(saturday)}T10:00:00Z", "EURUSD", "9.999999"])
+        # Row order in fx.csv carries no meaning (the memo says so):
+        # fixes must be filed by their UTC instant, not by file position.
+        rng.shuffle(fx_rows)
 
         cutoff = 16
 
-        def effective_rates(use_prev_after_cutoff=True, fix_inversion=True,
+        def effective_rates(fix_inversion=True, method="walkback",
                             key_by_stamp_date=False):
-            out, prev = {}, None
-            for day in union_dates:
-                rate, quote, utc_hour, stamp_date = fx_info[_dstr(day)]
-                eff = rate if quote == "EURUSD" else (1 / rate if fix_inversion else rate)
-                chosen = eff
-                if use_prev_after_cutoff and utc_hour > cutoff and prev is not None:
-                    chosen = prev
-                # Trap variant: file fixes by the stamp's own date string
-                # instead of the UTC date (midnight+01 rows shift a day).
-                out[stamp_date if key_by_stamp_date else _dstr(day)] = chosen
-                prev = eff
+            """Effective USD-per-EUR rate per union date.
+
+            ``walkback`` (the memo rule): a date uses its own fix only
+            when that fix is on time (at or before the cut-off); a late
+            fix is never used, and the date falls back to the most
+            recent ON-TIME fix before it.  ``prev_date`` is the old trap:
+            fall back to the previous date's fix even if it was late.
+            ``same_day`` uses a late fix on its own date.  With
+            ``key_by_stamp_date`` the fixes are (wrongly) filed under
+            the calendar date written in their stamp instead of their
+            UTC date and used at face value with no cut-off test.
+            """
             if key_by_stamp_date:
+                by_stamp = {}
+                for day in union_dates:
+                    rate, quote, _h, stamp_date = fx_info[_dstr(day)]
+                    by_stamp[stamp_date] = rate if quote == "EURUSD" else (
+                        1 / rate if fix_inversion else rate)
                 filled, prev = {}, None
                 for day in union_dates:
-                    if _dstr(day) in out:
-                        prev = out[_dstr(day)]
+                    if _dstr(day) in by_stamp:
+                        prev = by_stamp[_dstr(day)]
                     filled[_dstr(day)] = prev if prev is not None else 1.0
                 return filled
+            out, prev_any, prev_on_time = {}, None, None
+            for day in union_dates:
+                rate, quote, utc_hour, _sd = fx_info[_dstr(day)]
+                eff = rate if quote == "EURUSD" else (1 / rate if fix_inversion else rate)
+                on_time = utc_hour <= cutoff - 1  # stamps are at :30
+                if method == "walkback":
+                    chosen = eff if on_time else prev_on_time
+                elif method == "prev_date":
+                    chosen = eff if on_time else prev_any
+                else:  # same_day
+                    chosen = eff
+                if on_time:
+                    prev_on_time = eff
+                prev_any = eff
+                out[_dstr(day)] = chosen
             return out
 
         us_idx = {t: {_dstr(d): c for d, c in zip(us_dates, us_series[t], strict=True)}
@@ -615,6 +702,12 @@ business days.
         eff = effective_rates()
         navs = nav_series(eff)
         inner_dates = sorted(navs)
+        # The second date of the forced consecutive-late run: the memo
+        # asks for the effective rate on this exact date, which pins
+        # down the walk-back rule (own late fix and previous-date's
+        # late fix are both wrong answers here).
+        late_probe_date = _dstr(union_dates[late_start + 1])
+        fx_detail_field = f"effective_fx_rate_{late_probe_date.replace('-', '')}"
         probe = [inner_dates[len(inner_dates) // 4], inner_dates[len(inner_dates) // 2],
                  inner_dates[(3 * len(inner_dates)) // 4]]
         first, last = inner_dates[0], inner_dates[-1]
@@ -632,6 +725,7 @@ business days.
             "fx_pnl_contribution": round(fx_contrib, 6),
             "dates_dropped_by_alignment": len(union_dates) - len(inner_dates),
             "effective_fx_rate_mid_probe": round(eff[probe[1]], 6),
+            fx_detail_field: round(eff[late_probe_date], 6),
             eu_field: round(eu_sleeve(probe[-1], eff), 6),
             "max_nav_value": round(navs[max_nav_date], 6),
             "max_nav_date": max_nav_date,
@@ -641,6 +735,7 @@ business days.
         core = list(expected)[:3] + [
             "total_return_usd", "fx_pnl_contribution",
             "dates_dropped_by_alignment", "effective_fx_rate_mid_probe",
+            fx_detail_field,
             eu_field, "max_nav_value", "max_nav_date", "nav_max_drawdown"]
 
         def variant_answer(eff_v, calendar="inner"):
@@ -658,6 +753,7 @@ business days.
                     (n[ks[-1]] / n[ks[0]] - 1) - (c[ks[-1]] / c[ks[0]] - 1), 6),
                 "dates_dropped_by_alignment": len(union_dates) - len(ks),
                 "effective_fx_rate_mid_probe": round(eff_v.get(probe[1], 0.0), 6),
+                fx_detail_field: round(eff_v.get(late_probe_date, 0.0), 6),
                 eu_field: round(eu_sleeve(probe[-1], eff_v), 6)
                 if probe[-1] in eu_idx[eu_assets[0]] and probe[-1] in eff_v else 0.0,
                 "max_nav_value": round(n[v_max_date], 6),
@@ -671,7 +767,9 @@ business days.
                 dict.fromkeys(eff, 1.0), "union"),
             "no_inversion_fix": variant_answer(effective_rates(fix_inversion=False)),
             "same_day_fix_after_cutoff": variant_answer(
-                effective_rates(use_prev_after_cutoff=False)),
+                effective_rates(method="same_day")),
+            "previous_date_fix_even_if_late": variant_answer(
+                effective_rates(method="prev_date")),
             "fx_filed_by_stamp_local_date": variant_answer(
                 effective_rates(key_by_stamp_date=True)),
         }
@@ -702,6 +800,7 @@ holdings: {json.dumps(holdings, sort_keys=True)}
 - fx_cutoff_utc_hour: {cutoff}
 - portfolio_calendar: inner (dates present on both exchanges)
 - nav_dates: {", ".join(probe)}
+- fx_detail_date: {late_probe_date}
 
 ## Rules
 1. Convert each European close to USD with the FX fix for the same trade
@@ -710,10 +809,16 @@ holdings: {json.dumps(holdings, sort_keys=True)}
    a stamp just after midnight in a +01:00 form (00:30 local) is 23:30
    UTC on the previous day, so its date string is not its trade date.
    Convert each timestamp to UTC first and file the fix under its UTC
-   date. If the fix instant is after the cut-off, use the previous union
-   date's fix instead. fx.csv also contains weekend prints on dates
-   that are not union trade dates; they are not fixes for any trade
-   date and must be ignored (in particular, never as a previous fix).
+   date. A fix is ON TIME when its UTC instant is at or before 16:00 UTC
+   on its trade date, and LATE when it is after 16:00 UTC. The effective
+   rate for a trade date is: its own fix, if that fix is on time;
+   otherwise the most recent ON-TIME fix on the latest earlier union
+   date that has one (walk back past any number of consecutive late
+   fixes; a late fix is never used, for its own date or any later one).
+   Row order in fx.csv is not chronological and carries no meaning.
+   fx.csv also contains weekend prints on dates that are not union
+   trade dates; they are not fixes for any trade date and must be
+   ignored (in particular, never as a walked-back fix).
 2. The quote column governs direction: EURUSD is USD per EUR (multiply),
    USDEUR is EUR per USD (divide by the rate to get USD). Two separate
    segments of fx.csv are quoted inverted; the quote column is the
@@ -726,7 +831,12 @@ holdings: {json.dumps(holdings, sort_keys=True)}
 5. dates_dropped_by_alignment is the number of union dates (dates on
    either exchange) that the inner calendar drops.
 6. effective_fx_rate_mid_probe is the effective USD-per-EUR rate actually
-   used (after rules 1-2) on the middle nav_date. The EU sleeve value on
+   used (after rules 1-2) on the middle nav_date.
+   {fx_detail_field} is the effective rate applied on fx_detail_date
+   under the same rules: that date's own fix arrived after the cut-off
+   (as did the previous union date's), so the applied rate is the
+   walked-back most recent on-time fix - neither that date's own fix
+   nor the previous date's fix. The EU sleeve value on
    the last nav_date is the sum over European holdings of shares * EUR
    close * that date's effective rate. max_nav_value / max_nav_date are
    the largest inner-calendar NAV and its date. nav_max_drawdown is the
@@ -735,13 +845,26 @@ holdings: {json.dumps(holdings, sort_keys=True)}
    example -0.083 means the NAV fell 8.3% from its running peak; 0.0 only
    if the NAV never falls). Do not report a drawdown as a positive number.
 
+## Allowed problem codes (report exactly these, under exactly these rules)
+The problems array may contain only: currency, timezone, calendar.
+Report a code if and only if its rule is met:
+- currency: at least one fx.csv row has quote USDEUR (the inverted
+  quote segments).
+- timezone: fx.csv timestamps use more than one UTC-offset form, or at
+  least one stamp's local calendar date differs from its UTC date.
+- calendar: the US and EU price files trade on different sets of dates.
+The following are explicitly NOT flagged and must not be reported:
+out_of_order (fx.csv row order is not chronological by design and
+carries no meaning), and the weekend FX prints (they are ignored data
+with no category code; there is no non-trading-print code in this
+task's allowed list). Exchange holidays are absent rows and are the
+calendar code above, not missing.
+
 Report NAV on each nav_date, total_return_usd, fx_pnl_contribution,
-dates_dropped_by_alignment, effective_fx_rate_mid_probe, the EU sleeve
-value, max_nav_value, max_nav_date, nav_max_drawdown and num_inner_days.
-Also report a problems array with the category codes that apply, from:
-currency, timezone, calendar, duplicate, missing, bad_price, split,
-reverse_split, unit_change, out_of_order, adj_close, column_order,
-source_conflict.
+dates_dropped_by_alignment, effective_fx_rate_mid_probe,
+{fx_detail_field}, the EU sleeve
+value, max_nav_value, max_nav_date, nav_max_drawdown and num_inner_days,
+plus the problems array defined above.
 """
         files = {
             "us_prices.csv": _csv(["date", "ticker", "open", "high", "low", "close", "volume"], us_rows),
@@ -823,15 +946,104 @@ source_conflict.
             row[2] = f"{dup_close:.2f}"
             a_rows.append(row)
             dup_keys.append((row[1], row[0]))
-        # Corrections: some effective at report time, some too late.
-        corr = {}
-        corr_keys = rng.sample(conflict_keys, 8) if len(conflict_keys) >= 8 else conflict_keys
-        for t, ds in corr_keys:
-            late = rng.random() < 0.3
-            as_of = f"{_dstr(dates[-1])}T{10 if late else 8:02d}:00:00Z"
+        # Corrections: some effective at report time, some too late;
+        # some keys carry two corrections (the later supersedes the
+        # earlier); as_of stamps use mixed UTC offsets; at least one
+        # corrected date sits in Vendor B's cents segment (correction
+        # closes are in dollars regardless of Vendor B's unit that day).
+        corr_entries: list[dict] = []
+
+        def _as_of(day_str, utc_hour, form=None):
+            """(display stamp in an offset form, normalised UTC)."""
+            form = form or rng.choice(["Z", "+01:00", "-05:00"])
+            if form == "+01:00":
+                display = f"{day_str}T{utc_hour + 1:02d}:00:00+01:00"
+            elif form == "-05:00" and utc_hour >= 5:
+                display = f"{day_str}T{utc_hour - 5:02d}:00:00-05:00"
+            else:
+                display = f"{day_str}T{utc_hour:02d}:00:00Z"
+            return display, f"{day_str}T{utc_hour:02d}:00:00Z"
+
+        def _add_corr(t, ds, val, day_str, utc_hour, form=None):
+            display, utc = _as_of(day_str, utc_hour, form)
+            corr_entries.append({"key": (t, ds), "val": val,
+                                 "display": display, "utc": utc})
+            corr_rows.append([t, ds, f"{val:.2f}", display])
+
+        # Correction keys are chosen so that every correction rule is
+        # exercised: the first key belongs to the probe ticker (it
+        # becomes a probe date below), and at least one key sits in
+        # Vendor B's cents segment (correction closes stay in dollars).
+        date_index = {_dstr(d): i for i, d in enumerate(dates)}
+        cents_keys = [k for k in conflict_keys if date_index[k[1]] >= switch_idx]
+        chosen: list = []
+        probe_pool = [k for k in conflict_keys if k[0] == tickers[0]]
+        if probe_pool:
+            chosen.append(rng.choice(probe_pool))
+        if cents_keys:
+            cents_choice = rng.choice(cents_keys)
+            if cents_choice not in chosen:
+                chosen.append(cents_choice)
+        pool = [k for k in conflict_keys if k not in chosen]
+        target = min(8, len(conflict_keys))
+        if len(pool) >= target - len(chosen):
+            chosen += rng.sample(pool, target - len(chosen))
+        corr_keys = chosen
+        # Guarantee a conflicted key with Vendor A merely indicative and
+        # no correction, so the median path is exercised on a conflict.
+        if not any(k not in corr_keys and a_status.get(k) == "indicative"
+                   for k in conflict_keys):
+            cands = [k for k in conflict_keys if k not in corr_keys]
+            if cands:
+                t0, ds0 = rng.choice(cands)
+                a_status[(t0, ds0)] = "indicative"
+                for row in a_rows:
+                    if row[0] == ds0 and row[1] == t0:
+                        row[3] = "indicative"
+                        break
+        superseded = 0
+        for idx, (t, ds) in enumerate(corr_keys):
+            late = rng.random() < 0.3 and idx > 0  # first key never late
             val = round(truth[t][dates.index(datetime.strptime(ds, "%Y-%m-%d"))] * 1.01, 2)
-            corr_rows.append([t, ds, f"{val:.2f}", as_of])
-            corr[(t, ds)] = (val, as_of)
+            if not late and superseded < 3:
+                # An earlier correction for the same key, superseded by
+                # the later one below.  Both stamps fall on the same UTC
+                # day in offset forms chosen so that string order and
+                # instant order DISAGREE: the earlier instant (05:00Z)
+                # displays as 06:00+01:00 while the later one (08:00Z)
+                # displays as 03:00-05:00, so comparing the stamp
+                # strings as written crowns the superseded value.
+                _add_corr(t, ds, round(val * 0.97, 2),
+                          _dstr(dates[-1]), 5, form="+01:00")
+                superseded += 1
+                _add_corr(t, ds, val, _dstr(dates[-1]), 8, form="-05:00")
+            else:
+                _add_corr(t, ds, val, _dstr(dates[-1]), 10 if late else 8)
+        rng.shuffle(corr_rows)
+
+        def corr_best(key, mode="latest"):
+            """Winning correction value for a key, or None.
+
+            ``latest``: latest as_of instant at or before report_time
+            (the memo rule).  ``first``: earliest such correction (trap).
+            ``lexicographic``: largest as_of string as written (trap:
+            mixed offsets make string order differ from instant order).
+            """
+            entries = [e for e in corr_entries
+                       if e["key"] == key and e["utc"] <= report_time]
+            if not entries:
+                return None
+            if mode == "first":
+                return min(entries, key=lambda e: e["utc"])["val"]
+            if mode == "lexicographic":
+                return max(entries, key=lambda e: e["display"])["val"]
+            return max(entries, key=lambda e: e["utc"])["val"]
+
+        corr = {}
+        for t, ds in corr_keys:
+            best = corr_best((t, ds))
+            if best is not None:
+                corr[(t, ds)] = (best, report_time)
 
         # Exact precedence for the correct answer, matching the memo.
         def resolve_correct():
@@ -874,9 +1086,14 @@ source_conflict.
 
         series, common, dd, trough = metrics(resolved)
         probe_ticker = tickers[0]
+        # Keep the corrected probe dates (the first carries a superseded
+        # correction pair by construction); only top up if short.
         probe_dates = [ds for (t, ds) in corr_keys if t == probe_ticker][:2]
-        if len(probe_dates) < 2:
-            probe_dates = [common[len(common) // 3], common[(2 * len(common)) // 3]]
+        for cand in (common[len(common) // 3], common[(2 * len(common)) // 3]):
+            if len(probe_dates) >= 2:
+                break
+            if cand not in probe_dates:
+                probe_dates.append(cand)
         expected = {
             "resolved_by_correction": paths["correction"],
             "resolved_by_vendor_a": paths["vendor_a"],
@@ -916,6 +1133,41 @@ source_conflict.
                                     else (avail[0] + avail[-1]) / 2)
                         if conflicted:
                             p["median"] += 1
+            elif mode in ("first_correction_wins", "asof_string_compare"):
+                # Correct precedence, but the wrong correction wins.
+                res, paths_tmp = {}, {"correction": 0, "vendor_a": 0, "median": 0}
+                sel = "first" if mode == "first_correction_wins" else "lexicographic"
+                for key in sorted(set(a_val) | set(b_val)):
+                    av, bv = a_val.get(key), b_val.get(key)
+                    best = corr_best(key, sel)
+                    conflicted = best is not None or (
+                        av is not None and bv is not None and abs(av - bv) > 0.01)
+                    if best is not None:
+                        res[key] = best
+                        if conflicted:
+                            paths_tmp["correction"] += 1
+                    elif av is not None and a_status.get(key) != "indicative":
+                        res[key] = av
+                        if conflicted:
+                            paths_tmp["vendor_a"] += 1
+                    else:
+                        avail = sorted(v for v in (av, bv) if v is not None)
+                        res[key] = (avail[len(avail) // 2] if len(avail) % 2
+                                    else (avail[0] + avail[-1]) / 2)
+                        if conflicted:
+                            paths_tmp["median"] += 1
+                s, c, d2, tr = metrics(res)
+                out = {"resolved_by_correction": paths_tmp["correction"],
+                       "resolved_by_vendor_a": paths_tmp["vendor_a"],
+                       "resolved_by_median": paths_tmp["median"],
+                       "reconciled_total_return": round(s[-1] - 1, 6),
+                       "max_drawdown": round(d2, 6),
+                       "max_drawdown_trough_date": tr,
+                       "num_resolved_days": len(c)}
+                for d in probe_dates:
+                    out[f"resolved_close_{probe_ticker}_{d.replace('-', '')}"] = \
+                        round(res.get((probe_ticker, d), 0.0), 6)
+                return out
             else:  # ignore_indicative
                 res = {}
                 p = {"correction": 0, "vendor_a": 0, "median": 0}
@@ -951,7 +1203,9 @@ source_conflict.
 
         variants = {"vendor_a_always_no_corrections": variant("vendor_a_always"),
                     "no_corrections": variant("no_corrections"),
-                    "ignore_indicative_flag": variant("ignore_indicative")}
+                    "ignore_indicative_flag": variant("ignore_indicative"),
+                    "first_correction_wins": variant("first_correction_wins"),
+                    "asof_string_compare": variant("asof_string_compare")}
         problems = ["source_conflict_vendor_disagreement", "unit_change_vendor_b_unit_column",
                     "duplicate_vendor_a_rows"]
         # The memo's missing rule, applied to the key exactly as stated:
@@ -974,7 +1228,11 @@ probe_dates: {", ".join(probe_dates)}
 Files: vendor_a.csv (date,ticker,close,status; closes in dollars),
 vendor_b.csv (date,ticker,close,unit; the unit column states dollars or
 cents for that row - one vendor switches units mid-file, stated in the
-column), corrections.csv (ticker,date,close,as_of).
+column), corrections.csv (ticker,date,close,as_of). Correction closes
+are always in dollars, including for dates where Vendor B's unit is
+cents. corrections.csv can contain several rows for the same
+ticker-date (one supersedes another) and its rows are not in as_of
+order; its as_of stamps use mixed UTC offsets.
 
 ## Resolution order (per ticker and date, over the union of vendor dates)
 0. Within a vendor file, a repeated ticker-date row keeps its first
@@ -982,8 +1240,13 @@ column), corrections.csv (ticker,date,close,as_of).
 1. Convert Vendor B closes using its unit column (cents means /100).
 2. A conflicted key is one with an applicable correction, or with both
    vendors present and converted closes differing by more than 0.01.
-3. If a correction exists with as_of <= report_time, the correction with
-   the latest such as_of wins (path: correction).
+3. If corrections exist with as_of <= report_time, the one with the
+   latest such as_of INSTANT wins and supersedes every earlier
+   correction for that key (path: correction). Compare as_of instants
+   in UTC: the stamps use mixed offset forms, so convert each stamp to
+   UTC before comparing it with report_time or with other stamps;
+   comparing the stamp strings as written gives the wrong winner on
+   some keys. (report_time above is stated in UTC.)
 4. Else, if Vendor A reports the date with status other than indicative,
    Vendor A wins (path: vendor_a).
 5. Else the median of the available converted vendor closes wins (path:
@@ -1039,11 +1302,17 @@ the problems array defined above.
             rets = [rng.gauss(0.0004, 0.012) for _ in range(rows - 1)]
             adj[t] = _closes(rng, rng.uniform(30, 120), [0.0] + rets)
         events = []  # (ticker, date_str, A, B)
-        ev1 = (assets[0], date_strs[rng.randint(50, 80)], 2, 1)
+        # The first ticker splits twice: a forward split, then later a
+        # reverse split on the same ticker (with cash-in-lieu).  The
+        # split table additionally carries a 1-for-1 no-op row, added
+        # below, which is not an event at all.
+        ev1 = (assets[0], date_strs[rng.randint(45, 65)], 2, 1)
         ev2 = (assets[1], date_strs[rng.randint(100, 140)], 1, 3)
-        events = [ev1, ev2]
+        ev3 = (assets[0], date_strs[rng.randint(125, 150)], 1, 3)
+        events = [ev1, ev2, ev3]
         if rng.random() < 0.5:
-            events.append((assets[2], date_strs[rng.randint(90, 150)], 3, 1))
+            events.append((assets[2], date_strs[rng.randint(90, 120)], 3, 1))
+        noop_row = (assets[2], date_strs[rng.randint(30, 160)], 1, 1)
         prices = {t: list(adj[t]) for t in assets}
         for t, ds, a, b in events:
             idx = date_strs.index(ds)
@@ -1068,14 +1337,21 @@ the problems array defined above.
         trades.append((date_strs[7], assets[2], 90))
         cross_date = date_strs[date_strs.index(ev1[1]) - 2]
         trades.append((cross_date, assets[0], 37))
+        # Partial sell between the first ticker's two splits (splits a
+        # FIFO lot), a buy settling across its reverse split, and a
+        # partial sell after it.
         trades.append((date_strs[90], assets[0], -40))
+        cross2_date = date_strs[date_strs.index(ev3[1]) - 2]
+        trades.append((cross2_date, assets[0], 25))
+        trades.append((date_strs[165], assets[0], -30))
         trades.append((date_strs[120], assets[1], 60))
         trades.append((date_strs[150], assets[1], -50))
         trades.append((date_strs[160], assets[2], -30))
         trade_rows = [[ds, t, sh, f"{price_at[t][ds]:.2f}"]
                       for ds, t, sh in trades]
 
-        def simulate(entitlement="settlement", apply_splits=True, lifo=False):
+        def simulate(entitlement="settlement", apply_splits=True, lifo=False,
+                     first_event_only=False):
             lots = {t: [] for t in assets}  # [shares, cost_per_share, settlement]
             cash_lieu, realised = 0.0, 0.0
             remaining_cost = 0.0
@@ -1083,8 +1359,17 @@ the problems array defined above.
             trades_by_date = {}
             for ds, t, sh in trades:
                 trades_by_date.setdefault(ds, []).append((t, sh))
+            use_events = events
+            if first_event_only:
+                # Wrong-method variant: only each ticker's earliest event
+                # is applied, later events on the same ticker are missed.
+                use_events, seen = [], set()
+                for t, ds, a, b in sorted(events, key=lambda e: e[1]):
+                    if t not in seen:
+                        seen.add(t)
+                        use_events.append((t, ds, a, b))
             event_by_date = {}
-            for t, ds, a, b in events:
+            for t, ds, a, b in use_events:
                 event_by_date.setdefault(ds, []).append((t, a, b))
             twr_index, prev_value = None, None
             for ds in date_strs:
@@ -1166,6 +1451,7 @@ the problems array defined above.
             "split_not_applied_to_holdings": simulate(apply_splits=False),
             "settlement_ignored_booked_only": simulate(entitlement="booked"),
             "lifo_instead_of_fifo": simulate(lifo=True),
+            "second_split_ignored": simulate(first_event_only=True),
         }
         problems = []
         for _t, ds, a, b in events:
@@ -1173,7 +1459,13 @@ the problems array defined above.
         rows_out = []
         for t in assets:
             rows_out += _price_rows(t, dates, prices[t], rng)
+        # The 1-for-1 no-op row is written to the table like any other
+        # row (and the table is shuffled: row order carries no meaning),
+        # but per the memo it is not an event at all.
         split_rows = [[ds, t, f"{a}-for-{b}"] for t, ds, a, b in events]
+        split_rows.append([noop_row[1], noop_row[0],
+                           f"{noop_row[2]}-for-{noop_row[3]}"])
+        rng.shuffle(split_rows)
         spec = """# Methodology memo - split-table holdings (T4)
 
 Files: prices.csv (unadjusted closes), splits.csv (date,ticker,ratio
@@ -1182,6 +1474,14 @@ the ex-date), trades.csv (date,ticker,shares,price; shares signed,
 executions at that price). Positions are in shares as booked.
 
 ## Rules
+0. The split table may list more than one event for the same ticker
+   (for example a forward split followed later by a reverse split);
+   every real event applies, in date order, to the lots held at the
+   time, and fractional cash-in-lieu is computed at each event. The
+   table's row order carries no meaning: sort by date. A row whose
+   ratio is 1-for-1 (A == B) is a no-op corporate-action placeholder:
+   it is not an event, it must not adjust any lot, it is not counted
+   in num_splits, and it does not count for either problem code below.
 1. A lot is a buy trade. Its settlement date is the booked date plus 2
    business days on the prices calendar. A split applies at the ex-date
    open only to lots whose settlement date is before the ex-date: their
@@ -1213,6 +1513,7 @@ Split-table rows DO count as problems, as follows:
   A > B (a forward split).
 - reverse_split: splits.csv contains at least one row whose ratio
   A-for-B has A < B.
+- A 1-for-1 row (A == B) counts for neither code (rule 0 above).
 Report both codes when the table contains both kinds of row, exactly
 one when it contains only one kind, and neither if the table were empty.
 No other category code may be reported for this task.
@@ -1565,7 +1866,13 @@ shrinkage delta, sectors and the 1-based rebalance row indices).
 
 Report weights and share counts at the first rebalance, turnover at each
 rebalance (the actual turnover of step 4/5), num_rebalances, final_nav,
-max_drawdown of the daily NAV path and cash_left.
+max_drawdown of the daily NAV path and cash_left. The
+turnover_by_rebalance field is a JSON object whose keys are the strings
+"1", "2", ... in rebalance order (the first rebalance is "1") and whose
+values are the actual turnover fractions for those rebalances, each
+rounded to 6 decimals: for example {"1": 0.982143, "2": 0.169956}.
+weights_first_rebalance and shares_first_rebalance are likewise JSON
+objects keyed by ticker.
 """
         files = {
             "prices.csv": _csv(["date", "ticker", "open", "high", "low", "close", "volume"], rows_out),

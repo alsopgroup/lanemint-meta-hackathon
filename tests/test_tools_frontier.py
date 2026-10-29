@@ -467,3 +467,171 @@ class TestCli:
         with pytest.raises(SystemExit) as excinfo:
             generate_tasks.main()
         assert excinfo.value.code == 1
+
+
+# ------------------------------------------------------- re-pilot fixes
+
+class TestRepilotFixes:
+    """Round-3 fixes from the seed-7201 re-pilot (Spark 1.3 24/30,
+    Spark Open 21/30, Glimmer 12/30, with T1/T3/T4 saturated)."""
+
+    def test_t2_walkback_consecutive_late_and_allowed_codes(self, dev_sets):
+        import csv as csv_mod
+        from datetime import UTC
+        from datetime import datetime as dt
+
+        def read(task_dir, name):
+            return list(csv_mod.DictReader(open(task_dir / name)))
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_fx_calendar":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                # Item 2: exact allowed codes, and the two non-codes
+                # (out-of-order rows, weekend prints) explicitly excluded.
+                assert "may contain only: currency, timezone, calendar" in spec
+                assert "out_of_order" in spec and "NOT flagged" in spec
+                assert "weekend" in spec and "no category code" in spec
+                # Item 1: the walk-back rule is stated explicitly.
+                assert "most recent ON-TIME fix" in spec
+                assert "a late fix is never used" in spec
+
+                union = sorted(
+                    {r["date"] for r in read(task_dir, "us_prices.csv")}
+                    | {r["date"] for r in read(task_dir, "eu_prices.csv")})
+                by_utc = {}
+                for r in read(task_dir, "fx.csv"):
+                    instant = dt.fromisoformat(
+                        r["timestamp"].replace("Z", "+00:00")).astimezone(UTC)
+                    by_utc[instant.strftime("%Y-%m-%d")] = (r, instant)
+                # Walk the union dates: on-time flag, late runs, and the
+                # walked-back rate (most recent on-time fix, converted).
+                on_time, converted = {}, {}
+                prev_on_time, run, max_run = None, 0, 0
+                walked = {}
+                for ds in union:
+                    row, instant = by_utc[ds]
+                    rate = float(row["rate"])
+                    eff = rate if row["quote"] == "EURUSD" else 1 / rate
+                    late = (instant.hour * 60 + instant.minute) > 16 * 60
+                    on_time[ds] = not late
+                    converted[ds] = eff
+                    if late:
+                        run += 1
+                        max_run = max(max_run, run)
+                        walked[ds] = prev_on_time
+                    else:
+                        run = 0
+                        prev_on_time = eff
+                # Every task exercises consecutive late fixes.
+                assert max_run >= 2, task["id"]
+                # The key's detail rate is the walked-back rate on a
+                # date whose own fix AND the previous date's fix are
+                # both late - not either late fix itself.
+                import re as re_mod
+                detail = re_mod.search(r"fx_detail_date: (\S+)", spec).group(1)
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                field = f"effective_fx_rate_{detail.replace('-', '')}"
+                prev_ds = union[union.index(detail) - 1]
+                assert not on_time[detail] and not on_time[prev_ds]
+                assert abs(expected[field] - walked[detail]) < 1e-6
+                # ... and it is not a copy of either late fix (the
+                # reseeding gate separately enforces >50x-tolerance
+                # separation from the wrong-method answers).
+                assert abs(expected[field] - converted[detail]) > 1e-6
+                assert abs(expected[field] - converted[prev_ds]) > 1e-6
+
+    def test_t5_turnover_format_stated_and_keyed(self, dev_sets):
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_portfolio_construction":
+                    continue
+                spec = (root / task["data_dir"] / "spec.md").read_text()
+                # Item 3: the expected format is stated in the memo.
+                assert "turnover_by_rebalance field is a JSON object" in spec
+                assert '"1", "2", ... in rebalance order' in spec
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                turnovers = expected["turnover_by_rebalance"]
+                assert list(turnovers) == [
+                    str(i + 1) for i in range(expected["num_rebalances"])]
+                assert all(isinstance(v, float) for v in turnovers.values())
+
+    def test_t3_superseding_corrections_mixed_offsets(self, dev_sets):
+        import csv as csv_mod
+        from collections import Counter
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_reconciliation":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                assert "supersedes every earlier" in spec
+                assert "comparing the stamp strings as written" in spec
+                corr = list(csv_mod.DictReader(
+                    open(task_dir / "corrections.csv")))
+                # At least one key carries two corrections (one
+                # supersedes the other) in every task.
+                counts = Counter((r["ticker"], r["date"]) for r in corr)
+                assert max(counts.values()) >= 2, task["id"]
+                # The superseded pair is stamped in +01:00 / -05:00
+                # forms, so string order and instant order disagree.
+                stamps = [r["as_of"] for r in corr]
+                assert any(s.endswith("+01:00") for s in stamps)
+                assert any(s.endswith("-05:00") for s in stamps)
+                # At least one corrected key sits in Vendor B's cents
+                # segment (correction closes remain dollars there).
+                b_unit = {(r["ticker"], r["date"]): r["unit"]
+                          for r in csv_mod.DictReader(
+                              open(task_dir / "vendor_b.csv"))}
+                assert any(b_unit[k] == "cents" for k in counts), task["id"]
+
+    def test_t4_multiple_splits_and_noop_row(self, dev_sets):
+        import csv as csv_mod
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_split_holdings":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                assert "1-for-1" in spec and "no-op" in spec
+                assert "not counted" in spec
+                rows = list(csv_mod.DictReader(open(task_dir / "splits.csv")))
+                real = [r for r in rows if r["ratio"] != "1-for-1"]
+                # The no-op row is present in the table but is not an
+                # event: num_splits counts only real rows.
+                assert len(rows) == len(real) + 1, task["id"]
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert expected["num_splits"] == len(real)
+                # One ticker splits twice: forward 2-for-1, then a
+                # reverse 1-for-3 later in date order.
+                first = sorted((r for r in real if r["ticker"] == "SPL1"),
+                               key=lambda r: r["date"])
+                assert [r["ratio"] for r in first] == ["2-for-1", "1-for-3"]
+
+    def test_t1_second_benchmark_and_recent_window(self, dev_sets):
+        import csv as csv_mod
+
+        for root in dev_sets.values():
+            for task in _tasks(root):
+                if task["type"] != "tools_frontier_convention_risk":
+                    continue
+                task_dir = root / task["data_dir"]
+                spec = (task_dir / "spec.md").read_text()
+                assert "benchmark=BMK2" in spec
+                assert "window_returns=60" in spec
+                tickers = {r["ticker"] for r in csv_mod.DictReader(
+                    open(task_dir / "prices.csv"))}
+                assert "BMK2" in tickers
+                expected = json.loads(
+                    (root / "answers" / f"{task['id']}_answer.json").read_text())
+                assert {"rolling3_max_beta", "rolling3_max_beta_end_date",
+                        "recent_vol_last_60"} <= set(expected)
+                assert {"wrong_benchmark", "full_sample_instead_of_recent"} \
+                    <= set(task["trap_variants"])

@@ -150,6 +150,28 @@ def _solve_t1(task_dir: Path) -> dict:
     answer["rolling2_max_beta"] = round(best2, 6)
     answer["rolling2_max_beta_end_date"] = series[asset2][0][best2_end + 1]
 
+    # Third rolling section, against the benchmark named in its own
+    # convention-table row (BMK2, not the first benchmark).
+    m3 = re.search(r"- rolling_beta3: asset=(\w+); benchmark=(\w+); window=(\d+); step=(\d+)", spec)
+    asset3, bench3, win3, step3 = m3.group(1), m3.group(2), int(m3.group(3)), int(m3.group(4))
+    ra3 = _returns(series[asset3][1], "simple")
+    rb3 = _returns(series[bench3][1], "simple")
+    best3, best3_end = None, None
+    for start in range(0, len(ra3) - win3 + 1, step3):
+        value = beta(ra3[start:start + win3], rb3[start:start + win3])
+        if best3 is None or value > best3:
+            best3, best3_end = value, start + win3 - 1
+    answer["rolling3_max_beta"] = round(best3, 6)
+    answer["rolling3_max_beta_end_date"] = series[asset3][0][best3_end + 1]
+
+    # Recent-window volatility: only the last window_returns returns of
+    # the calendar-filtered series, under this row's own convention.
+    mr = re.search(r"- recent_vol: asset=(\w+); window_returns=(\d+); return=(\w+); "
+                   r"periods_per_year=(\d+); ddof=(\d+)", spec)
+    recent = _returns(series[mr.group(1)][1], mr.group(3))[-int(mr.group(2)):]
+    answer[f"recent_vol_last_{mr.group(2)}"] = round(
+        _std(recent, int(mr.group(5))) * math.sqrt(int(mr.group(4))), 6)
+
     md = re.search(r"- downside_vol: asset=(\w+); return=(\w+); periods_per_year=(\d+)", spec)
     d_rets = _returns(series[md.group(1)][1], md.group(2))
     answer["downside_volatility"] = round(
@@ -206,6 +228,7 @@ def _solve_t2(task_dir: Path) -> dict:
     spec = _spec(task_dir)
     cutoff = int(re.search(r"fx_cutoff_utc_hour: (\d+)", spec).group(1))
     probe = re.search(r"nav_dates: (.+)", spec).group(1).split(", ")
+    detail_date = re.search(r"fx_detail_date: (\S+)", spec).group(1)
     holdings = {k: float(v) for k, v in json.loads(
         re.search(r"^holdings: (\{.*\})$", spec, re.MULTILINE).group(1)).items()}
     us = _price_map(task_dir, "us_prices.csv")
@@ -224,7 +247,10 @@ def _solve_t2(task_dir: Path) -> dict:
         instant = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
         return instant.astimezone(UTC)
 
-    effective, prev = {}, None
+    # Memo rule: a date uses its own fix only when the fix instant is at
+    # or before the cut-off; otherwise walk back to the most recent
+    # ON-TIME fix (a late fix is never used).  Row order is meaningless.
+    effective, prev_on_time = {}, None
     fx_by_utc_date = {}
     for row in fx_rows:
         fx_by_utc_date[to_utc(row["timestamp"]).strftime("%Y-%m-%d")] = row
@@ -232,9 +258,11 @@ def _solve_t2(task_dir: Path) -> dict:
         row = fx_by_utc_date[ds]
         rate = float(row["rate"])
         eff = rate if row["quote"] == "EURUSD" else 1 / rate
-        effective[ds] = prev if (to_utc(row["timestamp"]).hour > cutoff
-                                 and prev is not None) else eff
-        prev = eff
+        instant = to_utc(row["timestamp"])
+        on_time = (instant.hour * 60 + instant.minute) <= cutoff * 60
+        effective[ds] = eff if on_time else prev_on_time
+        if on_time:
+            prev_on_time = eff
 
     def nav(eff_map, ds):
         total = 0.0
@@ -260,6 +288,8 @@ def _solve_t2(task_dir: Path) -> dict:
             total - (navs_const[inner_dates[-1]] / navs_const[inner_dates[0]] - 1), 6),
         "dates_dropped_by_alignment": len(union_dates) - len(inner_dates),
         "effective_fx_rate_mid_probe": round(effective[probe[1]], 6),
+        f"effective_fx_rate_{detail_date.replace('-', '')}": round(
+            effective[detail_date], 6),
         f"eu_sleeve_usd_{probe[-1].replace('-', '')}": round(eu_last, 6),
         "max_nav_value": round(navs[max_date], 6),
         "max_nav_date": max_date,
@@ -307,16 +337,28 @@ def _solve_t3(task_dir: Path) -> dict:
     b_val, _ = first_wins(
         _read_csv(task_dir, "vendor_b.csv"),
         lambda r: float(r["close"]) / 100 if r["unit"] == "cents" else float(r["close"]))
+    # Corrections: compare as_of instants in UTC (mixed offset forms),
+    # keep only those at or before report_time, latest instant wins and
+    # supersedes earlier corrections for the same key.
+    from datetime import UTC as _UTC
+
+    def _instant(stamp):
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(_UTC)
+
+    report_instant = _instant(report_time)
     corr = {}
     for row in _read_csv(task_dir, "corrections.csv"):
         key = (row["ticker"], row["date"])
-        if key not in corr or row["as_of"] > corr[key][1]:
-            corr[key] = (float(row["close"]), row["as_of"])
+        when = _instant(row["as_of"])
+        if when > report_instant:
+            continue
+        if key not in corr or when > corr[key][1]:
+            corr[key] = (float(row["close"]), when)
 
     resolved, paths = {}, {"correction": 0, "vendor_a": 0, "median": 0}
     for key in sorted(set(a_val) | set(b_val)):
         av, bv = a_val.get(key), b_val.get(key)
-        applicable = key in corr and corr[key][1] <= report_time
+        applicable = key in corr  # already filtered to <= report_time
         conflicted = applicable or (av is not None and bv is not None and abs(av - bv) > 0.01)
         if applicable:
             resolved[key] = corr[key][0]
@@ -395,6 +437,10 @@ def _solve_t4(task_dir: Path) -> dict:
     problems = []
     for row in _read_csv(task_dir, "splits.csv"):
         a, b = (float(x) for x in row["ratio"].split("-for-"))
+        # Memo: a 1-for-1 row is a no-op - ignore it entirely (not an
+        # event, not counted in num_splits, not a problem).
+        if a == b:
+            continue
         events.setdefault(row["date"], []).append((row["ticker"], a, b))
         problems.append("split" if a > b else "reverse_split")
     trades_by_date: dict[str, list] = {}
