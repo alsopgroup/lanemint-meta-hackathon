@@ -469,6 +469,14 @@ function renderLeaderboard(data) {
     return `<div class="lb-cell${totalCell ? ' lb-rate' : ''}"><span class="lb-frac${totalCell ? ' lb-pct' : ''}">${totalCell ? pctTxt(v) : `${v.passed}/${v.total}`}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(v), v.passed ? 2 : 0)}%"></div></div>${ci}</div>`;
   };
   const notes = [];
+  // A partial run is labelled with how far it got (e.g. "partial ·
+  // 36 of 90 tasks"), derived from its status, its own total, and the
+  // board's full task count — never presented as a complete result.
+  const partialLabel = (e, board) => {
+    if (e.status !== 'partial') return '';
+    const ran = (e.total && e.total.total) ?? (e.tools_on && e.tools_on.total) ?? (e.tools_off && e.tools_off.total);
+    return ran != null && board.tasks ? `partial · ${ran} of ${board.tasks} tasks` : 'partial run';
+  };
   $('leaderboardBody').innerHTML = boards.map(board => {
     const fams = board.families || [];
     const isCompare = board.entries.some(e => e.tools_off || e.tools_on);
@@ -481,16 +489,18 @@ function renderLeaderboard(data) {
     const head = board.headline ? `<div class="lb-board-head"><h3>${esc(board.title)}</h3><p>${esc(board.headline)}</p></div>` : `<div class="lb-board-head"><h3>${esc(board.title)}</h3></div>`;
     if (isCompare) {
       const rows = board.entries.map(e => {
-        const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
+        const pLabel = partialLabel(e, board);
+        const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${pLabel ? ` · <span class="lb-chip lb-chip-partial">${esc(pLabel)}</span>` : e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
         if (e.status === 'coming_soon') return `<div class="lb-row lb-row-compare lb-pending">${nameCell}<div class="lb-cell lb-dim">—</div><div class="lb-cell"><span class="lb-chip lb-chip-soon">Coming soon</span></div></div>`;
         const off = e.tools_off ? (e.tools_off.passed == null ? resultCell(e.tools_off, true) : `<div class="lb-cell"><span class="lb-frac">${e.tools_off.passed}/${e.tools_off.total} (${pctTxt(e.tools_off)})</span><div class="lb-mini-track"><div class="lb-mini-fill lb-mini-off" style="width:${Math.max(famPct(e.tools_off), e.tools_off.passed ? 2 : 0)}%"></div></div></div>`) : '<div class="lb-cell lb-dim">—</div>';
         const on = e.tools_on ? (e.tools_on.passed == null ? resultCell(e.tools_on, true) : `<div class="lb-cell lb-rate"><span class="lb-frac lb-pct">${e.tools_on.passed}/${e.tools_on.total} (${pctTxt(e.tools_on)})</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(e.tools_on), e.tools_on.passed ? 2 : 0)}%"></div></div></div>`) : '<div class="lb-cell lb-dim">—</div>';
-        return `<div class="lb-row lb-row-compare">${nameCell}${off}${on}</div>`;
+        return `<div class="lb-row lb-row-compare${pLabel ? ' lb-partial' : ''}">${nameCell}${off}${on}</div>`;
       }).join('');
       return `<div class="lb-board">${head}<div class="lb-row lb-row-compare lb-head"><div class="lb-model">Model</div><div class="lb-cell">Tools off</div><div class="lb-cell">Tools on</div></div>${rows}</div>`;
     }
     const rows = board.entries.map(e => {
-      const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
+      const pLabel = partialLabel(e, board);
+      const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${pLabel ? ` · <span class="lb-chip lb-chip-partial">${esc(pLabel)}</span>` : e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
       if (e.status === 'coming_soon') {
         return `<div class="lb-row lb-row-tf lb-pending">${nameCell}` +
           fams.map(() => '<div class="lb-cell lb-dim">—</div>').join('') +
@@ -503,8 +513,12 @@ function renderLeaderboard(data) {
         return `<div class="lb-cell"><span class="lb-frac">${v.passed}/${v.total}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(v), v.passed ? 2 : 0)}%"></div></div></div>`;
       }).join('');
       const t = e.total;
-      const totalCell = t ? `<div class="lb-cell"><span class="lb-frac lb-total">${t.passed}/${t.total}</span></div>${resultCell(t, true)}` : '<div class="lb-cell lb-dim">—</div><div class="lb-cell lb-dim">—</div>';
-      return `<div class="lb-row lb-row-tf">${nameCell}${famCells}${totalCell}</div>`;
+      // Partial runs show their partial label in place of a pass
+      // rate / CI over the full board, so 0/36 cannot read as 0/90.
+      const totalCell = !t ? '<div class="lb-cell lb-dim">—</div><div class="lb-cell lb-dim">—</div>'
+        : pLabel ? `<div class="lb-cell"><span class="lb-frac lb-total">${t.passed}/${t.total}</span><span class="lb-ci lb-partial-note">${esc(pLabel)}</span></div><div class="lb-cell"><span class="lb-chip lb-chip-partial">${esc(pLabel)}</span></div>`
+        : `<div class="lb-cell"><span class="lb-frac lb-total">${t.passed}/${t.total}</span></div>${resultCell(t, true)}`;
+      return `<div class="lb-row lb-row-tf${pLabel ? ' lb-partial' : ''}">${nameCell}${famCells}${totalCell}</div>`;
     }).join('');
     return `<div class="lb-board">${head}<div class="lb-row lb-row-tf lb-head"><div class="lb-model">Model</div>` +
       fams.map(f => `<div class="lb-cell"><span class="lb-fam">${esc(f.id)} · ${esc(f.label)}</span>${f.type ? `<span class="lb-fam-type">${esc(f.type)}</span>` : ''}</div>`).join('') +

@@ -202,6 +202,9 @@ button{font:inherit}
 .lb-dim{color:var(--text-3)}
 .lb-chip{display:inline-block;padding:1px 8px;border-radius:85px;box-shadow:inset 0 0 0 1px var(--line-1);font-family:var(--font-mono);font-size:11px;color:var(--text-2);white-space:nowrap}
 .lb-chip-soon{box-shadow:inset 0 0 0 1px var(--accent);color:var(--accent)}
+.lb-chip-partial{box-shadow:inset 0 0 0 1px var(--warning-500);color:var(--warning-500)}
+.lb-partial{background:color-mix(in oklch,var(--warning-500) 6%,transparent)}
+.lb-partial-note{color:var(--warning-500)}
 .lb-pending{opacity:.75}
 .lb-board{padding:16px 0 8px}
 .lb-board+.lb-board{border-top:1px solid var(--line-1);margin-top:8px}

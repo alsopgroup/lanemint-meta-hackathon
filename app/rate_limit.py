@@ -103,6 +103,10 @@ class LiveCallGuard:
                 return False, retry, "rate limit: too many requests this hour"
             if self._daily_calls >= daily_max:
                 return False, 3600, "daily live-call cap reached"
+            # A 0 reserve means cost is unknown (pricing not configured
+            # in muse_client): spend then stays 0 and only the call-
+            # count limits above bound usage. A budget of 0 is still a
+            # hard block, because 0 spend already reaches it.
             if self._daily_spend_usd >= daily_budget:
                 return False, 3600, "daily live-call budget reached"
             if reserve_usd > 0 and (

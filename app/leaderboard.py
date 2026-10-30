@@ -85,7 +85,7 @@ def _summarise_result(value: object, where: str) -> dict:
 
 
 def _load_entries(raw_entries: object, family_ids: list[str],
-                  board_id: str) -> list[dict]:
+                  board_id: str, board_tasks: int | None = None) -> list[dict]:
     if not isinstance(raw_entries, list) or not raw_entries:
         raise ValueError(f"board {board_id!r}: 'entries' must be a "
                          "non-empty list")
@@ -100,10 +100,21 @@ def _load_entries(raw_entries: object, family_ids: list[str],
                              f"{entry['id']!r}")
         seen_ids.add(entry["id"])
         status = entry.get("status")
-        if status not in ("complete", "coming_soon"):
+        if status not in ("complete", "partial", "coming_soon"):
             raise ValueError(
-                f"entry {entry['id']!r}: status must be 'complete' or "
-                f"'coming_soon'")
+                f"entry {entry['id']!r}: status must be 'complete', "
+                f"'partial', or 'coming_soon'")
+        if status == "partial":
+            # A partial run must say how far it got: an explicit total
+            # covering fewer tasks than the full board. Without that,
+            # a truncated run could be mistaken for a complete one.
+            _, partial_total = _check_count(
+                entry.get("total"), f"entry {entry['id']!r} total")
+            if isinstance(board_tasks, int) and not partial_total < board_tasks:
+                raise ValueError(
+                    f"entry {entry['id']!r}: partial runs must cover "
+                    f"fewer than the board's {board_tasks} tasks, "
+                    f"got total={partial_total!r}")
         out = {"id": entry["id"], "name": entry["name"],
                "provider": entry.get("provider", ""),
                "status": status, "notes": list(entry.get("notes", []))}
@@ -156,7 +167,7 @@ def _load_entries(raw_entries: object, family_ids: list[str],
             out["total"] = None
         else:
             raise ValueError(
-                f"entry {entry['id']!r}: complete entries need "
+                f"entry {entry['id']!r}: complete/partial entries need "
                 f"'families', 'total', or tools_off/tools_on counts")
         entries.append(out)
     return entries
@@ -185,7 +196,8 @@ def _load_board(raw_board: object, index: int) -> dict:
              "notes": list(raw_board.get("notes", [])),
              "families": families,
              "entries": _load_entries(raw_board.get("entries"),
-                                      family_ids, board_id)}
+                                      family_ids, board_id,
+                                      raw_board.get("tasks"))}
     # Legacy single-board files nested their metadata under "benchmark".
     benchmark = raw_board.get("benchmark")
     if isinstance(benchmark, dict):

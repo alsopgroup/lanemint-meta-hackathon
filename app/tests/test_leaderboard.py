@@ -113,6 +113,9 @@ def test_tools_frontier_board_published_results():
     assert answer["total"]["total"] == 90
 
     trace = entries["muse-glimmer-30b-trace-lora"]
+    # Only 36 of the board's 90 tasks ran: it is a partial run, never
+    # a complete one.
+    assert trace["status"] == "partial"
     assert trace["scope"] == "partial run"
     assert trace["total"]["passed"] == 0
     assert trace["total"]["total"] == 36
@@ -162,11 +165,30 @@ def test_loader_recomputes_totals(tmp_path):
     lambda p: p["entries"][0].update({"families": {"F1": {"passed": 1, "total": 2}}}),  # missing family
     lambda p: p["entries"].append(dict(p["entries"][0])),  # duplicate id
     lambda p: p["entries"][0].update({"status": "done"}),  # bad status
+    lambda p: p["entries"][0].update({"status": "partial"}),  # partial, no total
     lambda p: p.update({"entries": []}),                    # no entries
 ])
 def test_loader_rejects_bad_data(tmp_path, mutate):
     payload = _valid_payload()
     mutate(payload)
+    with pytest.raises(ValueError):
+        load_leaderboard(_write(tmp_path, payload))
+
+
+def test_loader_rejects_partial_covering_full_board(tmp_path):
+    # A "partial" run that covered every board task is a contradiction.
+    payload = {
+        "boards": [{
+            "id": "b", "tasks": 4,
+            "families": [{"id": "F1"}, {"id": "F2"}],
+            "entries": [
+                {"id": "a", "name": "A", "status": "partial",
+                 "total": {"passed": 1, "total": 4},
+                 "families": {"F1": {"passed": 1, "total": 2},
+                              "F2": {"passed": 0, "total": 2}}},
+            ],
+        }],
+    }
     with pytest.raises(ValueError):
         load_leaderboard(_write(tmp_path, payload))
 
@@ -191,7 +213,26 @@ def test_leaderboard_endpoint():
         "passed": 63, "total": 90, "pct": 70, "ci95": [60, 78],
         "approx": False, "display": None}
     assert tools_frontier["max_turns"] == 12
+    trace = {e["id"]: e for e in tools_frontier["entries"]}[
+        "muse-glimmer-30b-trace-lora"]
+    assert trace["status"] == "partial"
+    assert trace["total"]["total"] == 36
+    assert tools_frontier["tasks"] == 90
     assert "api_key" not in resp.text.lower()
+
+
+def test_frontend_renders_partial_runs_clearly():
+    # The UI must label a partial run with how far it got (e.g.
+    # "partial · 36 of 90 tasks"), driven by the entry's status —
+    # not colour alone and never as a complete result.
+    app_dir = Path(__file__).resolve().parent.parent
+    js = (app_dir / "static" / "js" / "app.js").read_text()
+    css = (app_dir / "static" / "css" / "app.css").read_text()
+    assert "e.status !== 'partial'" in js
+    assert "partial · ${ran} of ${board.tasks} tasks" in js
+    assert "lb-chip-partial" in js
+    assert ".lb-chip-partial" in css
+    assert ".lb-partial" in css
 
 
 def test_index_has_leaderboard_and_mode_indicator():

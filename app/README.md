@@ -32,9 +32,12 @@ tiers: the **frontier** tier as a tools-off vs tools-on comparison
 saturates once tools are on) and the harder **`tools_frontier`** tier
 with tools on at the default 12 turns (90 tasks; Spark 1.3 at
 63/90 / 70%, ahead of Spark Open at 57% and Glimmer 30B base at 30%).
-Approximate rates (e.g. Glimmer base tools-on at ~85%) and the
-partial trace-LoRA run (0/36) are shown exactly as labelled in the
-data — no exact count is invented for them. All numbers live in the
+Approximate rates (e.g. Glimmer base tools-on at ~85%) are shown
+exactly as labelled in the data — no exact count is invented for
+them. The trace-LoRA run on `tools_frontier` is marked
+`status: "partial"` in the data (0/36, not a complete run) and the
+page renders it as "partial · 36 of 90 tasks" in place of a full-board
+pass rate, so it cannot be read as a completed 0/90 result. All numbers live in the
 single data file `data/leaderboard.json` — the frontend hard-codes
 nothing. To publish new results, edit that file only: per-family pass
 counts are summed server-side by `leaderboard.py`, which also
@@ -73,6 +76,18 @@ which fits a single Railway replica but is not a distributed limiter):
   `LIVE_DAILY_MAX_CALLS`, `LIVE_DAILY_BUDGET_USD`. A value of `0`
   is a hard block (no live calls), not unlimited. Violations get
   `429` + `Retry-After`.
+- **Pricing is never hard-coded.** Spend estimates use only the
+  optional server-side variables `META_INPUT_COST_PER_MTOK` and
+  `META_OUTPUT_COST_PER_MTOK` (cost per million tokens, in the same
+  currency as `LIVE_DAILY_BUDGET_USD`; set both from your provider's
+  current pricing — no figures are recorded in this repo). If either
+  variable is unset or invalid, cost is treated as **unknown**: no
+  spend is estimated or reserved, the spend-based part of the budget
+  guard simply does not engage, and the per-IP plus daily call-count
+  limits (`LIVE_DAILY_MAX_CALLS`) still bound live usage. A budget
+  explicitly set to `0` remains a hard block even then. To enforce a
+  spend ceiling as well as a call-count ceiling, set both pricing
+  variables (and `LIVE_DAILY_BUDGET_USD`) on the server.
 - **The daily counters reset on every redeploy** (and at UTC
   midnight): they live in process memory, so a redeploy restarts the
   daily budget from zero. Keep that in mind when redeploying often;
@@ -124,6 +139,11 @@ The live Muse call is stubbed in tests; no key or network is needed.
    - Optional limit tuning: `LIVE_RATE_PER_MINUTE`,
      `LIVE_RATE_PER_HOUR`, `LIVE_DAILY_MAX_CALLS`,
      `LIVE_DAILY_BUDGET_USD`
+   - `META_INPUT_COST_PER_MTOK` and `META_OUTPUT_COST_PER_MTOK` —
+     optional (set both, from your provider's current pricing, to
+     enforce the spend-based daily budget; if unset, cost is unknown
+     and only the call-count limits apply — see "Pricing is never
+     hard-coded" above). Never commit real values.
 7. Deploy, then verify in the deployment details/logs that the
    healthcheck on `/healthz` was actually applied (not just that the
    port answers), and confirm `https://<your-domain>/healthz` returns
