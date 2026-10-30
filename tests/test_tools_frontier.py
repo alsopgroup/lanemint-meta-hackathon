@@ -1020,8 +1020,7 @@ class TestOptimisationHardening:
     """Round-5 hardening (seed 7601 pilot: Spark 1.3 24/30 with T5 at
     0/6 and T1-T4 saturated): every family gains a field that needs a
     small constrained optimisation or a stateful multi-period
-    simulation, the T5 optimiser is certified exact, and the tier's
-    default turn budget rises to 16."""
+    simulation, and the T5 optimiser is certified exact."""
 
     def test_t5_key_weights_match_independent_solver(self, dev_sets):
         import csv as csv_mod
@@ -1289,7 +1288,7 @@ class TestOptimisationHardening:
                 assert variant["rebalance_trade_shares"] != \
                     key["rebalance_trade_shares"], task["id"]
 
-    def test_tools_frontier_default_max_turns_16(self, monkeypatch, tmp_path):
+    def test_tools_frontier_default_max_turns_12(self, monkeypatch, tmp_path):
         import sys
 
         from src import runner as runner_mod
@@ -1304,7 +1303,7 @@ class TestOptimisationHardening:
             def run_all_tasks(self, **kwargs):
                 return []
 
-        for tier, want in (("tools_frontier", 16), ("frontier", 12)):
+        for tier, want in (("tools_frontier", 12), ("frontier", 12)):
             FakeToolRunner.seen = {}
             seen = FakeToolRunner.seen
             monkeypatch.setattr(tool_mod, "ToolTaskRunner", FakeToolRunner)

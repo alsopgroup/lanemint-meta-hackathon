@@ -26,15 +26,23 @@ Railway service** — it does not import anything from the repo root.
 
 ## Leaderboard
 
-The page's Leaderboard section shows held-out **frontier** results
-(pooled over seeds 42/1001/1002, 96 tasks for every completed model,
-including Glimmer 30B base at 0/96; the fine-tuned Glimmer LoRA slot
-shows "Coming soon"). All numbers live in the single data file
-`data/leaderboard.json` — the frontend hard-codes nothing. To publish
-new results, edit that file only: per-family pass counts are summed
-server-side by `leaderboard.py`, which also recomputes the pass rate
-and Wilson 95% interval and validates the file's shape on load
-(`GET /api/leaderboard` returns 500 rather than serving bad data).
+The page's Leaderboard section shows held-out results for both
+tiers: the **frontier** tier as a tools-off vs tools-on comparison
+(96 tasks; tools take Muse Spark 1.3 from 50% to 99%, so that tier
+saturates once tools are on) and the harder **`tools_frontier`** tier
+with tools on at the default 12 turns (90 tasks; Spark 1.3 at
+63/90 / 70%, ahead of Spark Open at 57% and Glimmer 30B base at 30%).
+Approximate rates (e.g. Glimmer base tools-on at ~85%) and the
+partial trace-LoRA run (0/36) are shown exactly as labelled in the
+data — no exact count is invented for them. All numbers live in the
+single data file `data/leaderboard.json` — the frontend hard-codes
+nothing. To publish new results, edit that file only: per-family pass
+counts are summed server-side by `leaderboard.py`, which also
+recomputes the pass rate and Wilson 95% interval and validates the
+file's shape on load (`GET /api/leaderboard` returns 500 rather than
+serving bad data). Demo mode works without `META_API_KEY`: without a
+key the page runs its clearly labelled simulated mode and the
+leaderboard still renders from the data file.
 No run-cost or spend figures are shown anywhere in the public app;
 the daily budget below is an internal server guard only and is never
 returned to the browser.

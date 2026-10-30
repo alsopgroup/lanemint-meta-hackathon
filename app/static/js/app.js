@@ -448,48 +448,76 @@ function renderScore() {
   $('stepScore').innerHTML = html;
 }
 
-/* ---------------- Leaderboard (held-out frontier results) ----------------
+/* ---------------- Leaderboard (held-out results, both tiers) ----------------
    All numbers come from GET /api/leaderboard, which serves the single
    data file app/data/leaderboard.json (totals and Wilson intervals are
-   recomputed server-side). Nothing is hard-coded here. */
+   recomputed server-side). Nothing is hard-coded here. The file holds
+   two boards: the frontier tools-off/tools-on comparison and the
+   tools_frontier per-family board (tools on, 12 turns). Approximate
+   rates (~85%) and partial runs are rendered exactly as labelled in
+   the data — no exact count is invented for them. */
 function renderLeaderboard(data) {
-  const fams = (data.benchmark && data.benchmark.families) || [];
+  const boards = data.boards && data.boards.length ? data.boards
+    : [{ id: 'legacy', title: data.title || 'Leaderboard', families: (data.benchmark && data.benchmark.families) || [], note: data.benchmark && data.benchmark.note, notes: (data.benchmark && data.benchmark.notes) || [], entries: data.entries || [] }];
   const famPct = f => Math.round(100 * f.passed / f.total);
   const pctTxt = t => (Number.isInteger(t.pct) ? t.pct : t.pct.toFixed(1)) + '%';
-  const rows = data.entries.map(e => {
-    const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
-    if (e.status === 'coming_soon') {
-      return `<div class="lb-row lb-pending">${nameCell}` +
-        fams.map(() => '<div class="lb-cell lb-dim">—</div>').join('') +
-        `<div class="lb-cell lb-dim">—</div><div class="lb-cell"><span class="lb-chip lb-chip-soon">Coming soon</span></div></div>`;
-    }
-    const famCells = fams.map(f => {
-      const v = e.families && e.families[f.id];
-      if (!v) return '<div class="lb-cell lb-dim">—</div>';
-      return `<div class="lb-cell"><span class="lb-frac">${v.passed}/${v.total}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(v), v.passed ? 2 : 0)}%"></div></div></div>`;
-    }).join('');
-    const t = e.total;
-    return `<div class="lb-row">${nameCell}${famCells}` +
-      `<div class="lb-cell"><span class="lb-frac lb-total">${t.passed}/${t.total}</span></div>` +
-      `<div class="lb-cell lb-rate"><span class="lb-pct">${pctTxt(t)}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(Math.round(t.pct), t.passed ? 2 : 0)}%"></div></div><span class="lb-ci">95% CI ${t.ci95[0]}–${t.ci95[1]}%</span></div></div>`;
-  }).join('');
-  $('leaderboardBody').innerHTML =
-    `<div class="lb-row lb-head"><div class="lb-model">Model</div>` +
-    fams.map(f => `<div class="lb-cell"><span class="lb-fam">${esc(f.id)} · ${esc(f.label)}</span><span class="lb-fam-type">${esc(f.type)}</span></div>`).join('') +
-    `<div class="lb-cell">Total</div><div class="lb-cell">Pass rate</div></div>` + rows;
-  const seeds = (data.benchmark && data.benchmark.seeds) || [];
-  if (seeds.length) $('lbEyebrow').textContent = 'Leaderboard · frontier tier · held-out seeds ' + seeds.join(' / ');
-  if (data.updated) $('lbUpdated').textContent = 'held-out run · ' + data.updated;
+  const resultCell = (v, totalCell) => {
+    if (!v) return '<div class="lb-cell lb-dim">—</div>';
+    if (v.display && v.passed == null) return `<div class="lb-cell"><span class="lb-frac">${esc(v.display)}</span></div>`;
+    if (v.approx) return `<div class="lb-cell lb-rate"><span class="lb-pct">${esc(v.display || pctTxt(v))}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(Math.round(v.pct), 2)}%"></div></div><span class="lb-ci">approximate, as reported</span></div>`;
+    const ci = totalCell && v.ci95 ? `<span class="lb-ci">95% CI ${v.ci95[0]}–${v.ci95[1]}%</span>` : '';
+    return `<div class="lb-cell${totalCell ? ' lb-rate' : ''}"><span class="lb-frac${totalCell ? ' lb-pct' : ''}">${totalCell ? pctTxt(v) : `${v.passed}/${v.total}`}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(v), v.passed ? 2 : 0)}%"></div></div>${ci}</div>`;
+  };
   const notes = [];
-  if (data.benchmark && data.benchmark.note) notes.push(data.benchmark.note);
-  if (data.benchmark && data.benchmark.notes) data.benchmark.notes.forEach(n => notes.push(n));
-  data.entries.forEach(e => (e.notes || []).forEach(n => notes.push(e.name + ': ' + n)));
+  $('leaderboardBody').innerHTML = boards.map(board => {
+    const fams = board.families || [];
+    const isCompare = board.entries.some(e => e.tools_off || e.tools_on);
+    if (board.note) notes.push(board.note);
+    (board.notes || []).forEach(n => notes.push(n));
+    board.entries.forEach(e => (e.notes || []).forEach(n => {
+      const line = e.name + ': ' + n;
+      if (!notes.includes(line)) notes.push(line);
+    }));
+    const head = board.headline ? `<div class="lb-board-head"><h3>${esc(board.title)}</h3><p>${esc(board.headline)}</p></div>` : `<div class="lb-board-head"><h3>${esc(board.title)}</h3></div>`;
+    if (isCompare) {
+      const rows = board.entries.map(e => {
+        const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
+        if (e.status === 'coming_soon') return `<div class="lb-row lb-row-compare lb-pending">${nameCell}<div class="lb-cell lb-dim">—</div><div class="lb-cell"><span class="lb-chip lb-chip-soon">Coming soon</span></div></div>`;
+        const off = e.tools_off ? (e.tools_off.passed == null ? resultCell(e.tools_off, true) : `<div class="lb-cell"><span class="lb-frac">${e.tools_off.passed}/${e.tools_off.total} (${pctTxt(e.tools_off)})</span><div class="lb-mini-track"><div class="lb-mini-fill lb-mini-off" style="width:${Math.max(famPct(e.tools_off), e.tools_off.passed ? 2 : 0)}%"></div></div></div>`) : '<div class="lb-cell lb-dim">—</div>';
+        const on = e.tools_on ? (e.tools_on.passed == null ? resultCell(e.tools_on, true) : `<div class="lb-cell lb-rate"><span class="lb-frac lb-pct">${e.tools_on.passed}/${e.tools_on.total} (${pctTxt(e.tools_on)})</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(e.tools_on), e.tools_on.passed ? 2 : 0)}%"></div></div></div>`) : '<div class="lb-cell lb-dim">—</div>';
+        return `<div class="lb-row lb-row-compare">${nameCell}${off}${on}</div>`;
+      }).join('');
+      return `<div class="lb-board">${head}<div class="lb-row lb-row-compare lb-head"><div class="lb-model">Model</div><div class="lb-cell">Tools off</div><div class="lb-cell">Tools on</div></div>${rows}</div>`;
+    }
+    const rows = board.entries.map(e => {
+      const nameCell = `<div class="lb-model"><span class="lb-model-name">${esc(e.name)}</span><span class="lb-model-sub">${esc(e.provider || '')}${e.scope ? ` · <span class="lb-chip">${esc(e.scope)}</span>` : ''}</span></div>`;
+      if (e.status === 'coming_soon') {
+        return `<div class="lb-row lb-row-tf lb-pending">${nameCell}` +
+          fams.map(() => '<div class="lb-cell lb-dim">—</div>').join('') +
+          `<div class="lb-cell lb-dim">—</div><div class="lb-cell"><span class="lb-chip lb-chip-soon">Coming soon</span></div></div>`;
+      }
+      const famCells = fams.map(f => {
+        const v = e.families && e.families[f.id];
+        if (!v) return '<div class="lb-cell lb-dim">—</div>';
+        if (v.passed == null) return `<div class="lb-cell"><span class="lb-frac">${esc(v.display || '—')}</span></div>`;
+        return `<div class="lb-cell"><span class="lb-frac">${v.passed}/${v.total}</span><div class="lb-mini-track"><div class="lb-mini-fill" style="width:${Math.max(famPct(v), v.passed ? 2 : 0)}%"></div></div></div>`;
+      }).join('');
+      const t = e.total;
+      const totalCell = t ? `<div class="lb-cell"><span class="lb-frac lb-total">${t.passed}/${t.total}</span></div>${resultCell(t, true)}` : '<div class="lb-cell lb-dim">—</div><div class="lb-cell lb-dim">—</div>';
+      return `<div class="lb-row lb-row-tf">${nameCell}${famCells}${totalCell}</div>`;
+    }).join('');
+    return `<div class="lb-board">${head}<div class="lb-row lb-row-tf lb-head"><div class="lb-model">Model</div>` +
+      fams.map(f => `<div class="lb-cell"><span class="lb-fam">${esc(f.id)} · ${esc(f.label)}</span>${f.type ? `<span class="lb-fam-type">${esc(f.type)}</span>` : ''}</div>`).join('') +
+      `<div class="lb-cell">Total</div><div class="lb-cell">Pass rate</div></div>${rows}</div>`;
+  }).join('');
+  $('lbEyebrow').textContent = 'Leaderboard · frontier + tools_frontier · held-out tasks';
+  if (data.updated) $('lbUpdated').textContent = 'held-out run · ' + data.updated;
   $('leaderboardNotes').innerHTML = notes.map(n => `<p>${esc(n)}</p>`).join('');
 }
 
 function loadLeaderboard() {
   fetch('/api/leaderboard').then(r => r.ok ? r.json() : null).then(data => {
-    if (data && data.entries) renderLeaderboard(data);
+    if (data && (data.boards || data.entries)) renderLeaderboard(data);
     else $('leaderboardBody').innerHTML = '<p class="lb-loading">Leaderboard unavailable right now.</p>';
   }).catch(() => { $('leaderboardBody').innerHTML = '<p class="lb-loading">Leaderboard unavailable right now.</p>'; });
 }

@@ -76,9 +76,9 @@
   <div class="section-inner">
     <div class="benchmark-head">
       <div class="benchmark-intro">
-        <span class="eyebrow" id="lbEyebrow">Leaderboard · frontier tier · held-out seeds</span>
-        <h2>The frontier tier is the real test.</h2>
-        <p id="lbIntro">Held-out frontier results, pooled across seeds the models never trained on. A task passes only when the problem set is exactly right and the core numbers are within tolerance.</p>
+        <span class="eyebrow" id="lbEyebrow">Leaderboard · frontier + tools_frontier · held-out tasks</span>
+        <h2>Tools saturate one tier. The harder tier brings headroom back.</h2>
+        <p id="lbIntro">Held-out results for both tiers. On the frontier tier, tools take Muse Spark 1.3 from 50% to 99%. On the harder tools_frontier tier — tools on at the default 12 turns — Spark 1.3 is back to 70%, with a clear spread across models. Most of its misses are running out of turns on multi-stage stateful work, and fine-tuning Glimmer on answers/traces hurt it once tools were on.</p>
       </div>
       <span class="badge badge-md badge-mono"><span class="badge-dot" style="background:var(--status-info)"></span><span id="lbUpdated">held-out run</span></span>
     </div>

@@ -26,7 +26,8 @@ Held-out frontier results, pooled over the evaluation seeds **42, 1001 and 1002*
 | Muse Spark 1.3 | Meta API | 13/24 | 17/24 | 14/24 | 4/24 | **48/96** | **50% (40–60%)** |
 | Muse Spark Open | Fireworks serverless | 1/24 | 0/24 | 1/24 | 0/24 | **2/96** | **2% (1–7%)** |
 | Muse Glimmer 30B (base) | Fireworks | 0/24 | 0/24 | 0/24 | 0/24 | **0/96** | **0% (0–4%)** |
-| Muse Glimmer 30B + LoRA (fine-tuned) | Fireworks | — | — | — | — | — | Coming soon |
+| Muse Glimmer 30B + trace LoRA | Fireworks | — | — | — | — | **0/96** | **0%** |
+| Muse Glimmer 30B + answer LoRA | Fireworks | — | — | — | — | **0/96** | **0%** |
 
 These numbers are read from [`app/data/leaderboard.json`](app/data/leaderboard.json), which is the **single source of truth** — the live demo's leaderboard renders that file, and this table is kept in sync with it. Updating the results means editing that one file (totals and intervals are recomputed and validated server-side).
 
@@ -34,6 +35,42 @@ Honest footnotes (also shown in the app):
 
 - Muse Spark Open: 5 of its tasks failed on API errors (dropped connections, 1 timeout) and were counted as failures.
 - Spark Open's and Glimmer 30B (base)'s seed-42 F1 results used the earlier 3-window version of F1; all other runs use the current 4-window version.
+
+## Results
+
+### Chart 1 — Frontier tier (96 held-out tasks), tools off vs tools on
+
+**Headline: tools take Spark 1.3 from 50% to 99%, so the tier saturates once tools are on.**
+
+| Model | Tools off | Tools on |
+|---|---|---|
+| Muse Spark 1.3 | 48/96 (50%) | 95/96 (99%) |
+| Muse Spark Open | 2/96 (2%) | 95/96 (99%) |
+| Muse Glimmer 30B (base) | 0/96 (0%) | ~85% |
+| Glimmer 30B + trace LoRA | 0/96 | ~15% |
+| Glimmer 30B + answer LoRA | 0/96 | 0% |
+
+![Chart 1 — Frontier tier, tools off vs tools on: tools take Muse Spark 1.3 from 50% to 99%](docs/assets/leaderboard-frontier-tools.png)
+
+`~` marks an approximate figure, as reported. With tools on, both Spark models reach 95/96 on this tier, while Glimmer 30B (base) rises from 0% to roughly 85%.
+
+### Chart 2 — `tools_frontier` tier (90 held-out tasks, tools on, 12 turns)
+
+**Headline: the harder tool tier brings Spark 1.3 back to 70%, with a clear spread across models (70 / 57 / 30).**
+
+| Model | Pass | T1 hedge | T2 FX min-var | T3 risk parity | T4 split/FIFO | T5 constraint stack |
+|---|---|---|---|---|---|---|
+| Muse Spark 1.3 | 63/90 (70%) | 18/18 | 10/18 | 11/18 | 18/18 | 6/18 |
+| Muse Spark Open | 51/90 (57%) | 18/18 | 15/18 | 5/18 | 12/18 | 1/18 |
+| Muse Glimmer 30B (base) | 27/90 (30%) | 14/18 | 1/18 | 0/18 | 12/18 | 0/18 |
+| Glimmer + answer LoRA | 0/90 (0%) | 0 | 0 | 0 | 0 | 0 |
+| Glimmer + trace LoRA | 0/36 (partial run) | 0 | 0 | 0 | 0 | 0 |
+
+![Chart 2 — tools_frontier tier, tools on at 12 turns: Muse Spark 1.3 passes 63/90 (70%)](docs/assets/leaderboard-tools-frontier.png)
+
+Most Spark 1.3 misses (25 of 27) are running out of turns on multi-stage stateful work. Per-family cells show tasks passed per family; the trace LoRA row is a partial run.
+
+**Secondary finding: fine-tuning Glimmer on answers/traces hurt it once tools were on.** On the frontier tier with tools on, Glimmer 30B (base) reaches roughly 85%, compared with roughly 15% for the trace LoRA and 0% for the answer LoRA; on `tools_frontier`, both LoRA variants score 0% against 30% for the base model.
 
 ## How Meta tools are used
 
@@ -135,7 +172,7 @@ python -m src.finetune_prep --tier frontier --seeds 3001-3002 --count 4 --val-se
 python -m src.finetune --train-file finetune_data/train.jsonl --validation-file finetune_data/validation.jsonl --dry-run
 ```
 
-**Status:** LoRA results are **pending** — training now runs through Fireworks' Serverless Training API, and the fine-tuned row of the leaderboard stays "Coming soon" rather than showing placeholder numbers. After training, the protocol is to evaluate on the same locked 96-task set at low reasoning effort and tear the deployment down immediately afterwards.
+**Status:** LoRA results are reported in [Results](#results) above. With tools on, both LoRA variants underperform Glimmer 30B (base) — fine-tuning on answers/traces hurt Glimmer once tools were available.
 
 ## The demo app
 
@@ -147,7 +184,7 @@ The app in `app/` (deployed at https://meta.lanemint.com) lets judges try the ea
 - **API failures count as failures.** Spark Open's 2% includes 5 tasks lost to API errors (dropped connections, 1 timeout) on the serving side, not wrong answers.
 - **F1 changed mid-flight.** Spark Open's and Glimmer base's seed-42 F1 results predate the current 4-window F1 (they used a 3-window version); all other results use the current version. Pooled totals mix the two only for those two models' seed-42 slice.
 - **One run per model.** Headline numbers are single pooled runs at low reasoning effort, not averages over repeated runs; the Wilson intervals are the honest precision statement.
-- **Fine-tune pending.** Glimmer + LoRA has not been evaluated yet — training runs through Fireworks' Serverless Training API and results are pending — so the central open question, how much of the Spark/Glimmer gap is trainable, is still open.
+- **Fine-tuning hurt with tools on.** The answer- and trace-LoRA variants underperform Glimmer 30B (base) once tools are available (see [Results](#results)); how much of the Spark/Glimmer gap is trainable remains open.
 - **Demo vs benchmark.** The interactive demo exercises the easy-tier checker for accessibility; the graded frontier tier is run through the CLI pipeline above, not in the browser.
 
 ## License and credits

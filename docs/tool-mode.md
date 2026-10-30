@@ -89,11 +89,9 @@ run:
 python -m src.scorer output/tool-meta/results.json tasks_frontier/answers
 ```
 
-Turn budget: `--max-turns` defaults to 12, except for
-`--tier tools_frontier`, where it defaults to **16** — those tasks
-chain several computation stages (data repair, optimisation,
-multi-period simulation) and regularly need the extra turns. Pass
-`--max-turns` explicitly to override either default.
+Turn budget: `--max-turns` defaults to **12** for every tier,
+including `--tier tools_frontier`. Pass `--max-turns` explicitly to
+override the default.
 
 Useful flags: `--tool-protocol text` makes the model compute by
 writing one fenced python code block per turn (the harness replies in
