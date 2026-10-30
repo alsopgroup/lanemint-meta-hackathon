@@ -169,7 +169,10 @@ async def api_check(request: Request) -> JSONResponse:
     # Reserve the worst-case cost up front: the reservation is held
     # against the daily budget for the whole call, so billed-but-failed
     # calls (e.g. malformed model output) cannot slip past the cap.
-    reserve_usd = worst_case_cost_usd(csv_text)
+    # When pricing is not configured the cost is unknown (None): no
+    # spend is reserved and the guard enforces call-count limits only.
+    worst_case = worst_case_cost_usd(csv_text)
+    reserve_usd = worst_case if worst_case is not None else 0.0
     allowed, retry_after, reason = guard.acquire(_client_ip(request), reserve_usd)
     if not allowed:
         return JSONResponse(

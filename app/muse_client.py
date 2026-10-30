@@ -8,6 +8,7 @@ benchmark answers. The API key is only ever read here, on the server.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -21,9 +22,14 @@ MAX_CSV_ROWS = 500
 MAX_CSV_COLS = 20
 DEFAULT_MAX_TOKENS = 4096
 HARD_MAX_TOKENS = 8192
-# Meta API list pricing used only to estimate daily spend for the cap.
-INPUT_USD_PER_TOKEN = 1.25 / 1_000_000
-OUTPUT_USD_PER_TOKEN = 4.25 / 1_000_000
+# Optional per-token pricing for the daily spend guard, supplied only
+# via the environment (never hard-coded in the repo): both
+# META_INPUT_COST_PER_MTOK and META_OUTPUT_COST_PER_MTOK must be set to
+# valid non-negative numbers (cost per million tokens, in the budget
+# currency) for spend to be estimable. When either is unset or invalid,
+# cost is unknown (None): no spend estimate is produced and the guard
+# in rate_limit.py enforces its call-count limits only — except that a
+# budget explicitly set to 0 remains a hard block there. See README.md.
 
 _SYSTEM_PROMPT = """You are a financial data quality analyst. You inspect CSV market data and report data quality problems.
 
@@ -72,19 +78,55 @@ def validate_csv(csv_text: str) -> tuple[str, int]:
     return "\n".join(lines), len(lines) - 1
 
 
-def worst_case_cost_usd(csv_text: str) -> float:
+def _cost_per_mtok() -> tuple[float, float] | None:
+    """(input, output) cost per million tokens from the environment.
+
+    Returns None — cost unknown — unless both pricing variables are
+    set to finite, non-negative numbers. No pricing is ever embedded
+    in the repo, and invalid values fail closed to "unknown" rather
+    than being guessed.
+    """
+    raw_input = os.getenv("META_INPUT_COST_PER_MTOK")
+    raw_output = os.getenv("META_OUTPUT_COST_PER_MTOK")
+    if raw_input is None or raw_output is None:
+        return None
+    try:
+        input_cost = float(raw_input)
+        output_cost = float(raw_output)
+    except ValueError:
+        return None
+    # float() accepts "nan"/"inf", which would poison budget maths.
+    if not math.isfinite(input_cost) or not math.isfinite(output_cost) \
+            or input_cost < 0 or output_cost < 0:
+        return None
+    return input_cost, output_cost
+
+
+def _cost_usd(input_tokens: int, output_tokens: int) -> float | None:
+    """Cost of a token pair, or None when pricing is not configured."""
+    pricing = _cost_per_mtok()
+    if pricing is None:
+        return None
+    input_per_mtok, output_per_mtok = pricing
+    return (
+        input_tokens * input_per_mtok / 1_000_000
+        + output_tokens * output_per_mtok / 1_000_000
+    )
+
+
+def worst_case_cost_usd(csv_text: str) -> float | None:
     """Upper-bound cost of one check_csv call, for budget reservation.
 
     Input tokens are estimated at ~4 chars/token over the whole prompt
     (system prompt + header + CSV); output is capped at _max_tokens().
     With max_retries=0 there is exactly one billed attempt per call.
+    Returns None when pricing is not configured via the environment:
+    cost is then unknown and callers must not reserve spend against
+    the daily budget (call-count limits still apply).
     """
     prompt_chars = len(_SYSTEM_PROMPT) + len(csv_text) + 64
     input_tokens = max(1, prompt_chars // 4)
-    return (
-        input_tokens * INPUT_USD_PER_TOKEN
-        + _max_tokens() * OUTPUT_USD_PER_TOKEN
-    )
+    return _cost_usd(input_tokens, _max_tokens())
 
 
 def _max_tokens() -> int:
@@ -233,13 +275,13 @@ def check_csv(filename: str, csv_text: str) -> dict:
         prompt_tokens = max(1, len(truncated) // 4)
     if completion_tokens is None:
         completion_tokens = max(1, len(content) // 4)
-    estimated_cost = (
-        prompt_tokens * INPUT_USD_PER_TOKEN
-        + completion_tokens * OUTPUT_USD_PER_TOKEN
-    )
+    # None when pricing is not configured: cost is unknown, not zero.
+    estimated_cost = _cost_usd(prompt_tokens, completion_tokens)
     return {
         "findings": findings,
         "latency_ms": latency_ms,
         "model": model_name,
-        "estimated_cost_usd": round(estimated_cost, 6),
+        "estimated_cost_usd": (
+            round(estimated_cost, 6) if estimated_cost is not None else None
+        ),
     }

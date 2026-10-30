@@ -143,7 +143,7 @@
           "id": "muse-glimmer-30b-trace-lora",
           "name": "Glimmer + trace LoRA",
           "provider": "Fireworks",
-          "status": "complete",
+          "status": "partial",
           "scope": "partial run",
           "total": {"passed": 0, "total": 36},
           "families": {

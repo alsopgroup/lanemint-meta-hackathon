@@ -189,13 +189,88 @@ def _live_full_usage_create(self, **kwargs):  # noqa: ANN001, ANN202
                           "usage": usage})()
 
 
+def _set_synthetic_pricing(monkeypatch):
+    """Synthetic test-only pricing (not a real provider price)."""
+    monkeypatch.setenv("META_INPUT_COST_PER_MTOK", "1000000")
+    monkeypatch.setenv("META_OUTPUT_COST_PER_MTOK", "1000000")
+
+
+def _unset_pricing(monkeypatch):
+    monkeypatch.delenv("META_INPUT_COST_PER_MTOK", raising=False)
+    monkeypatch.delenv("META_OUTPUT_COST_PER_MTOK", raising=False)
+
+
+def test_pricing_unset_means_cost_unknown(monkeypatch):
+    _unset_pricing(monkeypatch)
+    # No pricing is embedded in the module, and cost is not guessed.
+    assert not hasattr(muse_client, "INPUT_USD_PER_TOKEN")
+    assert not hasattr(muse_client, "OUTPUT_USD_PER_TOKEN")
+    assert muse_client.worst_case_cost_usd(CSV) is None
+
+
+@pytest.mark.parametrize("raw", ["not-a-number", "", "-1", "nan", "inf"])
+def test_pricing_invalid_means_cost_unknown(monkeypatch, raw):
+    monkeypatch.setenv("META_INPUT_COST_PER_MTOK", raw)
+    monkeypatch.setenv("META_OUTPUT_COST_PER_MTOK", "1000000")
+    assert muse_client.worst_case_cost_usd(CSV) is None
+
+
+def test_pricing_partially_set_means_cost_unknown(monkeypatch):
+    monkeypatch.setenv("META_INPUT_COST_PER_MTOK", "1000000")
+    monkeypatch.delenv("META_OUTPUT_COST_PER_MTOK", raising=False)
+    assert muse_client.worst_case_cost_usd(CSV) is None
+
+
+def test_pricing_read_from_environment(monkeypatch):
+    _set_synthetic_pricing(monkeypatch)
+    # Synthetic pricing is one unit per token, so the worst case is
+    # simply the estimated input tokens plus the output cap.
+    input_tokens = max(
+        1, (len(muse_client._SYSTEM_PROMPT) + len(CSV) + 64) // 4)
+    assert muse_client.worst_case_cost_usd(CSV) == (
+        input_tokens + muse_client.DEFAULT_MAX_TOKENS)
+
+
+def test_check_csv_cost_unknown_without_pricing(monkeypatch):
+    _unset_pricing(monkeypatch)
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    _stub_openai(monkeypatch, _live_full_usage_create)
+    result = muse_client.check_csv("x.csv", CSV)
+    assert result["estimated_cost_usd"] is None
+
+
+def test_check_csv_cost_from_env_pricing(monkeypatch):
+    _set_synthetic_pricing(monkeypatch)
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    _stub_openai(monkeypatch, _live_full_usage_create)
+    result = muse_client.check_csv("x.csv", CSV)
+    # Stub reports 400 prompt + 4096 completion tokens, at the
+    # synthetic one-unit-per-token test pricing.
+    assert result["estimated_cost_usd"] == 400 + 4096
+
+
+def test_live_without_pricing_enforces_call_count_only(monkeypatch):
+    _unset_pricing(monkeypatch)
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "100")
+    monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
+    monkeypatch.setenv("LIVE_DAILY_MAX_CALLS", "1")
+    _stub_openai(monkeypatch, _live_ok_create)
+    first = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    second = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert "daily live-call cap" in second.json()["error"]
+
+
 def test_check_daily_budget_cap(monkeypatch):
+    _set_synthetic_pricing(monkeypatch)
     monkeypatch.setenv("META_API_KEY", "test-key")
     monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "100")
     monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
     # Budget fits one reserved worst case (settled at ~full usage)
     # but not a second reservation on top of that spend.
-    budget = muse_client.worst_case_cost_usd(CSV) * 1.5
+    budget = (muse_client.worst_case_cost_usd(CSV) or 0) * 1.5
     monkeypatch.setenv("LIVE_DAILY_BUDGET_USD", str(budget))
     _stub_openai(monkeypatch, _live_full_usage_create)
     first = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
@@ -207,10 +282,11 @@ def test_check_daily_budget_cap(monkeypatch):
 
 def test_malformed_responses_still_hit_budget(monkeypatch):
     """Billed-but-unparseable responses must count against the budget."""
+    _set_synthetic_pricing(monkeypatch)
     monkeypatch.setenv("META_API_KEY", "test-key")
     monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "100")
     monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
-    budget = muse_client.worst_case_cost_usd(CSV) * 1.5
+    budget = (muse_client.worst_case_cost_usd(CSV) or 0) * 1.5
     monkeypatch.setenv("LIVE_DAILY_BUDGET_USD", str(budget))
 
     def garbage_create(self, **kwargs):  # noqa: ANN001, ANN202
@@ -267,6 +343,8 @@ def test_zero_limit_is_a_hard_block(monkeypatch):
 
 
 def test_zero_budget_is_a_hard_block(monkeypatch):
+    # Even with pricing unset (cost unknown), a 0 budget blocks.
+    _unset_pricing(monkeypatch)
     monkeypatch.setenv("META_API_KEY", "test-key")
     monkeypatch.setenv("LIVE_RATE_PER_MINUTE", "100")
     monkeypatch.setenv("LIVE_RATE_PER_HOUR", "100")
