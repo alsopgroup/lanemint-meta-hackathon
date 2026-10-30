@@ -1,70 +1,160 @@
 {
-  "title": "Frontier tier — held-out leaderboard",
-  "updated": "2026-10-28",
-  "benchmark": {
-    "tier": "frontier",
-    "seeds": [42, 1001, 1002],
-    "tasks": 96,
-    "families": [
-      {"id": "F1", "type": "frontier_rolling_risk", "label": "Rolling risk"},
-      {"id": "F2", "type": "frontier_vendor_reconciliation", "label": "Vendor reconciliation"},
-      {"id": "F3", "type": "frontier_factor_exposure", "label": "Factor exposure"},
-      {"id": "F4", "type": "frontier_portfolio_pipeline", "label": "Portfolio pipeline"}
-    ],
-    "note": "Pooled over the held-out seeds 42, 1001 and 1002 (32 tasks per seed, 24 per family). A task passes only when the problem set is exactly right and the core numeric fields are within tolerance. Pass rates are shown with 95% Wilson score intervals.",
-    "notes": [
-      "Spark Open's and Glimmer 30B (base)'s seed-42 F1 results used the earlier 3-window version of F1; all other runs use the 4-window version."
-    ]
-  },
-  "entries": [
+  "title": "Held-out leaderboards",
+  "updated": "2026-10-30",
+  "boards": [
     {
-      "id": "muse-spark-1.3",
-      "name": "Muse Spark 1.3",
-      "provider": "Meta API",
-      "status": "complete",
-      "families": {
-        "F1": {"passed": 13, "total": 24},
-        "F2": {"passed": 17, "total": 24},
-        "F3": {"passed": 14, "total": 24},
-        "F4": {"passed": 4, "total": 24}
-      },
-      "notes": []
-    },
-    {
-      "id": "muse-spark-open",
-      "name": "Muse Spark Open",
-      "provider": "Fireworks serverless",
-      "status": "complete",
-      "families": {
-        "F1": {"passed": 1, "total": 24},
-        "F2": {"passed": 0, "total": 24},
-        "F3": {"passed": 1, "total": 24},
-        "F4": {"passed": 0, "total": 24}
-      },
+      "id": "frontier-tools",
+      "title": "Frontier tier — tools off vs tools on",
+      "tier": "frontier",
+      "tasks": 96,
+      "headline": "Tools take Muse Spark 1.3 from 50% to 99% — the tier saturates once tools are on.",
+      "note": "Frontier tier, 96 held-out tasks, tools off vs tools on. ~ marks an approximate figure, as reported.",
       "notes": [
-        "5 of its tasks failed on API errors (dropped connections, 1 timeout) and were counted as failures."
+        "Muse Spark Open: 5 of its tasks failed on API errors (dropped connections, 1 timeout) and were counted as failures."
+      ],
+      "entries": [
+        {
+          "id": "muse-spark-1.3",
+          "name": "Muse Spark 1.3",
+          "provider": "Meta API",
+          "status": "complete",
+          "tools_off": {"passed": 48, "total": 96},
+          "tools_on": {"passed": 95, "total": 96},
+          "notes": []
+        },
+        {
+          "id": "muse-spark-open",
+          "name": "Muse Spark Open",
+          "provider": "Fireworks serverless",
+          "status": "complete",
+          "tools_off": {"passed": 2, "total": 96},
+          "tools_on": {"passed": 95, "total": 96},
+          "notes": [
+            "5 of its tasks failed on API errors (dropped connections, 1 timeout) and were counted as failures."
+          ]
+        },
+        {
+          "id": "muse-glimmer-30b-base",
+          "name": "Muse Glimmer 30B (base)",
+          "provider": "Fireworks",
+          "status": "complete",
+          "tools_off": {"passed": 0, "total": 96},
+          "tools_on": {"approx_pct": 85},
+          "notes": []
+        },
+        {
+          "id": "muse-glimmer-30b-trace-lora",
+          "name": "Glimmer 30B + trace LoRA",
+          "provider": "Fireworks",
+          "status": "complete",
+          "tools_off": {"passed": 0, "total": 96},
+          "tools_on": {"approx_pct": 15},
+          "notes": []
+        },
+        {
+          "id": "muse-glimmer-30b-answer-lora",
+          "name": "Glimmer 30B + answer LoRA",
+          "provider": "Fireworks",
+          "status": "complete",
+          "tools_off": {"passed": 0, "total": 96},
+          "tools_on": {"passed": 0, "total": 96},
+          "notes": []
+        }
       ]
     },
     {
-      "id": "muse-glimmer-30b-base",
-      "name": "Muse Glimmer 30B (base)",
-      "provider": "Fireworks",
-      "status": "complete",
-      "families": {
-        "F1": {"passed": 0, "total": 24},
-        "F2": {"passed": 0, "total": 24},
-        "F3": {"passed": 0, "total": 24},
-        "F4": {"passed": 0, "total": 24}
-      },
-      "notes": []
-    },
-    {
-      "id": "muse-glimmer-30b-lora",
-      "name": "Muse Glimmer 30B + LoRA (fine-tuned)",
-      "provider": "Fireworks",
-      "status": "coming_soon",
+      "id": "tools-frontier",
+      "title": "tools_frontier tier — tools on, 12 turns",
+      "tier": "tools_frontier",
+      "tasks": 90,
+      "max_turns": 12,
+      "headline": "The harder tool tier brings Muse Spark 1.3 back to 70%, with a clear spread across models (70 / 57 / 30).",
+      "note": "tools_frontier tier, 90 held-out tasks, tools on at the default 12 turns. Per-family cells show tasks passed per family.",
       "notes": [
-        "LoRA fine-tune on seed-disjoint frontier data (train seeds 2001–2036) — results pending."
+        "Most Muse Spark 1.3 misses (25 of 27) are running out of turns on multi-stage stateful work.",
+        "Secondary finding: fine-tuning Glimmer on answers/traces hurt it once tools were on.",
+        "Glimmer + trace LoRA is a partial run (0/36)."
+      ],
+      "families": [
+        {"id": "T1", "label": "Hedge"},
+        {"id": "T2", "label": "FX min-var"},
+        {"id": "T3", "label": "Risk parity"},
+        {"id": "T4", "label": "Split/FIFO"},
+        {"id": "T5", "label": "Constraint stack"}
+      ],
+      "entries": [
+        {
+          "id": "muse-spark-1.3",
+          "name": "Muse Spark 1.3",
+          "provider": "Meta API",
+          "status": "complete",
+          "families": {
+            "T1": {"passed": 18, "total": 18},
+            "T2": {"passed": 10, "total": 18},
+            "T3": {"passed": 11, "total": 18},
+            "T4": {"passed": 18, "total": 18},
+            "T5": {"passed": 6, "total": 18}
+          },
+          "notes": []
+        },
+        {
+          "id": "muse-spark-open",
+          "name": "Muse Spark Open",
+          "provider": "Fireworks serverless",
+          "status": "complete",
+          "families": {
+            "T1": {"passed": 18, "total": 18},
+            "T2": {"passed": 15, "total": 18},
+            "T3": {"passed": 5, "total": 18},
+            "T4": {"passed": 12, "total": 18},
+            "T5": {"passed": 1, "total": 18}
+          },
+          "notes": []
+        },
+        {
+          "id": "muse-glimmer-30b-base",
+          "name": "Muse Glimmer 30B (base)",
+          "provider": "Fireworks",
+          "status": "complete",
+          "families": {
+            "T1": {"passed": 14, "total": 18},
+            "T2": {"passed": 1, "total": 18},
+            "T3": {"passed": 0, "total": 18},
+            "T4": {"passed": 12, "total": 18},
+            "T5": {"passed": 0, "total": 18}
+          },
+          "notes": []
+        },
+        {
+          "id": "muse-glimmer-30b-answer-lora",
+          "name": "Glimmer + answer LoRA",
+          "provider": "Fireworks",
+          "status": "complete",
+          "families": {
+            "T1": {"passed": 0, "total": 18},
+            "T2": {"passed": 0, "total": 18},
+            "T3": {"passed": 0, "total": 18},
+            "T4": {"passed": 0, "total": 18},
+            "T5": {"passed": 0, "total": 18}
+          },
+          "notes": []
+        },
+        {
+          "id": "muse-glimmer-30b-trace-lora",
+          "name": "Glimmer + trace LoRA",
+          "provider": "Fireworks",
+          "status": "complete",
+          "scope": "partial run",
+          "total": {"passed": 0, "total": 36},
+          "families": {
+            "T1": {"display": "0"},
+            "T2": {"display": "0"},
+            "T3": {"display": "0"},
+            "T4": {"display": "0"},
+            "T5": {"display": "0"}
+          },
+          "notes": ["Partial run — 0/36 tasks completed in this run."]
+        }
       ]
     }
   ]
