@@ -465,3 +465,154 @@ def test_check_csv_requires_key(monkeypatch):
     monkeypatch.delenv("MODEL_API_KEY", raising=False)
     with pytest.raises(muse_client.MuseNotConfigured):
         muse_client.check_csv("x.csv", CSV)
+
+
+# --- reasoning_effort / token budget / timeout (mocked OpenAI client) ---
+
+_FINDING_JSON = (
+    '{"findings": [{"type": "dups", "title": "Dup", '
+    '"rows": [1], "explain": "e"}]}'
+)
+
+
+def _capturing_create(captured, content=_FINDING_JSON):  # noqa: ANN001, ANN202
+    """Fake create() that records its kwargs and returns a canned reply."""
+
+    def fake_create(self, **kwargs):  # noqa: ANN001, ANN202
+        captured.update(kwargs)
+        message = type("M", (), {"content": content})()
+        choice = type("C", (), {"message": message, "finish_reason": "stop"})()
+        usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 10})()
+        return type("R", (), {"choices": [choice], "usage": usage})()
+
+    return fake_create
+
+
+def test_reasoning_effort_defaults_to_low(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.delenv("META_REASONING_EFFORT", raising=False)
+    captured: dict = {}
+    _stub_openai(monkeypatch, _capturing_create(captured))
+    result = muse_client.check_csv("x.csv", CSV)
+    assert result["findings"][0]["type"] == "dups"
+    assert captured["reasoning_effort"] == "low"
+    # Raised budgets/timeout guard the reasoning call end to end.
+    assert captured["max_tokens"] == 8192 == muse_client.DEFAULT_MAX_TOKENS
+    assert _stub_openai.last_client_kwargs.get("timeout") == 90.0
+    assert _stub_openai.last_client_kwargs.get("max_retries") == 0
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("medium", "medium"), ("high", "high"), ("LOW", "low"), (" High ", "high"),
+])
+def test_reasoning_effort_env_override(monkeypatch, raw, expected):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("META_REASONING_EFFORT", raw)
+    captured: dict = {}
+    _stub_openai(monkeypatch, _capturing_create(captured))
+    muse_client.check_csv("x.csv", CSV)
+    assert captured["reasoning_effort"] == expected
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "bogus", "turbo"])
+def test_reasoning_effort_invalid_or_empty_falls_back_to_low(monkeypatch, raw):
+    monkeypatch.setenv("META_REASONING_EFFORT", raw)
+    assert muse_client._reasoning_effort() == "low"
+
+
+@pytest.mark.parametrize("raw", ["none", "off", "NONE", " Off "])
+def test_reasoning_effort_none_omits_parameter(monkeypatch, raw):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    monkeypatch.setenv("META_REASONING_EFFORT", raw)
+    assert muse_client._reasoning_effort() is None
+    captured: dict = {}
+    _stub_openai(monkeypatch, _capturing_create(captured))
+    muse_client.check_csv("x.csv", CSV)
+    assert "reasoning_effort" not in captured
+
+
+def test_max_tokens_hard_cap_raised(monkeypatch):
+    monkeypatch.delenv("META_MAX_TOKENS", raising=False)
+    assert muse_client._max_tokens() == 8192
+    monkeypatch.setenv("META_MAX_TOKENS", "999999")
+    assert muse_client._max_tokens() == 16384 == muse_client.HARD_MAX_TOKENS
+    # worst_case_cost_usd still reserves against _max_tokens().
+    _set_synthetic_pricing(monkeypatch)
+    input_tokens = max(
+        1, (len(muse_client._SYSTEM_PROMPT) + len(CSV) + 64) // 4)
+    assert muse_client.worst_case_cost_usd(CSV) == input_tokens + 16384
+
+
+def _empty_content_create(content, finish_reason, reasoning_tokens=4094):  # noqa: ANN001, ANN202
+    def fake_create(self, **kwargs):  # noqa: ANN001, ANN202
+        message = type("M", (), {"content": content})()
+        choice = type(
+            "C", (), {"message": message, "finish_reason": finish_reason})()
+        details = type("D", (), {"reasoning_tokens": reasoning_tokens})()
+        usage = type("U", (), {
+            "prompt_tokens": 10, "completion_tokens": reasoning_tokens,
+            "completion_tokens_details": details,
+        })()
+        return type("R", (), {"choices": [choice], "usage": usage})()
+
+    return fake_create
+
+
+def test_empty_content_length_gives_clear_error(monkeypatch, capsys):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    _stub_openai(monkeypatch, _empty_content_create(None, "length"))
+    with pytest.raises(
+            muse_client.MuseUpstreamError,
+            match="Model ran out of tokens before answering"):
+        muse_client.check_csv("x.csv", CSV)
+    logged = capsys.readouterr().out
+    assert "[check_csv] empty content finish_reason=length reasoning_tokens=4094" in logged
+    assert "test-key" not in logged
+
+
+@pytest.mark.parametrize("content", [None, "", "   "])
+def test_empty_content_other_finish_gives_empty_error(monkeypatch, content):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    _stub_openai(monkeypatch, _empty_content_create(content, "stop"))
+    with pytest.raises(
+            muse_client.MuseUpstreamError,
+            match="Model returned an empty response"):
+        muse_client.check_csv("x.csv", CSV)
+
+
+def test_empty_content_length_surfaces_via_api(monkeypatch):
+    monkeypatch.setenv("META_API_KEY", "test-key")
+    _stub_openai(monkeypatch, _empty_content_create(None, "length"))
+    resp = client.post("/api/check", json={"filename": "x.csv", "csv": CSV})
+    assert resp.status_code == 502
+    assert resp.json()["error"] == "Model ran out of tokens before answering"
+
+
+# --- _parse_findings robustness ---
+
+def test_parse_findings_fenced_json():
+    fenced = "```json\n" + _FINDING_JSON + "\n```"
+    findings = muse_client._parse_findings(fenced, num_rows=5)
+    assert [f["type"] for f in findings] == ["dups"]
+    bare_fence = "```\n" + _FINDING_JSON + "\n```"
+    assert muse_client._parse_findings(bare_fence, num_rows=5) == findings
+
+
+def test_parse_findings_with_leading_trailing_prose():
+    content = "Here is what I found:\n" + _FINDING_JSON + "\nThat is all."
+    findings = muse_client._parse_findings(content, num_rows=5)
+    assert findings == [
+        {"type": "dups", "title": "Dup", "rows": [1], "explain": "e"}]
+
+
+def test_parse_findings_top_level_list():
+    content = '[{"type": "gaps", "title": "Gap", "rows": [2], "explain": "e"}]'
+    findings = muse_client._parse_findings(content, num_rows=5)
+    assert findings == [
+        {"type": "gaps", "title": "Gap", "rows": [2], "explain": "e"}]
+
+
+def test_parse_findings_prose_without_json_still_rejected(capsys):
+    with pytest.raises(muse_client.MuseUpstreamError):
+        muse_client._parse_findings("I found {nothing} to report", num_rows=3)
+    assert "JSONDecodeError" in capsys.readouterr().out

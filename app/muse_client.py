@@ -20,8 +20,17 @@ MAX_EXPLAIN_CHARS = 600
 MAX_CSV_CHARS = 64_000
 MAX_CSV_ROWS = 500
 MAX_CSV_COLS = 20
-DEFAULT_MAX_TOKENS = 4096
-HARD_MAX_TOKENS = 8192
+DEFAULT_MAX_TOKENS = 8192
+HARD_MAX_TOKENS = 16384
+# muse-spark-1.3 is a reasoning model: without an explicit effort it can
+# spend the whole completion budget on reasoning and return no content
+# (finish_reason="length", message.content=None). "low" keeps that
+# bounded; see _reasoning_effort() and META_REASONING_EFFORT in README.md.
+DEFAULT_REASONING_EFFORT = "low"
+ALLOWED_REASONING_EFFORTS = {"low", "medium", "high"}
+# Explicit opt-out values omit reasoning_effort entirely, for
+# non-reasoning models that would reject the parameter.
+REASONING_EFFORT_OFF_VALUES = {"none", "off"}
 # Optional per-token pricing for the daily spend guard, supplied only
 # via the environment (never hard-coded in the repo): both
 # META_INPUT_COST_PER_MTOK and META_OUTPUT_COST_PER_MTOK must be set to
@@ -139,6 +148,38 @@ def _max_tokens() -> int:
         return DEFAULT_MAX_TOKENS
 
 
+def _reasoning_effort() -> str | None:
+    """Reasoning effort for chat.completions.create, or None to omit it.
+
+    From META_REASONING_EFFORT (case-insensitive): "low" (default),
+    "medium" or "high". Invalid or empty values fall back to "low".
+    An explicit "none"/"off" returns None so the parameter is omitted
+    entirely, for non-reasoning models that would reject it.
+    """
+    raw = (os.getenv("META_REASONING_EFFORT") or "").strip().lower()
+    if raw in REASONING_EFFORT_OFF_VALUES:
+        return None
+    if raw in ALLOWED_REASONING_EFFORTS:
+        return raw
+    return DEFAULT_REASONING_EFFORT
+
+
+def _reasoning_tokens(usage: object) -> object:
+    """Reasoning-token count from usage, when the API reports it.
+
+    Read defensively (attribute access only) from
+    usage.completion_tokens_details.reasoning_tokens, falling back to
+    usage.reasoning_tokens; returns None when neither is present.
+    """
+    if usage is None:
+        return None
+    details = getattr(usage, "completion_tokens_details", None)
+    tokens = getattr(details, "reasoning_tokens", None)
+    if tokens is None:
+        tokens = getattr(usage, "reasoning_tokens", None)
+    return tokens
+
+
 def _safe_exc_summary(exc: BaseException) -> str:
     """Log only the exception type and HTTP status.
 
@@ -169,12 +210,29 @@ def _parse_findings(content: str, num_rows: int) -> list[dict]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        # Type only: parse-error text can include a snippet of the
-        # response body, which may echo credentials.
-        print(f"[_parse_findings] {_safe_exc_summary(exc)}")
-        raise MuseUpstreamError("Model did not return valid JSON") from exc
+        # Fall back to the outermost {...} object in the text, so a
+        # bare JSON object wrapped in leading/trailing prose still
+        # parses. Only the extracted slice is retried, never logged.
+        parsed = None
+        start, end = text.find("{"), text.rfind("}")
+        if 0 <= start < end:
+            try:
+                parsed = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                parsed = None
+        if parsed is None:
+            # Type only: parse-error text can include a snippet of the
+            # response body, which may echo credentials.
+            print(f"[_parse_findings] {_safe_exc_summary(exc)}")
+            raise MuseUpstreamError("Model did not return valid JSON") from exc
 
-    raw = parsed.get("findings") if isinstance(parsed, dict) else None
+    # Tolerate a top-level JSON list: it is the findings list itself.
+    if isinstance(parsed, list):
+        raw = parsed
+    elif isinstance(parsed, dict):
+        raw = parsed.get("findings")
+    else:
+        raw = None
     if not isinstance(raw, list):
         raise MuseUpstreamError("Model response has no findings list")
 
@@ -239,24 +297,32 @@ def check_csv(filename: str, csv_text: str) -> dict:
 
     # max_retries=0: one call = one billed attempt, so the budget
     # reservation in rate_limit.py is a true worst case per request.
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=30.0, max_retries=0)
+    # 90s timeout: a reasoning call can take 25s+ end to end.
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=90.0, max_retries=0)
     started = time.perf_counter()
+    # reasoning_effort bounds how much of the token budget the
+    # reasoning model spends thinking before it answers; omit the
+    # parameter entirely when META_REASONING_EFFORT=none/off.
+    create_kwargs: dict = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Filename: {filename or 'upload.csv'}\n"
+                    f"Data rows: {num_rows}\n\nCSV:\n{truncated}"
+                ),
+            },
+        ],
+        "temperature": 0.1,
+        "max_tokens": _max_tokens(),
+    }
+    reasoning_effort = _reasoning_effort()
+    if reasoning_effort is not None:
+        create_kwargs["reasoning_effort"] = reasoning_effort
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Filename: {filename or 'upload.csv'}\n"
-                        f"Data rows: {num_rows}\n\nCSV:\n{truncated}"
-                    ),
-                },
-            ],
-            temperature=0.1,
-            max_tokens=_max_tokens(),
-        )
+        response = client.chat.completions.create(**create_kwargs)
     except Exception as exc:  # upstream/network errors become a clean 502
         # Type + status only: exception text can echo request headers
         # (including credentials) and must never be written to logs.
@@ -265,8 +331,22 @@ def check_csv(filename: str, csv_text: str) -> dict:
     latency_ms = round((time.perf_counter() - started) * 1000)
 
     content = ""
+    finish_reason = None
     if response.choices:
         content = response.choices[0].message.content or ""
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+    if not content.strip():
+        # A reasoning model that exhausts its token budget returns no
+        # content at all. Log only safe metadata (no body, no headers,
+        # no key) and fail with a message that says what happened.
+        reasoning_tokens = _reasoning_tokens(getattr(response, "usage", None))
+        print(
+            f"[check_csv] empty content finish_reason={finish_reason} "
+            f"reasoning_tokens={reasoning_tokens if reasoning_tokens is not None else 'unknown'}"
+        )
+        if finish_reason == "length":
+            raise MuseUpstreamError("Model ran out of tokens before answering")
+        raise MuseUpstreamError("Model returned an empty response")
     findings = _parse_findings(content, num_rows)
     usage = getattr(response, "usage", None)
     prompt_tokens = getattr(usage, "prompt_tokens", None)
