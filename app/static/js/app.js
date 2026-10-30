@@ -166,19 +166,57 @@ function buildSampleScoreIssues(s, answer) {
     const m = String(label).match(/^(duplicate_row|missing_day|bad_price|stock_split)_(\d{4}-\d{2}-\d{2})(?:_(.+))?$/);
     if (!m) return;
     const kind = m[1], date = m[2], detail = m[3] || '';
-    if (kind === 'duplicate_row') issues.push({ id: 'sample_' + idx + '_duplicate', step: 'dups', title: 'Duplicate row', rows: rowsForDate(date), explain: `The row for ${date} appears more than once. Keep the first copy.` });
+    if (kind === 'duplicate_row') issues.push({ id: 'sample_' + idx + '_duplicate', kind: 'duplicate', date, step: 'dups', title: 'Duplicate row', rows: rowsForDate(date), explain: `The row for ${date} appears more than once. Keep the first copy.` });
     else if (kind === 'missing_day') {
       const nextIdx = s.rows.findIndex(r => String(r.cells[dk]) > date);
       const rows = nextIdx > 0 ? [nextIdx, nextIdx + 1] : (nextIdx === 0 ? [1] : [s.rows.length]);
-      issues.push({ id: 'sample_' + idx + '_missing', step: 'gaps', title: 'Missing day', rows, explain: `${date} is a weekday with no row, so a return across this break covers more than one session.` });
-    } else if (kind === 'bad_price') issues.push({ id: 'sample_' + idx + '_bad_price', step: 'prices', title: 'Bad price', rows: rowsForDate(date), explain: `The close on ${date} is a one-day spike (${detail}× its neighbours) and then reverts. It is a bad tick, not a market move.` });
+      issues.push({ id: 'sample_' + idx + '_missing', kind: 'missing', date, step: 'gaps', title: 'Missing day', rows, explain: `${date} is a weekday with no row, so a return across this break covers more than one session.` });
+    } else if (kind === 'bad_price') issues.push({ id: 'sample_' + idx + '_bad_price', kind: 'bad_price', date, step: 'prices', title: 'Bad price', rows: rowsForDate(date), explain: `The close on ${date} is a one-day spike (${detail}× its neighbours) and then reverts. It is a bad tick, not a market move.` });
     else if (kind === 'stock_split') {
       const splitRows = rowsForDate(date);
       const rows = splitRows.length ? [splitRows[0] - 1, splitRows[0]].filter(n => n >= 1) : [];
-      issues.push({ id: 'sample_' + idx + '_split', step: 'splits', title: 'Unadjusted split', rows, explain: `From ${date} prices drop to about half their previous level and stay there, with volume doubled: an unadjusted ${detail || '2.0'}-for-1 split. Earlier prices should be divided by ${detail || '2'} to match.` });
+      issues.push({ id: 'sample_' + idx + '_split', kind: 'split', date, ratio: parseFloat(detail) || 2, step: 'splits', title: 'Unadjusted split', rows, explain: `From ${date} prices drop to about half their previous level and stay there, with volume doubled: an unadjusted ${detail || '2.0'}-for-1 split. Earlier prices should be divided by ${detail || '2'} to match.` });
     }
   });
   return issues;
+}
+function applySampleFixTags(s, issues) {
+  /* Align the After-view fix tags with the score issues, the same way
+     the built-in samples align theirs (rows carry remove / cleanFor /
+     gap markers keyed by the issue id they belong to; renderFindings
+     applies a marker only when the scorer counted that issue as
+     caught, via `fixed`). Without this, a recognised upload's rows
+     keep only the heuristic tags (e.g. remove='u_dup'), which never
+     match a score-issue id like 'sample_0_duplicate', so a duplicate
+     the Score tab counted as caught would stay in the After table.
+     Markers are keyed by the sample issue id, not the heuristic id,
+     so an issue the model missed applies no fix. */
+  const colByLabel = labels => { const c = s.cols.find(col => labels.includes(String(col[1]).toLowerCase())); return c && c[0]; };
+  const priceKeys = ['open', 'high', 'low', 'close', 'o', 'h', 'l', 'c'].map(k => colByLabel([k])).filter(Boolean);
+  const volumeKey = colByLabel(['volume', 'v', 'size']);
+  const rowAt = n => s.rows[n - 1];
+  issues.forEach(issue => {
+    if (issue.kind === 'duplicate') {
+      /* Keep the first copy; every later copy is the removal. */
+      issue.rows.slice(1).forEach(n => { const r = rowAt(n); if (r) r.remove = issue.id; });
+    } else if (issue.kind === 'bad_price') {
+      /* A bad tick is dropped from the cleaned series. */
+      issue.rows.forEach(n => { const r = rowAt(n); if (r) r.remove = issue.id; });
+    } else if (issue.kind === 'missing') {
+      const before = rowAt(issue.rows[0]);
+      if (before) before.gap = { for: issue.id, text: `1 session missing · ${issue.date} · flagged, not filled` };
+    } else if (issue.kind === 'split') {
+      /* Back-adjust pre-split rows onto the post-split basis. */
+      const splitRow = issue.rows[issue.rows.length - 1], ratio = issue.ratio || 2;
+      s.rows.forEach(r => {
+        if (r.n >= splitRow) return;
+        const clean = { ...r.cells };
+        priceKeys.forEach(k => { const v = parseFloat(clean[k]); if (isFinite(v)) clean[k] = Math.round(v / ratio * 100) / 100; });
+        if (volumeKey) { const v = parseFloat(clean[volumeKey]); if (isFinite(v)) clean[volumeKey] = Math.round(v * ratio); }
+        r.clean = clean; r.cleanFor = issue.id;
+      });
+    }
+  });
 }
 async function fetchSampleMatch(rawText, fileName, upload) {
   /* Recognition is best-effort: any failure leaves the upload
@@ -191,6 +229,7 @@ async function fetchSampleMatch(rawText, fileName, upload) {
     upload.matchedSample = { task_id: j.task_id, file_name: j.file_name, sha256: j.sha256 };
     upload.matchedAnswer = j.answer;
     upload.scoreIssues = buildSampleScoreIssues(upload, j.answer);
+    applySampleFixTags(upload, upload.scoreIssues);
     render();
   } catch (e) { /* no recognition available: findings still work */ }
 }
@@ -430,6 +469,12 @@ function renderFindings() {
   const findings = currentFindings();
   const sc = state.stage === 'done' ? score(s, findings) : null;
   const fixed = sc ? sc.matched : (state.stage === 'done' && s.upload && !state.live ? new Set(s.found) : new Set());
+  /* After-view fixes follow the caught issues by category + affected
+     rows as well as by aligned tag id, so a caught duplicate removes
+     its later copies even if a row's remove tag came from the
+     heuristic pass ('u_dup') rather than the score issue. */
+  const caughtIssues = (s.scoreIssues || s.issues).filter(is => fixed.has(is.id));
+  const caughtRow = (kind, step, n) => caughtIssues.some(is => (is.kind === kind || is.step === step) && is.rows.includes(n));
   const rowF = {}; findings.forEach((f, i) => (f.rows || []).forEach(n => { if (rowF[n] == null) rowF[n] = i; }));
   const act = st.active, actRows = act >= 0 && findings[act] ? new Set(findings[act].rows) : null;
   const cards = findings.map((f, i) => {
@@ -446,12 +491,12 @@ function renderFindings() {
       tableRows.push({ isRow: true, html: `<div class="table-row" style="background:${f ? `color-mix(in oklch,${ty[1]} ${on ? 26 : 13}%,transparent)` : 'transparent'};box-shadow:${on ? 'inset 0 0 0 1px ' + ty[1] : 'none'};opacity:${dim}"><span class="cell-num">${r.n}</span>${s.cols.map(([k, , d]) => { const c = fmtCell(r.cells[k], d, f ? { col: 'var(--text-1)' } : {}); return `<span class="cell" style="text-align:${c.al};color:${c.col}">${esc(c.v)}</span>`; }).join('')}<span class="cell-note" style="color:${f ? ty[1] : 'var(--text-3)'}">${f ? esc(ty[0]) : ''}</span></div>` });
     } else {
       let status = '', cells, noteCol = 'var(--text-3)';
-      if (r.remove && fixed.has(r.remove)) { status = 'removed'; cells = s.cols.map(([k, , d]) => fmtCell(r.cells[k], d, { col: 'var(--text-3)', td: 'line-through' })); }
+      if ((r.remove && (fixed.has(r.remove) || caughtRow('duplicate', 'dups', r.n))) || caughtRow('bad_price', null, r.n)) { status = 'removed'; cells = s.cols.map(([k, , d]) => fmtCell(r.cells[k], d, { col: 'var(--text-3)', td: 'line-through' })); }
       else if (r.clean && fixed.has(r.cleanFor)) { status = 'fixed'; noteCol = 'var(--accent)'; cells = s.cols.map(([k, , d]) => { const ch = fmtV(r.clean[k], d) !== fmtV(r.cells[k], d); return fmtCell(r.clean[k], d, ch ? { col: 'var(--accent)' } : {}); }); }
       else { cells = s.cols.map(([k, , d]) => fmtCell(r.cells[k], d)); if (f) { status = 'flagged'; noteCol = 'var(--warning-500)'; } }
       tableRows.push({ isRow: true, note: status, html: `<div class="table-row" style="background:${status === 'fixed' ? 'color-mix(in oklch,var(--accent) 10%,transparent)' : 'transparent'};box-shadow:${on ? 'inset 0 0 0 1px var(--line-2)' : 'none'};opacity:${dim}"><span class="cell-num">${r.n}</span>${cells.map(c => `<span class="cell" style="text-align:${c.al};color:${c.col};text-decoration:${c.td}">${esc(c.v)}</span>`).join('')}<span class="cell-note" style="color:${noteCol}">${status}</span></div>` });
     }
-    if (st.view === 'clean' && r.gap && fixed.has(r.gap.for)) tableRows.push({ isRow: false, html: `<div class="gap-row">${esc(r.gap.text)}</div>` });
+    if (st.view === 'clean' && r.gap && (fixed.has(r.gap.for) || caughtRow('missing', 'gaps', r.n))) tableRows.push({ isRow: false, html: `<div class="gap-row">${esc(r.gap.text)}</div>` });
   });
   const kept = st.view === 'clean' ? tableRows.filter(x => x.isRow && x.note !== 'removed').length : s.rows.length;
   $('stepFindings').innerHTML = `<div class="step-body">

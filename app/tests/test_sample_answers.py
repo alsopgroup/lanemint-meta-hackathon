@@ -8,6 +8,8 @@ normalisation), and pin the disabled-Score contract in the frontend.
 """
 
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -93,6 +95,26 @@ def test_sample_match_rejects_bad_payloads():
     assert client.post("/api/sample-match", json={}).status_code == 400
 
 
+def test_after_view_removes_rows_the_score_counts_as_caught():
+    """Recognised uploads: After view fixes align with score issues.
+
+    Drives the real app.js under Node (see sample_after_view.test.mjs):
+    the duplicate/bad-price rows a recognised sample's Score tab counts
+    as caught must be marked removed in the After table, a missed
+    finding must apply no fix, and built-in samples plus non-matched
+    uploads must behave as before. Skipped without a Node runtime.
+    """
+    node = shutil.which("node")
+    if node is None:
+        import pytest
+        pytest.skip("node runtime not available")
+    harness = Path(__file__).resolve().parent / "sample_after_view.test.mjs"
+    result = subprocess.run(  # noqa: S603 - fixed argv, repo-local script
+        [node, str(harness)], capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all assertions passed" in result.stdout
+
+
 def test_frontend_disabled_score_contract():
     """Unscored uploads: Score step is disabled with an accessible reason."""
     js = client.get("/static/js/app.js").text
@@ -109,5 +131,8 @@ def test_frontend_disabled_score_contract():
     # Matched uploads are scored through the normal score path.
     assert "matchedSample" in js
     assert "/api/sample-match" in js
+    # After-view fix tags are aligned with the score-issue ids.
+    assert "applySampleFixTags" in js
+    assert "r.remove = issue.id" in js or "rowAt(n)" in js
     css = client.get("/static/css/app.css").text
     assert ".step-disabled" in css
