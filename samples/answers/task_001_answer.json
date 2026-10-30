@@ -1,0 +1,9 @@
+{
+  "mean_return": 0.002831,
+  "std_return": 0.022816,
+  "problems_found": [
+    "bad_price_2024-03-15_10.0",
+    "duplicate_row_2024-04-10",
+    "missing_day_2024-03-22"
+  ]
+}

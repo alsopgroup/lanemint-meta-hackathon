@@ -146,6 +146,54 @@ function parseCSV(text, name) {
   heur(s); return finish(s);
 }
 function toCSV(s) { return [s.cols.map(c => c[1]).join(',')].concat(s.rows.map(r => s.cols.map(c => fmtV(r.cells[c[0]], c[2]).replace('−', '-').replace(/,/g, '')).join(','))).join('\n'); }
+
+/* ---------------- recognised public samples ----------------
+   An upload is scored only when the server recognises it as one of
+   the public easy-tier samples in the repo's samples/ folder (exact
+   match on the SHA-256 of the normalised CSV; see
+   app/sample_answers.py). The answer key comes back from
+   /api/sample-match on a match only; other uploads get no key, so
+   their Score step stays disabled below. */
+const SCORE_DISABLED_REASON = "Scoring needs an answer key. Uploaded files can only be scored if they match one of the sample files in the repo's samples/ folder. Findings still work on any file.";
+const SCORE_DISABLED_SHORT = 'Scoring needs an answer key. Findings still work on any file.';
+function scoreDisabledFor(s) { return !!(s && s.upload && !s.matchedSample); }
+function buildSampleScoreIssues(s, answer) {
+  const dateCol = s.cols.find(c => String(c[1]).toLowerCase() === 'date') || s.cols[0];
+  const dk = dateCol && dateCol[0];
+  const rowsForDate = date => s.rows.filter(r => String(r.cells[dk]) === date).map(r => r.n);
+  const issues = [];
+  (answer && answer.problems_found || []).forEach((label, idx) => {
+    const m = String(label).match(/^(duplicate_row|missing_day|bad_price|stock_split)_(\d{4}-\d{2}-\d{2})(?:_(.+))?$/);
+    if (!m) return;
+    const kind = m[1], date = m[2], detail = m[3] || '';
+    if (kind === 'duplicate_row') issues.push({ id: 'sample_' + idx + '_duplicate', step: 'dups', title: 'Duplicate row', rows: rowsForDate(date), explain: `The row for ${date} appears more than once. Keep the first copy.` });
+    else if (kind === 'missing_day') {
+      const nextIdx = s.rows.findIndex(r => String(r.cells[dk]) > date);
+      const rows = nextIdx > 0 ? [nextIdx, nextIdx + 1] : (nextIdx === 0 ? [1] : [s.rows.length]);
+      issues.push({ id: 'sample_' + idx + '_missing', step: 'gaps', title: 'Missing day', rows, explain: `${date} is a weekday with no row, so a return across this break covers more than one session.` });
+    } else if (kind === 'bad_price') issues.push({ id: 'sample_' + idx + '_bad_price', step: 'prices', title: 'Bad price', rows: rowsForDate(date), explain: `The close on ${date} is a one-day spike (${detail}× its neighbours) and then reverts. It is a bad tick, not a market move.` });
+    else if (kind === 'stock_split') {
+      const splitRows = rowsForDate(date);
+      const rows = splitRows.length ? [splitRows[0] - 1, splitRows[0]].filter(n => n >= 1) : [];
+      issues.push({ id: 'sample_' + idx + '_split', step: 'splits', title: 'Unadjusted split', rows, explain: `From ${date} prices drop to about half their previous level and stay there, with volume doubled: an unadjusted ${detail || '2.0'}-for-1 split. Earlier prices should be divided by ${detail || '2'} to match.` });
+    }
+  });
+  return issues;
+}
+async function fetchSampleMatch(rawText, fileName, upload) {
+  /* Recognition is best-effort: any failure leaves the upload
+     unscored (Score disabled) rather than blocking the findings. */
+  try {
+    const r = await fetch('/api/sample-match', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: fileName, csv: rawText }) });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!j || !j.matched || !j.answer || state.upload !== upload) return;
+    upload.matchedSample = { task_id: j.task_id, file_name: j.file_name, sha256: j.sha256 };
+    upload.matchedAnswer = j.answer;
+    upload.scoreIssues = buildSampleScoreIssues(upload, j.answer);
+    render();
+  } catch (e) { /* no recognition available: findings still work */ }
+}
 function cur() { return state.upload || S.find(s => s.id === state.sid); }
 function serverLive() { return !!appConfig.live; }
 /* Mode of the current/last run, snapshotted when the run starts so a
@@ -158,11 +206,12 @@ function cancelInFlight() {
   pendingLive = false;
 }
 function score(s, findings) {
-  if (s.upload) return null;
+  if (s.upload && !s.matchedSample) return null;
+  const planted = s.scoreIssues || s.issues;
   const m = new Set();
-  const verdict = findings.map(f => { const hit = s.issues.filter(is => is.step === f.step && is.rows.some(n => (f.rows || []).includes(n))); const t = hit.find(is => !m.has(is.id)) || hit[0]; if (t) { m.add(t.id); return 'ok'; } return 'fp'; });
-  const caught = m.size, total = s.issues.length, ff = verdict.filter(v => v === 'fp').length, val = Math.max(0, caught - 0.5 * ff) / total;
-  return { caught, total, ff, missed: s.issues.filter(i => !m.has(i.id)), val, pass: val >= 0.8, verdict, matched: m };
+  const verdict = findings.map(f => { const hit = planted.filter(is => is.step === f.step && is.rows.some(n => (f.rows || []).includes(n))); const t = hit.find(is => !m.has(is.id)) || hit[0]; if (t) { m.add(t.id); return 'ok'; } return 'fp'; });
+  const caught = m.size, total = planted.length, ff = verdict.filter(v => v === 'fp').length, val = Math.max(0, caught - 0.5 * ff) / total;
+  return { caught, total, ff, missed: planted.filter(i => !m.has(i.id)), val, pass: val >= 0.8, verdict, matched: m };
 }
 function scrollToApp() { const el = $('app'); if (el) window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 68, behavior: 'smooth' }); }
 
@@ -229,7 +278,7 @@ function trySample() { clearInterval(timer); cancelInFlight(); Object.assign(sta
 function pickFile() { const f = $('fileInput'); if (f) f.click(); }
 function loadFile(file) {
   if (!file) return; const rd = new FileReader();
-  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, limitHit: false, liveAttempted: false, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
+  rd.onload = () => { try { const rawText = String(rd.result); const up = parseCSV(rawText, file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, limitHit: false, liveAttempted: false, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); fetchSampleMatch(rawText, file.name, up); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
   rd.readAsText(file);
 }
 
@@ -270,16 +319,20 @@ function renderStepper() {
   const sc = done ? score(s, findings) : null;
   const model = (st.live && st.live.model) || appConfig.model || 'muse-spark';
   const order = ['data', 'analyze', 'findings', 'score'], ci = order.indexOf(st.step);
-  const subs = { data: s.file, analyze: running ? 'running…' : done ? (simulatedRun() ? 'simulated' : fmtV(st.elapsed, 'int') + ' ms') : (serverLive() ? model : 'simulated'), findings: done ? findings.length + ' found' : '—', score: sc ? sc.val.toFixed(2) + (simulatedRun() ? ' · demo' : (sc.pass ? ' · pass' : ' · fail')) : (done && s.upload ? 'no answer key' : '—') };
+  const scoreOff = scoreDisabledFor(s);
+  const subs = { data: s.file, analyze: running ? 'running…' : done ? (simulatedRun() ? 'simulated' : fmtV(st.elapsed, 'int') + ' ms') : (serverLive() ? model : 'simulated'), findings: done ? findings.length + ' found' : '—', score: scoreOff ? 'answer key needed' : sc ? sc.val.toFixed(2) + (simulatedRun() ? ' · demo' : (sc.pass ? ' · pass' : ' · fail')) : '—' };
   $('stepper').innerHTML = [['data', 'Data'], ['analyze', 'Analyze'], ['findings', 'Findings'], ['score', 'Score']].map(([k, label], i) => {
-    const enabled = k === 'data' || k === 'analyze' ? (k === 'data' || st.stage !== 'idle') : done;
-    const isCur = st.step === k, past = i < ci;
+    const isScoreOff = k === 'score' && scoreOff;
+    const enabled = !isScoreOff && (k === 'data' || k === 'analyze' ? (k === 'data' || st.stage !== 'idle') : done);
+    const isCur = st.step === k && !isScoreOff, past = i < ci && !isScoreOff;
     const numBg = isCur ? 'var(--accent)' : 'transparent';
     const numCol = isCur ? 'var(--neutral-900)' : past ? 'var(--accent)' : 'var(--text-3)';
     const numRing = isCur ? 'var(--accent)' : past ? 'var(--accent)' : 'var(--line-2)';
-    return `<div class="step" data-action="${enabled && !running ? 'go' : ''}" data-step="${k}" style="cursor:${enabled ? 'pointer' : 'default'};background:${isCur ? 'var(--surface-raised)' : 'transparent'};box-shadow:${isCur ? 'inset 0 -2px 0 var(--accent)' : 'none'};opacity:${enabled || isCur ? 1 : 0.45}">
+    const disabledAttrs = isScoreOff ? ` title="${esc(SCORE_DISABLED_REASON)}" aria-disabled="true" aria-describedby="scoreDisabledNote" data-disabled="true"` : '';
+    const note = isScoreOff ? `<span class="step-note" id="scoreDisabledNote" role="note">${esc(SCORE_DISABLED_SHORT)}</span>` : '';
+    return `<div class="step${isScoreOff ? ' step-disabled' : ''}" data-action="${enabled && !running ? 'go' : ''}" data-step="${k}"${disabledAttrs} style="cursor:${isScoreOff ? 'not-allowed' : enabled ? 'pointer' : 'default'};background:${isCur ? 'var(--surface-raised)' : 'transparent'};box-shadow:${isCur ? 'inset 0 -2px 0 var(--accent)' : 'none'};opacity:${isScoreOff ? 0.45 : enabled || isCur ? 1 : 0.45}">
       <span class="step-num" style="background:${numBg};color:${numCol};box-shadow:inset 0 0 0 1px ${numRing}">${i + 1}</span>
-      <div class="step-labels"><span class="step-label">${label}</span><span class="step-sub">${esc(subs[k])}</span></div></div>`;
+      <div class="step-labels"><span class="step-label">${label}</span><span class="step-sub">${esc(subs[k])}</span>${note}</div></div>`;
   }).join('');
 }
 
@@ -291,7 +344,7 @@ function tableHead(s, withNote) {
 function renderData() {
   const st = state, s = cur();
   const sampleList = S.map(x => ({ ...x, ring: !st.upload && st.sid === x.id ? 'inset 0 0 0 1px var(--accent)' : 'inset 0 0 0 1px var(--line-1)' }));
-  if (st.upload) sampleList.push({ ...st.upload, desc: 'Your file', file: st.upload.total + ' rows', ring: 'inset 0 0 0 1px var(--accent)', id: 'upload' });
+  if (st.upload) sampleList.push({ ...st.upload, desc: st.upload.matchedSample ? 'Recognised sample · scored' : 'Your file', file: st.upload.total + ' rows', ring: 'inset 0 0 0 1px var(--accent)', id: 'upload' });
   const previewRows = s.rows.slice(0, 200).map(r => `<div class="table-row"><span class="cell-num">${r.n}</span>${s.cols.map(([k, , d]) => { const c = fmtCell(r.cells[k], d); return `<span class="cell" style="text-align:${c.al}">${esc(c.v)}</span>`; }).join('')}</div>`).join('');
   $('stepData').innerHTML = `<div class="step-body">
     <div class="col-samples">
@@ -373,6 +426,7 @@ function renderAnalyze() {
 
 function renderFindings() {
   const st = state, s = cur();
+  const scoreOff = scoreDisabledFor(s);
   const findings = currentFindings();
   const sc = state.stage === 'done' ? score(s, findings) : null;
   const fixed = sc ? sc.matched : (state.stage === 'done' && s.upload && !state.live ? new Set(s.found) : new Set());
@@ -403,7 +457,7 @@ function renderFindings() {
   $('stepFindings').innerHTML = `<div class="step-body">
     <div class="findings-col">
       ${state.stage === 'done' && !findings.length ? '<div class="empty-card">No problems reported.</div>' : cards}
-      <button class="btn btn-primary btn-md" data-action="go" data-step="score" type="button" style="align-self:flex-start">See the score →</button>
+      ${scoreOff ? `<button class="btn btn-primary btn-md" type="button" disabled aria-disabled="true" title="${esc(SCORE_DISABLED_REASON)}" aria-describedby="scoreDisabledNote" style="align-self:flex-start">See the score →</button><span class="score-disabled-inline-note">${esc(SCORE_DISABLED_SHORT)}</span>` : '<button class="btn btn-primary btn-md" data-action="go" data-step="score" type="button" style="align-self:flex-start">See the score →</button>'}
     </div>
     <div class="col-main table-card">
       <div class="table-card-head">
@@ -423,7 +477,10 @@ function renderScore() {
   const sc = state.stage === 'done' ? score(s, findings) : null;
   let html = '<div class="score-body">';
   if (state.stage === 'done' && !sc) {
-    html += '<div class="score-empty">Uploaded files have no answer key, so they can\'t be scored. Run one of the seeded samples to see a score.</div>';
+    /* Unreachable via the UI for unscored uploads (their Score step
+       is disabled); kept as a fallback explanation if this step is
+       ever rendered directly. */
+    html += `<div class="score-empty" role="note">${esc(SCORE_DISABLED_REASON)}</div>`;
   }
   if (sc) {
     const simulated = simulatedRun();
@@ -537,6 +594,8 @@ function loadLeaderboard() {
 }
 
 function render() {
+  /* An unscored upload can never sit on the disabled Score step. */
+  if (state.step === 'score' && scoreDisabledFor(cur())) state.step = state.stage === 'done' ? 'findings' : 'data';
   renderMode(); renderStepper(); renderData(); renderAnalyze(); renderFindings(); renderScore();
   $('stepData').hidden = state.step !== 'data';
   $('stepAnalyze').hidden = state.step !== 'analyze';
@@ -588,7 +647,7 @@ function initWaves() {
 document.addEventListener('click', (e) => {
   const t = e.target.closest('[data-action]'); if (!t) return;
   const a = t.dataset.action; if (!a) return;
-  if (a === 'go') { state.step = t.dataset.step; render(); }
+  if (a === 'go') { if (t.dataset.step === 'score' && scoreDisabledFor(cur())) return; state.step = t.dataset.step; render(); }
   else if (a === 'sample') { const id = t.dataset.id; if (id === 'upload') return; clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: id, upload: null, stage: 'idle', step: 'data', live: null, err: null, limitHit: false, liveAttempted: false, active: -1, runMode: null }); render(); }
   else if (a === 'pick-file') pickFile();
   else if (a === 'run') run();

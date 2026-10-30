@@ -40,6 +40,7 @@ from muse_client import (
     worst_case_cost_usd,
 )
 from rate_limit import guard
+from sample_answers import match_sample
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -57,6 +58,31 @@ def healthz() -> dict:
 def config() -> dict:
     """Secret-free config so the UI can show live vs simulated mode."""
     return live_config()
+
+
+@app.post("/api/sample-match")
+async def api_sample_match(request: Request) -> JSONResponse:
+    """Recognise an upload that exactly matches a public sample.
+
+    The CSV is normalised (BOM stripped, line endings normalised) and
+    hashed server-side; the matching sample's public answer key is
+    returned only on an exact hash match. Non-matching uploads get
+    ``{"matched": false}`` and no key material. This is a read-only
+    lookup: it never takes live-model quota.
+    """
+    if not _origin_allowed(request):
+        return JSONResponse({"error": "Cross-origin calls are not allowed"}, status_code=403)
+    payload, error = await _read_json_payload(request)
+    if error is not None:
+        return error
+    assert payload is not None
+    csv_text = payload.get("csv")
+    if not isinstance(csv_text, str) or not csv_text.strip():
+        return JSONResponse({"error": "Field 'csv' must be a non-empty string"}, status_code=400)
+    matched = match_sample(csv_text)
+    if matched is None:
+        return JSONResponse({"matched": False})
+    return JSONResponse({"matched": True, **matched})
 
 
 def _origin_allowed(request: Request) -> bool:
