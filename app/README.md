@@ -59,8 +59,14 @@ which fits a single Railway replica but is not a distributed limiter):
 - The **model is pinned server-side** (`META_MODEL_NAME`); any model a
   client sends is ignored, so callers cannot pick a different model.
 - Hard caps: 80 KB request body, 64,000-char CSV, 500 rows, 20 columns;
-  `max_tokens` defaults to 4,096 and `META_MAX_TOKENS` is capped at
-  8,192; upstream timeout 30s; at most 2 concurrent live calls.
+  `max_tokens` defaults to 8,192 and `META_MAX_TOKENS` is capped at
+  16,384; upstream timeout 90s; at most 2 concurrent live calls.
+  `META_REASONING_EFFORT` sets the `reasoning_effort` passed to the
+  model (`low` by default, or `medium`/`high`; invalid or empty values
+  fall back to `low`). Muse Spark is a reasoning model, so without an
+  explicit effort it can spend the whole token budget on reasoning and
+  return no answer. Set `META_REASONING_EFFORT=none` (or `off`) to omit
+  the parameter entirely, e.g. for a non-reasoning model.
 - Per-IP limits keyed on `X-Real-IP` (set by Railway's edge proxy to
   the visitor address it observed), falling back to the first
   `X-Forwarded-For` hop, then the TCP peer. The last forwarded hop
@@ -134,6 +140,9 @@ The live Muse call is stubbed in tests; no key or network is needed.
    - `META_API_KEY` — required for live mode; omit for simulated mode
    - `META_BASE_URL` — optional, default `https://api.meta.ai/v1`
    - `META_MODEL_NAME` — optional, default `muse-spark-1.3`
+   - `META_REASONING_EFFORT` — optional, default `low` (`low`/`medium`/`high`;
+     `none`/`off` omits `reasoning_effort` entirely)
+   - `META_MAX_TOKENS` — optional, default `8192`, hard-capped at `16384`
    - `ALLOWED_ORIGINS=https://meta.lanemint.com` — the public origin
      allowed to call `/api/check` from a browser
    - Optional limit tuning: `LIVE_RATE_PER_MINUTE`,
