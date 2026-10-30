@@ -80,6 +80,10 @@ button{font:inherit}
 .step:last-child{border-right:none}
 .step-num{width:26px;height:26px;flex:none;border-radius:99px;display:grid;place-items:center;font-family:var(--font-mono);font-size:12px;background:transparent}
 .step-labels{display:flex;flex-direction:column;gap:3px;min-width:0}
+.step-disabled{cursor:not-allowed;filter:grayscale(.6)}
+.step-disabled .step-label,.step-disabled .step-sub{color:var(--text-3)}
+.step-note{font-size:11px;line-height:1.35;color:var(--text-3);white-space:normal}
+.score-disabled-inline-note{font-size:13px;line-height:1.45;color:var(--text-3);max-width:300px}
 .step-label{font-size:15px;font-weight:500;white-space:nowrap}
 .step-sub{font-family:var(--font-mono);font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .step-body{display:flex;flex-wrap:wrap;gap:16px;padding:20px;align-items:flex-start}

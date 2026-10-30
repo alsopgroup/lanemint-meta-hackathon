@@ -146,6 +146,93 @@ function parseCSV(text, name) {
   heur(s); return finish(s);
 }
 function toCSV(s) { return [s.cols.map(c => c[1]).join(',')].concat(s.rows.map(r => s.cols.map(c => fmtV(r.cells[c[0]], c[2]).replace('−', '-').replace(/,/g, '')).join(','))).join('\n'); }
+
+/* ---------------- recognised public samples ----------------
+   An upload is scored only when the server recognises it as one of
+   the public easy-tier samples in the repo's samples/ folder (exact
+   match on the SHA-256 of the normalised CSV; see
+   app/sample_answers.py). The answer key comes back from
+   /api/sample-match on a match only; other uploads get no key, so
+   their Score step stays disabled below. */
+const SCORE_DISABLED_REASON = "Scoring needs an answer key. Uploaded files can only be scored if they match one of the sample files in the repo's samples/ folder. Findings still work on any file.";
+const SCORE_DISABLED_SHORT = 'Scoring needs an answer key. Findings still work on any file.';
+function scoreDisabledFor(s) { return !!(s && s.upload && !s.matchedSample); }
+function buildSampleScoreIssues(s, answer) {
+  const dateCol = s.cols.find(c => String(c[1]).toLowerCase() === 'date') || s.cols[0];
+  const dk = dateCol && dateCol[0];
+  const rowsForDate = date => s.rows.filter(r => String(r.cells[dk]) === date).map(r => r.n);
+  const issues = [];
+  (answer && answer.problems_found || []).forEach((label, idx) => {
+    const m = String(label).match(/^(duplicate_row|missing_day|bad_price|stock_split)_(\d{4}-\d{2}-\d{2})(?:_(.+))?$/);
+    if (!m) return;
+    const kind = m[1], date = m[2], detail = m[3] || '';
+    if (kind === 'duplicate_row') issues.push({ id: 'sample_' + idx + '_duplicate', kind: 'duplicate', date, step: 'dups', title: 'Duplicate row', rows: rowsForDate(date), explain: `The row for ${date} appears more than once. Keep the first copy.` });
+    else if (kind === 'missing_day') {
+      const nextIdx = s.rows.findIndex(r => String(r.cells[dk]) > date);
+      const rows = nextIdx > 0 ? [nextIdx, nextIdx + 1] : (nextIdx === 0 ? [1] : [s.rows.length]);
+      issues.push({ id: 'sample_' + idx + '_missing', kind: 'missing', date, step: 'gaps', title: 'Missing day', rows, explain: `${date} is a weekday with no row, so a return across this break covers more than one session.` });
+    } else if (kind === 'bad_price') issues.push({ id: 'sample_' + idx + '_bad_price', kind: 'bad_price', date, step: 'prices', title: 'Bad price', rows: rowsForDate(date), explain: `The close on ${date} is a one-day spike (${detail}× its neighbours) and then reverts. It is a bad tick, not a market move.` });
+    else if (kind === 'stock_split') {
+      const splitRows = rowsForDate(date);
+      const rows = splitRows.length ? [splitRows[0] - 1, splitRows[0]].filter(n => n >= 1) : [];
+      issues.push({ id: 'sample_' + idx + '_split', kind: 'split', date, ratio: parseFloat(detail) || 2, step: 'splits', title: 'Unadjusted split', rows, explain: `From ${date} prices drop to about half their previous level and stay there, with volume doubled: an unadjusted ${detail || '2.0'}-for-1 split. Earlier prices should be divided by ${detail || '2'} to match.` });
+    }
+  });
+  return issues;
+}
+function applySampleFixTags(s, issues) {
+  /* Align the After-view fix tags with the score issues, the same way
+     the built-in samples align theirs (rows carry remove / cleanFor /
+     gap markers keyed by the issue id they belong to; renderFindings
+     applies a marker only when the scorer counted that issue as
+     caught, via `fixed`). Without this, a recognised upload's rows
+     keep only the heuristic tags (e.g. remove='u_dup'), which never
+     match a score-issue id like 'sample_0_duplicate', so a duplicate
+     the Score tab counted as caught would stay in the After table.
+     Markers are keyed by the sample issue id, not the heuristic id,
+     so an issue the model missed applies no fix. */
+  const colByLabel = labels => { const c = s.cols.find(col => labels.includes(String(col[1]).toLowerCase())); return c && c[0]; };
+  const priceKeys = ['open', 'high', 'low', 'close', 'o', 'h', 'l', 'c'].map(k => colByLabel([k])).filter(Boolean);
+  const volumeKey = colByLabel(['volume', 'v', 'size']);
+  const rowAt = n => s.rows[n - 1];
+  issues.forEach(issue => {
+    if (issue.kind === 'duplicate') {
+      /* Keep the first copy; every later copy is the removal. */
+      issue.rows.slice(1).forEach(n => { const r = rowAt(n); if (r) r.remove = issue.id; });
+    } else if (issue.kind === 'bad_price') {
+      /* A bad tick is dropped from the cleaned series. */
+      issue.rows.forEach(n => { const r = rowAt(n); if (r) r.remove = issue.id; });
+    } else if (issue.kind === 'missing') {
+      const before = rowAt(issue.rows[0]);
+      if (before) before.gap = { for: issue.id, text: `1 session missing · ${issue.date} · flagged, not filled` };
+    } else if (issue.kind === 'split') {
+      /* Back-adjust pre-split rows onto the post-split basis. */
+      const splitRow = issue.rows[issue.rows.length - 1], ratio = issue.ratio || 2;
+      s.rows.forEach(r => {
+        if (r.n >= splitRow) return;
+        const clean = { ...r.cells };
+        priceKeys.forEach(k => { const v = parseFloat(clean[k]); if (isFinite(v)) clean[k] = Math.round(v / ratio * 100) / 100; });
+        if (volumeKey) { const v = parseFloat(clean[volumeKey]); if (isFinite(v)) clean[volumeKey] = Math.round(v * ratio); }
+        r.clean = clean; r.cleanFor = issue.id;
+      });
+    }
+  });
+}
+async function fetchSampleMatch(rawText, fileName, upload) {
+  /* Recognition is best-effort: any failure leaves the upload
+     unscored (Score disabled) rather than blocking the findings. */
+  try {
+    const r = await fetch('/api/sample-match', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: fileName, csv: rawText }) });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!j || !j.matched || !j.answer || state.upload !== upload) return;
+    upload.matchedSample = { task_id: j.task_id, file_name: j.file_name, sha256: j.sha256 };
+    upload.matchedAnswer = j.answer;
+    upload.scoreIssues = buildSampleScoreIssues(upload, j.answer);
+    applySampleFixTags(upload, upload.scoreIssues);
+    render();
+  } catch (e) { /* no recognition available: findings still work */ }
+}
 function cur() { return state.upload || S.find(s => s.id === state.sid); }
 function serverLive() { return !!appConfig.live; }
 /* Mode of the current/last run, snapshotted when the run starts so a
@@ -158,11 +245,12 @@ function cancelInFlight() {
   pendingLive = false;
 }
 function score(s, findings) {
-  if (s.upload) return null;
+  if (s.upload && !s.matchedSample) return null;
+  const planted = s.scoreIssues || s.issues;
   const m = new Set();
-  const verdict = findings.map(f => { const hit = s.issues.filter(is => is.step === f.step && is.rows.some(n => (f.rows || []).includes(n))); const t = hit.find(is => !m.has(is.id)) || hit[0]; if (t) { m.add(t.id); return 'ok'; } return 'fp'; });
-  const caught = m.size, total = s.issues.length, ff = verdict.filter(v => v === 'fp').length, val = Math.max(0, caught - 0.5 * ff) / total;
-  return { caught, total, ff, missed: s.issues.filter(i => !m.has(i.id)), val, pass: val >= 0.8, verdict, matched: m };
+  const verdict = findings.map(f => { const hit = planted.filter(is => is.step === f.step && is.rows.some(n => (f.rows || []).includes(n))); const t = hit.find(is => !m.has(is.id)) || hit[0]; if (t) { m.add(t.id); return 'ok'; } return 'fp'; });
+  const caught = m.size, total = planted.length, ff = verdict.filter(v => v === 'fp').length, val = Math.max(0, caught - 0.5 * ff) / total;
+  return { caught, total, ff, missed: planted.filter(i => !m.has(i.id)), val, pass: val >= 0.8, verdict, matched: m };
 }
 function scrollToApp() { const el = $('app'); if (el) window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 68, behavior: 'smooth' }); }
 
@@ -229,7 +317,7 @@ function trySample() { clearInterval(timer); cancelInFlight(); Object.assign(sta
 function pickFile() { const f = $('fileInput'); if (f) f.click(); }
 function loadFile(file) {
   if (!file) return; const rd = new FileReader();
-  rd.onload = () => { try { const up = parseCSV(String(rd.result), file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, limitHit: false, liveAttempted: false, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
+  rd.onload = () => { try { const rawText = String(rd.result); const up = parseCSV(rawText, file.name); clearInterval(timer); cancelInFlight(); Object.assign(state, { upload: up, err: null, limitHit: false, liveAttempted: false, stage: 'idle', step: 'data', live: null, runMode: null }); render(); scrollToApp(); fetchSampleMatch(rawText, file.name, up); } catch (e) { state.err = e.message; state.step = 'data'; render(); scrollToApp(); } };
   rd.readAsText(file);
 }
 
@@ -270,16 +358,20 @@ function renderStepper() {
   const sc = done ? score(s, findings) : null;
   const model = (st.live && st.live.model) || appConfig.model || 'muse-spark';
   const order = ['data', 'analyze', 'findings', 'score'], ci = order.indexOf(st.step);
-  const subs = { data: s.file, analyze: running ? 'running…' : done ? (simulatedRun() ? 'simulated' : fmtV(st.elapsed, 'int') + ' ms') : (serverLive() ? model : 'simulated'), findings: done ? findings.length + ' found' : '—', score: sc ? sc.val.toFixed(2) + (simulatedRun() ? ' · demo' : (sc.pass ? ' · pass' : ' · fail')) : (done && s.upload ? 'no answer key' : '—') };
+  const scoreOff = scoreDisabledFor(s);
+  const subs = { data: s.file, analyze: running ? 'running…' : done ? (simulatedRun() ? 'simulated' : fmtV(st.elapsed, 'int') + ' ms') : (serverLive() ? model : 'simulated'), findings: done ? findings.length + ' found' : '—', score: scoreOff ? 'answer key needed' : sc ? sc.val.toFixed(2) + (simulatedRun() ? ' · demo' : (sc.pass ? ' · pass' : ' · fail')) : '—' };
   $('stepper').innerHTML = [['data', 'Data'], ['analyze', 'Analyze'], ['findings', 'Findings'], ['score', 'Score']].map(([k, label], i) => {
-    const enabled = k === 'data' || k === 'analyze' ? (k === 'data' || st.stage !== 'idle') : done;
-    const isCur = st.step === k, past = i < ci;
+    const isScoreOff = k === 'score' && scoreOff;
+    const enabled = !isScoreOff && (k === 'data' || k === 'analyze' ? (k === 'data' || st.stage !== 'idle') : done);
+    const isCur = st.step === k && !isScoreOff, past = i < ci && !isScoreOff;
     const numBg = isCur ? 'var(--accent)' : 'transparent';
     const numCol = isCur ? 'var(--neutral-900)' : past ? 'var(--accent)' : 'var(--text-3)';
     const numRing = isCur ? 'var(--accent)' : past ? 'var(--accent)' : 'var(--line-2)';
-    return `<div class="step" data-action="${enabled && !running ? 'go' : ''}" data-step="${k}" style="cursor:${enabled ? 'pointer' : 'default'};background:${isCur ? 'var(--surface-raised)' : 'transparent'};box-shadow:${isCur ? 'inset 0 -2px 0 var(--accent)' : 'none'};opacity:${enabled || isCur ? 1 : 0.45}">
+    const disabledAttrs = isScoreOff ? ` title="${esc(SCORE_DISABLED_REASON)}" aria-disabled="true" aria-describedby="scoreDisabledNote" data-disabled="true"` : '';
+    const note = isScoreOff ? `<span class="step-note" id="scoreDisabledNote" role="note">${esc(SCORE_DISABLED_SHORT)}</span>` : '';
+    return `<div class="step${isScoreOff ? ' step-disabled' : ''}" data-action="${enabled && !running ? 'go' : ''}" data-step="${k}"${disabledAttrs} style="cursor:${isScoreOff ? 'not-allowed' : enabled ? 'pointer' : 'default'};background:${isCur ? 'var(--surface-raised)' : 'transparent'};box-shadow:${isCur ? 'inset 0 -2px 0 var(--accent)' : 'none'};opacity:${isScoreOff ? 0.45 : enabled || isCur ? 1 : 0.45}">
       <span class="step-num" style="background:${numBg};color:${numCol};box-shadow:inset 0 0 0 1px ${numRing}">${i + 1}</span>
-      <div class="step-labels"><span class="step-label">${label}</span><span class="step-sub">${esc(subs[k])}</span></div></div>`;
+      <div class="step-labels"><span class="step-label">${label}</span><span class="step-sub">${esc(subs[k])}</span>${note}</div></div>`;
   }).join('');
 }
 
@@ -291,7 +383,7 @@ function tableHead(s, withNote) {
 function renderData() {
   const st = state, s = cur();
   const sampleList = S.map(x => ({ ...x, ring: !st.upload && st.sid === x.id ? 'inset 0 0 0 1px var(--accent)' : 'inset 0 0 0 1px var(--line-1)' }));
-  if (st.upload) sampleList.push({ ...st.upload, desc: 'Your file', file: st.upload.total + ' rows', ring: 'inset 0 0 0 1px var(--accent)', id: 'upload' });
+  if (st.upload) sampleList.push({ ...st.upload, desc: st.upload.matchedSample ? 'Recognised sample · scored' : 'Your file', file: st.upload.total + ' rows', ring: 'inset 0 0 0 1px var(--accent)', id: 'upload' });
   const previewRows = s.rows.slice(0, 200).map(r => `<div class="table-row"><span class="cell-num">${r.n}</span>${s.cols.map(([k, , d]) => { const c = fmtCell(r.cells[k], d); return `<span class="cell" style="text-align:${c.al}">${esc(c.v)}</span>`; }).join('')}</div>`).join('');
   $('stepData').innerHTML = `<div class="step-body">
     <div class="col-samples">
@@ -373,9 +465,16 @@ function renderAnalyze() {
 
 function renderFindings() {
   const st = state, s = cur();
+  const scoreOff = scoreDisabledFor(s);
   const findings = currentFindings();
   const sc = state.stage === 'done' ? score(s, findings) : null;
   const fixed = sc ? sc.matched : (state.stage === 'done' && s.upload && !state.live ? new Set(s.found) : new Set());
+  /* After-view fixes follow the caught issues by category + affected
+     rows as well as by aligned tag id, so a caught duplicate removes
+     its later copies even if a row's remove tag came from the
+     heuristic pass ('u_dup') rather than the score issue. */
+  const caughtIssues = (s.scoreIssues || s.issues).filter(is => fixed.has(is.id));
+  const caughtRow = (kind, step, n) => caughtIssues.some(is => (is.kind === kind || is.step === step) && is.rows.includes(n));
   const rowF = {}; findings.forEach((f, i) => (f.rows || []).forEach(n => { if (rowF[n] == null) rowF[n] = i; }));
   const act = st.active, actRows = act >= 0 && findings[act] ? new Set(findings[act].rows) : null;
   const cards = findings.map((f, i) => {
@@ -392,18 +491,18 @@ function renderFindings() {
       tableRows.push({ isRow: true, html: `<div class="table-row" style="background:${f ? `color-mix(in oklch,${ty[1]} ${on ? 26 : 13}%,transparent)` : 'transparent'};box-shadow:${on ? 'inset 0 0 0 1px ' + ty[1] : 'none'};opacity:${dim}"><span class="cell-num">${r.n}</span>${s.cols.map(([k, , d]) => { const c = fmtCell(r.cells[k], d, f ? { col: 'var(--text-1)' } : {}); return `<span class="cell" style="text-align:${c.al};color:${c.col}">${esc(c.v)}</span>`; }).join('')}<span class="cell-note" style="color:${f ? ty[1] : 'var(--text-3)'}">${f ? esc(ty[0]) : ''}</span></div>` });
     } else {
       let status = '', cells, noteCol = 'var(--text-3)';
-      if (r.remove && fixed.has(r.remove)) { status = 'removed'; cells = s.cols.map(([k, , d]) => fmtCell(r.cells[k], d, { col: 'var(--text-3)', td: 'line-through' })); }
+      if ((r.remove && (fixed.has(r.remove) || caughtRow('duplicate', 'dups', r.n))) || caughtRow('bad_price', null, r.n)) { status = 'removed'; cells = s.cols.map(([k, , d]) => fmtCell(r.cells[k], d, { col: 'var(--text-3)', td: 'line-through' })); }
       else if (r.clean && fixed.has(r.cleanFor)) { status = 'fixed'; noteCol = 'var(--accent)'; cells = s.cols.map(([k, , d]) => { const ch = fmtV(r.clean[k], d) !== fmtV(r.cells[k], d); return fmtCell(r.clean[k], d, ch ? { col: 'var(--accent)' } : {}); }); }
       else { cells = s.cols.map(([k, , d]) => fmtCell(r.cells[k], d)); if (f) { status = 'flagged'; noteCol = 'var(--warning-500)'; } }
       tableRows.push({ isRow: true, note: status, html: `<div class="table-row" style="background:${status === 'fixed' ? 'color-mix(in oklch,var(--accent) 10%,transparent)' : 'transparent'};box-shadow:${on ? 'inset 0 0 0 1px var(--line-2)' : 'none'};opacity:${dim}"><span class="cell-num">${r.n}</span>${cells.map(c => `<span class="cell" style="text-align:${c.al};color:${c.col};text-decoration:${c.td}">${esc(c.v)}</span>`).join('')}<span class="cell-note" style="color:${noteCol}">${status}</span></div>` });
     }
-    if (st.view === 'clean' && r.gap && fixed.has(r.gap.for)) tableRows.push({ isRow: false, html: `<div class="gap-row">${esc(r.gap.text)}</div>` });
+    if (st.view === 'clean' && r.gap && (fixed.has(r.gap.for) || caughtRow('missing', 'gaps', r.n))) tableRows.push({ isRow: false, html: `<div class="gap-row">${esc(r.gap.text)}</div>` });
   });
   const kept = st.view === 'clean' ? tableRows.filter(x => x.isRow && x.note !== 'removed').length : s.rows.length;
   $('stepFindings').innerHTML = `<div class="step-body">
     <div class="findings-col">
       ${state.stage === 'done' && !findings.length ? '<div class="empty-card">No problems reported.</div>' : cards}
-      <button class="btn btn-primary btn-md" data-action="go" data-step="score" type="button" style="align-self:flex-start">See the score →</button>
+      ${scoreOff ? `<button class="btn btn-primary btn-md" type="button" disabled aria-disabled="true" title="${esc(SCORE_DISABLED_REASON)}" aria-describedby="scoreDisabledNote" style="align-self:flex-start">See the score →</button><span class="score-disabled-inline-note">${esc(SCORE_DISABLED_SHORT)}</span>` : '<button class="btn btn-primary btn-md" data-action="go" data-step="score" type="button" style="align-self:flex-start">See the score →</button>'}
     </div>
     <div class="col-main table-card">
       <div class="table-card-head">
@@ -423,7 +522,10 @@ function renderScore() {
   const sc = state.stage === 'done' ? score(s, findings) : null;
   let html = '<div class="score-body">';
   if (state.stage === 'done' && !sc) {
-    html += '<div class="score-empty">Uploaded files have no answer key, so they can\'t be scored. Run one of the seeded samples to see a score.</div>';
+    /* Unreachable via the UI for unscored uploads (their Score step
+       is disabled); kept as a fallback explanation if this step is
+       ever rendered directly. */
+    html += `<div class="score-empty" role="note">${esc(SCORE_DISABLED_REASON)}</div>`;
   }
   if (sc) {
     const simulated = simulatedRun();
@@ -537,6 +639,8 @@ function loadLeaderboard() {
 }
 
 function render() {
+  /* An unscored upload can never sit on the disabled Score step. */
+  if (state.step === 'score' && scoreDisabledFor(cur())) state.step = state.stage === 'done' ? 'findings' : 'data';
   renderMode(); renderStepper(); renderData(); renderAnalyze(); renderFindings(); renderScore();
   $('stepData').hidden = state.step !== 'data';
   $('stepAnalyze').hidden = state.step !== 'analyze';
@@ -588,7 +692,7 @@ function initWaves() {
 document.addEventListener('click', (e) => {
   const t = e.target.closest('[data-action]'); if (!t) return;
   const a = t.dataset.action; if (!a) return;
-  if (a === 'go') { state.step = t.dataset.step; render(); }
+  if (a === 'go') { if (t.dataset.step === 'score' && scoreDisabledFor(cur())) return; state.step = t.dataset.step; render(); }
   else if (a === 'sample') { const id = t.dataset.id; if (id === 'upload') return; clearInterval(timer); cancelInFlight(); Object.assign(state, { sid: id, upload: null, stage: 'idle', step: 'data', live: null, err: null, limitHit: false, liveAttempted: false, active: -1, runMode: null }); render(); }
   else if (a === 'pick-file') pickFile();
   else if (a === 'run') run();

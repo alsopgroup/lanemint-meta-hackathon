@@ -1,0 +1,44 @@
+{
+  "samples": [
+    {
+      "task_id": "task_001",
+      "file_name": "task_001.csv",
+      "sha256": "46d6cd820e82b8263c350e6c1e240c18fde10477cb3fb0612217d1a0653eab59",
+      "answer": {
+        "mean_return": 0.002831,
+        "std_return": 0.022816,
+        "problems_found": [
+          "bad_price_2024-03-15_10.0",
+          "duplicate_row_2024-04-10",
+          "missing_day_2024-03-22"
+        ]
+      }
+    },
+    {
+      "task_id": "task_002",
+      "file_name": "task_002.csv",
+      "sha256": "8ae39d4d5253288aae9bc0cff235777f8eecbed06c4beb459a33b3333812ac4b",
+      "answer": {
+        "annualized_volatility": 0.333634,
+        "num_clean_days": 54,
+        "problems_found": [
+          "duplicate_row_2024-07-29",
+          "missing_day_2024-07-15"
+        ]
+      }
+    },
+    {
+      "task_id": "task_003",
+      "file_name": "task_003.csv",
+      "sha256": "d0ffd13a1d24a58d7548262bc80ed49fb4f41622406cb3e120853efc47fc2b1f",
+      "answer": {
+        "total_return": 0.0532,
+        "final_price": 52.66,
+        "problems_found": [
+          "bad_price_2024-05-30_10.0",
+          "stock_split_2024-05-17_2.0"
+        ]
+      }
+    }
+  ]
+}

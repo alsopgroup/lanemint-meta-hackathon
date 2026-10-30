@@ -17,6 +17,18 @@ Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [Lane
 **Demo video:** coming Nov 3 <!-- TODO: replace this placeholder with the demo video link -->
 **Full technical reference:** the previous long-form README is preserved at [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
+## Try it in two minutes
+
+1. **Open the live app and click “Try a sample →”.** Go to [meta.lanemint.com](https://meta.lanemint.com) and press the **Try a sample →** button in the hero (or **Upload CSV** to pick a file yourself). The built-in sample runs straight away so you can see the checker flag problems and explain them in plain English.
+2. **Download a sample CSV and upload it.** Grab a ready-made CSV from [`samples/`](samples/) (for example `samples/task_001.csv`), upload it in the app, and run the check. Because that file exactly matches a public sample, the app recognises it and gives you the full score against its answer key, just like the built-in samples. Any other CSV still gets findings, but its Score tab stays disabled — scoring needs an answer key, and only the `samples/` files have one in the app. See [`samples/README.md`](samples/README.md) for what each file contains and how to read its answer key.
+3. **Generate your own fresh data.** One command makes a new, never-seen easy-tier set with its own answer keys:
+
+   ```bash
+   python -m src.generate_tasks --tier easy --seed 123 --count 3 --output-dir my_samples
+   ```
+
+   Use any seed you like for your own data, but do not use the reserved evaluation seeds (42, 1001, 1002) for training or tuning — those are held out for the headline results.
+
 ## Headline results
 
 Held-out frontier results, pooled over the evaluation seeds **42, 1001 and 1002** (96 tasks, 4 families × 24), run at low reasoning effort. Pass rates are whole-percent with Wilson 95% confidence intervals.
