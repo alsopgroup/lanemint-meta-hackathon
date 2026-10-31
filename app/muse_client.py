@@ -492,9 +492,45 @@ def _parse_image_analysis(content: str) -> dict:
     }
 
 
-def worst_case_image_cost_usd() -> float | None:
-    """Worst-case reserve for one image call (cost unknown without pricing)."""
-    return _cost_usd(max(1, len(_IMAGE_SYSTEM_PROMPT) // 4), _max_tokens())
+# Conservative per-image token allowance for vision input. Image token
+# cost scales with resolution, which cannot be known from the bytes
+# alone without decoding, so the spend guard never reserves on text
+# tokens only: every image call is charged at least this fixed
+# allowance, plus a size-based term from the base64 data URL actually
+# sent, capped at the upload size limit (MAX_IMAGE_BYTES).
+FIXED_IMAGE_TOKEN_ALLOWANCE = 8192
+
+
+def _estimated_image_prompt_tokens(image_size_bytes: int | None = None) -> int:
+    """Conservative upper-bound prompt tokens for one image call.
+
+    Text tokens (~4 chars/token over the system prompt plus the short
+    user instruction) + FIXED_IMAGE_TOKEN_ALLOWANCE + a size-based
+    term: the base64 data URL is ~4/3 the byte size, estimated at
+    ~4 chars/token. ``image_size_bytes=None`` (or any size above the
+    cap) estimates at MAX_IMAGE_BYTES, so a reserve computed before
+    the image is known is still an upper bound for any upload the
+    endpoint will accept.
+    """
+    if image_size_bytes is None:
+        size = MAX_IMAGE_BYTES
+    else:
+        size = min(max(int(image_size_bytes), 0), MAX_IMAGE_BYTES)
+    data_url_chars = 4 * math.ceil(size / 3) + len("data:image/webp;base64,")
+    size_based_tokens = math.ceil(data_url_chars / 4)
+    text_tokens = (len(_IMAGE_SYSTEM_PROMPT) + 256) // 4
+    return text_tokens + FIXED_IMAGE_TOKEN_ALLOWANCE + size_based_tokens
+
+
+def worst_case_image_cost_usd(image_size_bytes: int | None = None) -> float | None:
+    """Worst-case reserve for one image call (cost unknown without pricing).
+
+    Includes the image payload via _estimated_image_prompt_tokens —
+    at the upload size cap when the actual size is not supplied — so
+    the daily-budget reservation cannot underestimate a multimodal
+    call the way a text-only estimate would.
+    """
+    return _cost_usd(_estimated_image_prompt_tokens(image_size_bytes), _max_tokens())
 
 
 def check_chart_image(filename: str, image_bytes: bytes, media_type: str) -> dict:
@@ -572,7 +608,10 @@ def check_chart_image(filename: str, image_bytes: bytes, media_type: str) -> dic
     prompt_tokens = getattr(usage, "prompt_tokens", None)
     completion_tokens = getattr(usage, "completion_tokens", None)
     if prompt_tokens is None:
-        prompt_tokens = max(1, len(_IMAGE_SYSTEM_PROMPT) // 4)
+        # No usage reported: fall back to the same conservative
+        # image-inclusive estimate the budget reserve uses, sized to
+        # the image actually sent — never a text-only estimate.
+        prompt_tokens = _estimated_image_prompt_tokens(len(image_bytes))
     if completion_tokens is None:
         completion_tokens = max(1, len(content) // 4)
     estimated_cost = _cost_usd(prompt_tokens, completion_tokens)

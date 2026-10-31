@@ -143,6 +143,68 @@ def test_live_image_check_sends_image_part(monkeypatch):
     assert "test-key" not in resp.text
 
 
+def test_image_reserve_includes_image_payload(monkeypatch):
+    """The spend reserve must not be a text-only estimate (Bugbot).
+
+    With synthetic one-unit-per-token pricing, the reserved worst case
+    equals the estimated prompt tokens plus the output cap, so the
+    image-inclusive parts are directly assertable.
+    """
+    monkeypatch.setenv("META_INPUT_COST_PER_MTOK", "1000000")
+    monkeypatch.setenv("META_OUTPUT_COST_PER_MTOK", "1000000")
+
+    text_only = muse_client._cost_usd(
+        max(1, len(muse_client._IMAGE_SYSTEM_PROMPT) // 4),
+        muse_client._max_tokens(),
+    )
+    size = len(SAMPLE_PNG.read_bytes())
+    reserved = muse_client.worst_case_image_cost_usd(size)
+    assert reserved is not None and text_only is not None
+    assert reserved > text_only
+    # At least the fixed per-image allowance is charged on top of text.
+    assert reserved - text_only >= muse_client.FIXED_IMAGE_TOKEN_ALLOWANCE
+    # The estimate grows with image size and is capped at the upload limit.
+    assert muse_client._estimated_image_prompt_tokens(0) < (
+        muse_client._estimated_image_prompt_tokens(size)
+    )
+    assert muse_client._estimated_image_prompt_tokens(
+        muse_client.MAX_IMAGE_BYTES * 10
+    ) == muse_client._estimated_image_prompt_tokens(muse_client.MAX_IMAGE_BYTES)
+    # No size supplied: reserve assumes the largest accepted upload.
+    assert muse_client.worst_case_image_cost_usd() == (
+        muse_client.worst_case_image_cost_usd(muse_client.MAX_IMAGE_BYTES)
+    )
+    assert muse_client.worst_case_image_cost_usd() >= reserved
+
+
+def test_image_usage_fallback_includes_image_payload(monkeypatch):
+    """When the API omits usage, settled cost uses the image estimate."""
+    monkeypatch.setenv("META_INPUT_COST_PER_MTOK", "1000000")
+    monkeypatch.setenv("META_OUTPUT_COST_PER_MTOK", "1000000")
+    monkeypatch.setenv("META_API_KEY", "test-key")
+
+    def fake_create(self, **kwargs):  # noqa: ANN001, ANN202 - no usage attr
+        message = type("M", (), {"content": _IMAGE_JSON})()
+        choice = type("C", (), {"message": message, "finish_reason": "stop"})()
+        return type("R", (), {"choices": [choice]})()
+
+    import openai
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):  # noqa: ANN003
+            self.chat = type(
+                "Chat", (), {"completions": type("Comp", (), {"create": fake_create})()}
+            )()
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    image_bytes = SAMPLE_PNG.read_bytes()
+    result = muse_client.check_chart_image("chart.png", image_bytes, "image/png")
+    expected_prompt = muse_client._estimated_image_prompt_tokens(len(image_bytes))
+    expected_completion = max(1, len(_IMAGE_JSON) // 4)
+    assert result["estimated_cost_usd"] == expected_prompt + expected_completion
+    assert result["estimated_cost_usd"] > muse_client.FIXED_IMAGE_TOKEN_ALLOWANCE
+
+
 def test_validate_image_magic_bytes():
     assert muse_client.validate_image(SAMPLE_PNG.read_bytes(), "image/png") == "image/png"
     with pytest.raises(muse_client.MuseBadRequest):

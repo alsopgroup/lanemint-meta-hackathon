@@ -298,7 +298,7 @@ async def api_check_image(request: Request) -> JSONResponse:
             status_code=503,
         )
 
-    worst_case = worst_case_image_cost_usd()
+    worst_case = worst_case_image_cost_usd(len(image_bytes))
     reserve_usd = worst_case if worst_case is not None else 0.0
     allowed, retry_after, reason = guard.acquire(_client_ip(request), reserve_usd)
     if not allowed:
