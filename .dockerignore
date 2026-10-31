@@ -1,0 +1,38 @@
+# Root build context (benchmark image: Dockerfile.benchmark).
+# The app image is built from app/ and uses app/.dockerignore instead.
+
+# Version control and local environment — never ship secrets to a builder
+.git/
+.github/
+.env
+.env.*
+!.env.example
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+
+# Generated benchmark runs and local outputs (regenerated in-container)
+output/
+docker-output/
+tasks/
+tasks_hard/
+tasks_frontier/
+tasks_tools_frontier/
+tasks_sample/
+tasks_eval_*/
+my_samples/
+finetune_data/
+
+# Tests and docs are not needed in the runtime benchmark image
+tests/
+app/tests/
+docs/
+*.md
+!README.md

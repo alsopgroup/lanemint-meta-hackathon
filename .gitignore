@@ -40,6 +40,7 @@ ENV/
 
 # Output files
 output/
+docker-output/
 tasks/*.csv
 tasks/*.json
 tasks/answers/
