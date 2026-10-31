@@ -1,0 +1,56 @@
+# One-command Docker setup for hackathon judges.
+#
+#   docker compose up --build app        # web app on http://localhost:8000
+#   docker compose --profile benchmark run --rm benchmark   # offline sample run
+#
+# Secrets are never baked into either image: Compose only forwards the
+# variables below from your shell / local .env file (gitignored — copy
+# .env.example to .env) at runtime. With no keys set, the app runs in
+# its clearly labelled simulated/demo mode and the benchmark sample
+# runs fully offline with the runner's stub model.
+
+services:
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: lanemint-meta-app:latest
+    ports:
+      # Override the host port with APP_PORT if 8000 is taken.
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      PORT: "8000"
+      # Runtime-only secrets (empty = demo/offline mode). Never commit
+      # real values; keep them in your shell or a gitignored .env file.
+      META_API_KEY: "${META_API_KEY:-}"
+      FIREWORKS_API_KEY: "${FIREWORKS_API_KEY:-}"
+      META_SITE_API_KEY: "${META_SITE_API_KEY:-}"
+      META_BASE_URL: "${META_BASE_URL:-https://api.meta.ai/v1}"
+      META_MODEL_NAME: "${META_MODEL_NAME:-muse-spark-1.3}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  benchmark:
+    # Opt-in only, so `docker compose up` starts just the web app.
+    profiles: ["benchmark"]
+    build:
+      context: .
+      dockerfile: Dockerfile.benchmark
+    image: lanemint-meta-benchmark:latest
+    environment:
+      # Runtime-only secrets, forwarded exactly as for the app service.
+      META_API_KEY: "${META_API_KEY:-}"
+      FIREWORKS_API_KEY: "${FIREWORKS_API_KEY:-}"
+      META_SITE_API_KEY: "${META_SITE_API_KEY:-}"
+      META_BASE_URL: "${META_BASE_URL:-https://api.meta.ai/v1}"
+      META_MODEL_NAME: "${META_MODEL_NAME:-muse-spark-1.3}"
+    # No bind mounts by default: the sample run is self-contained and
+    # prints its scoring summary, so `--rm` can safely discard the
+    # container. To keep generated tasks/results on the host, run with
+    # your own mount and user, e.g.
+    #   docker compose --profile benchmark run --rm --user "$(id -u):$(id -g)" \
+    #     -v "$PWD/docker-output:/workspace/output" benchmark

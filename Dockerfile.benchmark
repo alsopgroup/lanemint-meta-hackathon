@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+
+# --- Builder: install the benchmark dependencies into an isolated venv ---
+FROM python:3.11-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /build
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# --- Runtime: only the venv, the benchmark source and the sample helper ---
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# Run as a non-root user; generated tasks/results are written under
+# /workspace (bind-mount ./docker-output there via Compose to keep them).
+RUN useradd --create-home --uid 10001 benchmark \
+    && mkdir -p /workspace/output /workspace/tasks_sample \
+    && chown -R benchmark:benchmark /workspace
+
+WORKDIR /workspace
+
+COPY --from=builder /opt/venv /opt/venv
+COPY src/ ./src/
+COPY samples/ ./samples/
+COPY docker/benchmark-entrypoint.sh /usr/local/bin/benchmark-entrypoint
+COPY docker/benchmark-sample.sh /usr/local/bin/benchmark-sample
+
+RUN chmod +x /usr/local/bin/benchmark-entrypoint /usr/local/bin/benchmark-sample \
+    && chown -R benchmark:benchmark /workspace
+
+USER benchmark
+
+# No secrets are baked in: META_API_KEY / FIREWORKS_API_KEY /
+# META_SITE_API_KEY are only ever supplied at runtime (see .env.example).
+ENTRYPOINT ["benchmark-entrypoint"]
+# With no arguments the entrypoint runs the offline sample pipeline
+# (generate -> dry-run runner -> scorer). Any arguments are executed
+# as-is, e.g. `python -m src.runner --help`.
+CMD []
