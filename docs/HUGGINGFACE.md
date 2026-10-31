@@ -1,11 +1,7 @@
 # Hugging Face release prep
 
-**Status: prepared locally, not uploaded.** There is no Hugging Face
-token in the automation environment, and nothing here uploads
-anything. A human with their own token runs the commands below.
-
-Planned dataset home (placeholder until the org is chosen):
-`huggingface.co/datasets/<org>/lanemint-meta-benchmark`
+**Status: published.** Dataset home:
+https://huggingface.co/datasets/LaneMint/lanemint-meta-benchmark
 
 ## What gets uploaded
 
@@ -33,21 +29,19 @@ du -sh hf_dataset                              # expect roughly 1 MB at defaults
 
 ## Upload (human, with your own token)
 
-Never commit a token. Log in interactively, replace `<org>`, then:
+Never commit a token. Log in interactively, then:
 
 ```bash
 pip install -U huggingface_hub
 hf auth login            # legacy equivalent: huggingface-cli login
 
  # create the (empty) dataset repo, then upload the folder:
-hf upload <org>/lanemint-meta-benchmark hf_dataset . --repo-type dataset
+hf upload LaneMint/lanemint-meta-benchmark hf_dataset . --repo-type dataset
 
 # Legacy CLI equivalent for the upload step:
-# huggingface-cli upload <org>/lanemint-meta-benchmark hf_dataset . --repo-type dataset
+# huggingface-cli upload LaneMint/lanemint-meta-benchmark hf_dataset . --repo-type dataset
 ```
 
-After uploading, update the README's Hugging Face section to replace
-the `<org>` placeholder with the real dataset URL.
 
 ## LoRA adapter weights: what exists in this repo
 

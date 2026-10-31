@@ -323,7 +323,7 @@ The app in `app/` (deployed at https://meta.lanemint.com) lets judges try the ea
 
 ## Hugging Face dataset (pending)
 
-A frozen public subset of the benchmark (easy, hard and frontier tiers, generated from new public seeds — never the held-out eval seeds) is prepared for Hugging Face at **`huggingface.co/datasets/<org>/lanemint-meta-benchmark` (pending upload; `<org>` is a placeholder)**. Nothing has been uploaded: `scripts/export_hf_dataset.py` builds the dataset folder locally (task CSVs, answer keys, dataset card), and [docs/HUGGINGFACE.md](docs/HUGGINGFACE.md) has the exact `hf upload` commands a human runs with their own token, plus what exists for the Glimmer LoRA work (no adapter weights in this repo).
+A frozen public subset of the benchmark (easy, hard and frontier tiers, generated from new public seeds — never the held-out eval seeds) is published on Hugging Face at **https://huggingface.co/datasets/LaneMint/lanemint-meta-benchmark**. `scripts/export_hf_dataset.py` builds the dataset folder (task CSVs, answer keys, dataset card), and [docs/HUGGINGFACE.md](docs/HUGGINGFACE.md) has the exact `hf upload` commands used to publish it, plus what exists for the Glimmer LoRA work (no adapter weights in this repo).
 
 ## Limitations and honest notes
 
