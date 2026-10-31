@@ -4,7 +4,7 @@
       "id": "task_001",
       "file_name": "chart_task_001.png",
       "url": "/static/assets/sample-charts/chart_task_001.png",
-      "sha256": "a7a7167cbf45ee7234aa6cc17253be2336ee5fbf91b082b435655b1e67ab02a8",
+      "sha256": "8314aac04e9ea6a1a483d6577634358c0b75ea95fa0465d205b9c98826450011",
       "source_csv": "samples/task_001.csv",
       "summary": "Simulated result for the bundled public sample task_001: the visible problems planted in that sample's price series.",
       "findings": [
@@ -343,7 +343,7 @@
       "id": "task_002",
       "file_name": "chart_task_002.png",
       "url": "/static/assets/sample-charts/chart_task_002.png",
-      "sha256": "da5b89e526325bb03b09caec7304355fa4c1367ff6c9b958022c4483626b8865",
+      "sha256": "ec70c3a6105329df042ec1128c2d36352eb83d22695ab4d46f328aaa5c7442a7",
       "source_csv": "samples/task_002.csv",
       "summary": "Simulated result for the bundled public sample task_002: the visible problems planted in that sample's price series.",
       "findings": [
@@ -585,7 +585,7 @@
       "id": "task_003",
       "file_name": "chart_task_003.png",
       "url": "/static/assets/sample-charts/chart_task_003.png",
-      "sha256": "1bacc8c7193108eee0176f7a508668272cc424cc5cfbe3f846e1aa861aab60c3",
+      "sha256": "62ebe0f4ea6114f390338e720719b37e4c93683bf35cc87cbb2219b996ab0a6a",
       "source_csv": "samples/task_003.csv",
       "summary": "Simulated result for the bundled public sample task_003: the visible problems planted in that sample's price series.",
       "findings": [

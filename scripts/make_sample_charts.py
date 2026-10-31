@@ -96,7 +96,10 @@ def main() -> None:
         ax.plot(frame["date"], frame["close"], color="#009d5e", lw=1.6)
         ax.set_title(f"{frame['ticker'].iloc[0]} daily close — {task_id} (public sample)")
         ax.set_ylabel("close")
-        ax.tick_params(axis="x", labelrotation=45, labelsize=7)
+        # Show at most ~8 date labels so the axis stays legible.
+        step = max(1, len(frame) // 8)
+        ax.set_xticks(range(0, len(frame), step))
+        ax.set_xticklabels(frame["date"].iloc[::step], rotation=30, ha="left", fontsize=7)
         ax.tick_params(axis="y", labelsize=8)
         ax.spines[["top", "right"]].set_visible(False)
         fig.tight_layout()
