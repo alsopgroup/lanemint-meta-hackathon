@@ -55,3 +55,6 @@ tasks_frontier/answers/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Generated HF dataset folder (built by scripts/export_hf_dataset.py)
+hf_dataset/

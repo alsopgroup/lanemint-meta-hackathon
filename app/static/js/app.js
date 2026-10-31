@@ -709,6 +709,87 @@ document.addEventListener('dragover', (e) => { const z = e.target.closest && e.t
 document.addEventListener('dragleave', (e) => { const z = e.target.closest && e.target.closest('#dropZone'); if (z && !(e.relatedTarget instanceof Node && z.contains(e.relatedTarget))) z.classList.remove('dragging'); });
 document.addEventListener('drop', (e) => { const z = e.target.closest && e.target.closest('#dropZone'); if (z) { e.preventDefault(); z.classList.remove('dragging'); loadFile(e.dataTransfer.files && e.dataTransfer.files[0]); } });
 
+/* ---------------- Chart image check (multimodal) ----------------
+   Live mode posts the image (base64 JSON) to /api/check-image, where
+   Muse Spark receives it as an image input server-side. Simulated
+   mode returns the bundled sample charts' labelled results from the
+   same endpoint; unknown images get an honest simulated notice. */
+let pendingImage = null; // {filename, media_type, image_base64}
+function setPendingImage(filename, mediaType, base64, sourceEl) {
+  pendingImage = { filename, media_type: mediaType, image_base64: base64 };
+  $('imageFileName').textContent = filename;
+  $('imageRunBtn').disabled = false;
+  document.querySelectorAll('.image-sample').forEach(el => el.classList.toggle('selected', el === sourceEl));
+}
+function readImageFile(file, sourceEl) {
+  if (!file) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    const url = String(rd.result || '');
+    const comma = url.indexOf(',');
+    if (comma < 0) return;
+    setPendingImage(file.name, file.type || 'image/png', url.slice(comma + 1), sourceEl);
+  };
+  rd.readAsDataURL(file);
+}
+async function loadSampleCharts() {
+  try {
+    const r = await fetch('/api/sample-charts');
+    if (!r.ok) return;
+    const j = await r.json();
+    $('imageSamples').innerHTML = (j.samples || []).map(s =>
+      `<button class="image-sample" type="button" data-sample-url="${esc(s.url)}" data-sample-name="${esc(s.file_name)}"><img src="${esc(s.url)}" alt="Bundled sample price chart ${esc(s.id)}"></button>`).join('');
+    document.querySelectorAll('.image-sample').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try {
+          const resp = await fetch(btn.dataset.sampleUrl);
+          const blob = await resp.blob();
+          readImageFile(new File([blob], btn.dataset.sampleName, { type: blob.type || 'image/png' }), btn);
+        } catch (e) { /* sample unavailable: leave upload path working */ }
+      });
+    });
+  } catch (e) { /* samples are optional; upload still works */ }
+}
+function renderImageResult(j) {
+  const modeLabel = j.simulated
+    ? badge('warn', 'Simulated — no model called', true)
+    : badge('pass', 'Live · ' + (j.model || 'muse-spark-1.3'), true);
+  const cards = (j.findings || []).map(f => {
+    const ty = TYPES[f.type] || [f.type, 'var(--text-2)'];
+    return `<div class="finding-card"><div class="finding-card-top"><span class="finding-type"><span class="finding-type-dot" style="background:${ty[1]}"></span>${esc(ty[0])}</span></div><span class="finding-title">${esc(f.title)}</span><p class="finding-explain">${esc(f.explain)}</p></div>`;
+  }).join('');
+  const series = (j.series || []).length
+    ? `<div class="image-series"><table><thead><tr><th>Date / label</th><th>Value</th></tr></thead><tbody>${j.series.map(p => `<tr><td>${esc(p.date)}</td><td>${esc(p.value)}</td></tr>`).join('')}</tbody></table></div>`
+    : '<p class="image-file-name">No readable series was extracted from this image.</p>';
+  $('imageResult').innerHTML = `<div class="image-result-head">${modeLabel}${j.summary ? `<span>${esc(j.summary)}</span>` : ''}</div>`
+    + (cards || '<div class="empty-card">No visible data problems reported.</div>') + series;
+}
+async function runImageCheck() {
+  if (!pendingImage) return;
+  const btn = $('imageRunBtn');
+  btn.disabled = true;
+  $('imageResult').innerHTML = '<p class="image-file-name">Analysing image…</p>';
+  try {
+    const r = await fetch('/api/check-image', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pendingImage) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      $('imageResult').innerHTML = `<div class="empty-card">${esc(j.mode === 'simulated'
+        ? 'Simulated mode: this image is not one of the bundled sample charts, so no result is shown — simulated results are never invented for images the demo has not seen. Pick a sample chart above, or run the app with a server-side Meta API key for live analysis.'
+        : (j.error || ('Image check failed (HTTP ' + r.status + ')')))}</div>`;
+      return;
+    }
+    renderImageResult(j);
+  } catch (e) {
+    $('imageResult').innerHTML = '<div class="empty-card">Image check failed — please try again.</div>';
+  } finally {
+    btn.disabled = false;
+  }
+}
+$('imageUploadBtn').addEventListener('click', () => $('imageInput').click());
+$('imageInput').addEventListener('change', (e) => { readImageFile(e.target.files && e.target.files[0], null); e.target.value = ''; });
+$('imageRunBtn').addEventListener('click', runImageCheck);
+loadSampleCharts();
+
 /* ---------------- boot ---------------- */
 render();
 initWaves();

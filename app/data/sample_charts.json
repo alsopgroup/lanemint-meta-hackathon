@@ -1,0 +1,883 @@
+{
+  "samples": [
+    {
+      "id": "task_001",
+      "file_name": "chart_task_001.png",
+      "url": "/static/assets/sample-charts/chart_task_001.png",
+      "sha256": "8314aac04e9ea6a1a483d6577634358c0b75ea95fa0465d205b9c98826450011",
+      "source_csv": "samples/task_001.csv",
+      "summary": "Simulated result for the bundled public sample task_001: the visible problems planted in that sample's price series.",
+      "findings": [
+        {
+          "type": "prices",
+          "title": "One-day price spike",
+          "explain": "The close on 2024-03-15 spikes to about 10.0\u00d7 its neighbours for a single day and then reverts \u2014 a bad tick, not a market move."
+        },
+        {
+          "type": "dups",
+          "title": "Duplicate row",
+          "explain": "The bar for 2024-04-10 appears twice, so that session would be counted twice in any return or volume calculation. Keep one copy."
+        },
+        {
+          "type": "gaps",
+          "title": "Missing day",
+          "explain": "2024-03-22 is a weekday with no bar, so a return across this break covers more than one session. Flag it; do not silently fill it."
+        }
+      ],
+      "series": [
+        {
+          "date": "2024-01-29",
+          "value": 100.0
+        },
+        {
+          "date": "2024-01-30",
+          "value": 97.63
+        },
+        {
+          "date": "2024-01-31",
+          "value": 99.48
+        },
+        {
+          "date": "2024-02-01",
+          "value": 100.1
+        },
+        {
+          "date": "2024-02-02",
+          "value": 100.85
+        },
+        {
+          "date": "2024-02-05",
+          "value": 101.24
+        },
+        {
+          "date": "2024-02-06",
+          "value": 104.62
+        },
+        {
+          "date": "2024-02-07",
+          "value": 106.69
+        },
+        {
+          "date": "2024-02-08",
+          "value": 109.49
+        },
+        {
+          "date": "2024-02-09",
+          "value": 108.87
+        },
+        {
+          "date": "2024-02-12",
+          "value": 107.86
+        },
+        {
+          "date": "2024-02-13",
+          "value": 105.57
+        },
+        {
+          "date": "2024-02-14",
+          "value": 105.06
+        },
+        {
+          "date": "2024-02-15",
+          "value": 99.06
+        },
+        {
+          "date": "2024-02-16",
+          "value": 102.52
+        },
+        {
+          "date": "2024-02-19",
+          "value": 102.87
+        },
+        {
+          "date": "2024-02-20",
+          "value": 103.1
+        },
+        {
+          "date": "2024-02-21",
+          "value": 105.05
+        },
+        {
+          "date": "2024-02-22",
+          "value": 104.26
+        },
+        {
+          "date": "2024-02-23",
+          "value": 104.85
+        },
+        {
+          "date": "2024-02-26",
+          "value": 106.63
+        },
+        {
+          "date": "2024-02-27",
+          "value": 103.12
+        },
+        {
+          "date": "2024-02-28",
+          "value": 106.98
+        },
+        {
+          "date": "2024-02-29",
+          "value": 107.35
+        },
+        {
+          "date": "2024-03-01",
+          "value": 108.8
+        },
+        {
+          "date": "2024-03-04",
+          "value": 106.44
+        },
+        {
+          "date": "2024-03-05",
+          "value": 105.08
+        },
+        {
+          "date": "2024-03-06",
+          "value": 108.92
+        },
+        {
+          "date": "2024-03-07",
+          "value": 107.73
+        },
+        {
+          "date": "2024-03-08",
+          "value": 106.84
+        },
+        {
+          "date": "2024-03-11",
+          "value": 107.97
+        },
+        {
+          "date": "2024-03-12",
+          "value": 111.32
+        },
+        {
+          "date": "2024-03-13",
+          "value": 105.6
+        },
+        {
+          "date": "2024-03-14",
+          "value": 108.98
+        },
+        {
+          "date": "2024-03-15",
+          "value": 1096.5
+        },
+        {
+          "date": "2024-03-18",
+          "value": 111.81
+        },
+        {
+          "date": "2024-03-19",
+          "value": 109.42
+        },
+        {
+          "date": "2024-03-20",
+          "value": 110.19
+        },
+        {
+          "date": "2024-03-21",
+          "value": 114.05
+        },
+        {
+          "date": "2024-03-25",
+          "value": 112.38
+        },
+        {
+          "date": "2024-03-26",
+          "value": 111.37
+        },
+        {
+          "date": "2024-03-27",
+          "value": 110.16
+        },
+        {
+          "date": "2024-03-28",
+          "value": 112.09
+        },
+        {
+          "date": "2024-03-29",
+          "value": 112.61
+        },
+        {
+          "date": "2024-04-01",
+          "value": 111.47
+        },
+        {
+          "date": "2024-04-02",
+          "value": 113.4
+        },
+        {
+          "date": "2024-04-03",
+          "value": 110.79
+        },
+        {
+          "date": "2024-04-04",
+          "value": 107.43
+        },
+        {
+          "date": "2024-04-05",
+          "value": 113.14
+        },
+        {
+          "date": "2024-04-08",
+          "value": 111.65
+        },
+        {
+          "date": "2024-04-09",
+          "value": 115.59
+        },
+        {
+          "date": "2024-04-10",
+          "value": 115.43
+        },
+        {
+          "date": "2024-04-10",
+          "value": 115.43
+        },
+        {
+          "date": "2024-04-11",
+          "value": 114.93
+        },
+        {
+          "date": "2024-04-12",
+          "value": 116.27
+        },
+        {
+          "date": "2024-04-15",
+          "value": 114.19
+        },
+        {
+          "date": "2024-04-16",
+          "value": 112.18
+        },
+        {
+          "date": "2024-04-17",
+          "value": 111.72
+        },
+        {
+          "date": "2024-04-18",
+          "value": 110.84
+        },
+        {
+          "date": "2024-04-19",
+          "value": 112.6
+        },
+        {
+          "date": "2024-04-22",
+          "value": 117.35
+        },
+        {
+          "date": "2024-04-23",
+          "value": 114.44
+        },
+        {
+          "date": "2024-04-24",
+          "value": 112.34
+        },
+        {
+          "date": "2024-04-25",
+          "value": 114.21
+        },
+        {
+          "date": "2024-04-26",
+          "value": 115.52
+        },
+        {
+          "date": "2024-04-29",
+          "value": 118.34
+        },
+        {
+          "date": "2024-04-30",
+          "value": 116.51
+        },
+        {
+          "date": "2024-05-01",
+          "value": 118.05
+        },
+        {
+          "date": "2024-05-02",
+          "value": 117.97
+        },
+        {
+          "date": "2024-05-03",
+          "value": 113.9
+        },
+        {
+          "date": "2024-05-06",
+          "value": 115.04
+        },
+        {
+          "date": "2024-05-07",
+          "value": 111.23
+        },
+        {
+          "date": "2024-05-08",
+          "value": 112.57
+        },
+        {
+          "date": "2024-05-09",
+          "value": 111.52
+        },
+        {
+          "date": "2024-05-10",
+          "value": 111.1
+        },
+        {
+          "date": "2024-05-13",
+          "value": 116.26
+        },
+        {
+          "date": "2024-05-14",
+          "value": 120.12
+        },
+        {
+          "date": "2024-05-15",
+          "value": 121.27
+        }
+      ]
+    },
+    {
+      "id": "task_002",
+      "file_name": "chart_task_002.png",
+      "url": "/static/assets/sample-charts/chart_task_002.png",
+      "sha256": "ec70c3a6105329df042ec1128c2d36352eb83d22695ab4d46f328aaa5c7442a7",
+      "source_csv": "samples/task_002.csv",
+      "summary": "Simulated result for the bundled public sample task_002: the visible problems planted in that sample's price series.",
+      "findings": [
+        {
+          "type": "dups",
+          "title": "Duplicate row",
+          "explain": "The bar for 2024-07-29 appears twice, so that session would be counted twice in any return or volume calculation. Keep one copy."
+        },
+        {
+          "type": "gaps",
+          "title": "Missing day",
+          "explain": "2024-07-15 is a weekday with no bar, so a return across this break covers more than one session. Flag it; do not silently fill it."
+        }
+      ],
+      "series": [
+        {
+          "date": "2024-06-18",
+          "value": 100.0
+        },
+        {
+          "date": "2024-06-19",
+          "value": 100.9
+        },
+        {
+          "date": "2024-06-20",
+          "value": 103.11
+        },
+        {
+          "date": "2024-06-21",
+          "value": 102.66
+        },
+        {
+          "date": "2024-06-24",
+          "value": 102.24
+        },
+        {
+          "date": "2024-06-25",
+          "value": 100.3
+        },
+        {
+          "date": "2024-06-26",
+          "value": 97.93
+        },
+        {
+          "date": "2024-06-27",
+          "value": 98.96
+        },
+        {
+          "date": "2024-06-28",
+          "value": 99.53
+        },
+        {
+          "date": "2024-07-01",
+          "value": 99.46
+        },
+        {
+          "date": "2024-07-02",
+          "value": 97.71
+        },
+        {
+          "date": "2024-07-03",
+          "value": 98.12
+        },
+        {
+          "date": "2024-07-04",
+          "value": 99.74
+        },
+        {
+          "date": "2024-07-05",
+          "value": 95.14
+        },
+        {
+          "date": "2024-07-08",
+          "value": 94.38
+        },
+        {
+          "date": "2024-07-09",
+          "value": 94.51
+        },
+        {
+          "date": "2024-07-10",
+          "value": 92.42
+        },
+        {
+          "date": "2024-07-11",
+          "value": 91.05
+        },
+        {
+          "date": "2024-07-12",
+          "value": 89.72
+        },
+        {
+          "date": "2024-07-16",
+          "value": 84.77
+        },
+        {
+          "date": "2024-07-17",
+          "value": 85.26
+        },
+        {
+          "date": "2024-07-18",
+          "value": 85.3
+        },
+        {
+          "date": "2024-07-19",
+          "value": 84.9
+        },
+        {
+          "date": "2024-07-22",
+          "value": 85.06
+        },
+        {
+          "date": "2024-07-23",
+          "value": 87.65
+        },
+        {
+          "date": "2024-07-24",
+          "value": 91.81
+        },
+        {
+          "date": "2024-07-25",
+          "value": 91.19
+        },
+        {
+          "date": "2024-07-26",
+          "value": 90.23
+        },
+        {
+          "date": "2024-07-29",
+          "value": 94.96
+        },
+        {
+          "date": "2024-07-29",
+          "value": 94.96
+        },
+        {
+          "date": "2024-07-30",
+          "value": 94.58
+        },
+        {
+          "date": "2024-07-31",
+          "value": 96.63
+        },
+        {
+          "date": "2024-08-01",
+          "value": 98.05
+        },
+        {
+          "date": "2024-08-02",
+          "value": 100.29
+        },
+        {
+          "date": "2024-08-05",
+          "value": 97.92
+        },
+        {
+          "date": "2024-08-06",
+          "value": 99.79
+        },
+        {
+          "date": "2024-08-07",
+          "value": 100.8
+        },
+        {
+          "date": "2024-08-08",
+          "value": 100.52
+        },
+        {
+          "date": "2024-08-09",
+          "value": 99.02
+        },
+        {
+          "date": "2024-08-12",
+          "value": 96.77
+        },
+        {
+          "date": "2024-08-13",
+          "value": 96.69
+        },
+        {
+          "date": "2024-08-14",
+          "value": 97.21
+        },
+        {
+          "date": "2024-08-15",
+          "value": 99.98
+        },
+        {
+          "date": "2024-08-16",
+          "value": 98.83
+        },
+        {
+          "date": "2024-08-19",
+          "value": 98.18
+        },
+        {
+          "date": "2024-08-20",
+          "value": 97.54
+        },
+        {
+          "date": "2024-08-21",
+          "value": 99.13
+        },
+        {
+          "date": "2024-08-22",
+          "value": 97.95
+        },
+        {
+          "date": "2024-08-23",
+          "value": 95.51
+        },
+        {
+          "date": "2024-08-26",
+          "value": 96.04
+        },
+        {
+          "date": "2024-08-27",
+          "value": 91.55
+        },
+        {
+          "date": "2024-08-28",
+          "value": 93.06
+        },
+        {
+          "date": "2024-08-29",
+          "value": 90.32
+        },
+        {
+          "date": "2024-08-30",
+          "value": 90.87
+        },
+        {
+          "date": "2024-09-02",
+          "value": 91.48
+        }
+      ]
+    },
+    {
+      "id": "task_003",
+      "file_name": "chart_task_003.png",
+      "url": "/static/assets/sample-charts/chart_task_003.png",
+      "sha256": "62ebe0f4ea6114f390338e720719b37e4c93683bf35cc87cbb2219b996ab0a6a",
+      "source_csv": "samples/task_003.csv",
+      "summary": "Simulated result for the bundled public sample task_003: the visible problems planted in that sample's price series.",
+      "findings": [
+        {
+          "type": "prices",
+          "title": "One-day price spike",
+          "explain": "The close on 2024-05-30 spikes to about 10.0\u00d7 its neighbours for a single day and then reverts \u2014 a bad tick, not a market move."
+        },
+        {
+          "type": "splits",
+          "title": "Unadjusted split",
+          "explain": "From 2024-05-17 prices sit at about 1/2.0 of their previous level and stay there, with volume scaled up \u2014 an unadjusted split. Earlier prices should be adjusted onto the new basis."
+        }
+      ],
+      "series": [
+        {
+          "date": "2024-03-25",
+          "value": 100.0
+        },
+        {
+          "date": "2024-03-26",
+          "value": 95.4
+        },
+        {
+          "date": "2024-03-27",
+          "value": 93.37
+        },
+        {
+          "date": "2024-03-28",
+          "value": 96.02
+        },
+        {
+          "date": "2024-03-29",
+          "value": 96.81
+        },
+        {
+          "date": "2024-04-01",
+          "value": 95.81
+        },
+        {
+          "date": "2024-04-02",
+          "value": 94.92
+        },
+        {
+          "date": "2024-04-03",
+          "value": 96.2
+        },
+        {
+          "date": "2024-04-04",
+          "value": 97.5
+        },
+        {
+          "date": "2024-04-05",
+          "value": 95.34
+        },
+        {
+          "date": "2024-04-08",
+          "value": 96.17
+        },
+        {
+          "date": "2024-04-09",
+          "value": 93.26
+        },
+        {
+          "date": "2024-04-10",
+          "value": 90.54
+        },
+        {
+          "date": "2024-04-11",
+          "value": 90.47
+        },
+        {
+          "date": "2024-04-12",
+          "value": 90.41
+        },
+        {
+          "date": "2024-04-15",
+          "value": 95.19
+        },
+        {
+          "date": "2024-04-16",
+          "value": 94.98
+        },
+        {
+          "date": "2024-04-17",
+          "value": 96.33
+        },
+        {
+          "date": "2024-04-18",
+          "value": 95.27
+        },
+        {
+          "date": "2024-04-19",
+          "value": 94.51
+        },
+        {
+          "date": "2024-04-22",
+          "value": 94.97
+        },
+        {
+          "date": "2024-04-23",
+          "value": 92.82
+        },
+        {
+          "date": "2024-04-24",
+          "value": 94.78
+        },
+        {
+          "date": "2024-04-25",
+          "value": 94.25
+        },
+        {
+          "date": "2024-04-26",
+          "value": 97.76
+        },
+        {
+          "date": "2024-04-29",
+          "value": 99.11
+        },
+        {
+          "date": "2024-04-30",
+          "value": 100.68
+        },
+        {
+          "date": "2024-05-01",
+          "value": 106.46
+        },
+        {
+          "date": "2024-05-02",
+          "value": 108.73
+        },
+        {
+          "date": "2024-05-03",
+          "value": 108.45
+        },
+        {
+          "date": "2024-05-06",
+          "value": 111.16
+        },
+        {
+          "date": "2024-05-07",
+          "value": 109.35
+        },
+        {
+          "date": "2024-05-08",
+          "value": 110.98
+        },
+        {
+          "date": "2024-05-09",
+          "value": 109.59
+        },
+        {
+          "date": "2024-05-10",
+          "value": 106.58
+        },
+        {
+          "date": "2024-05-13",
+          "value": 107.12
+        },
+        {
+          "date": "2024-05-14",
+          "value": 107.48
+        },
+        {
+          "date": "2024-05-15",
+          "value": 104.63
+        },
+        {
+          "date": "2024-05-16",
+          "value": 102.36
+        },
+        {
+          "date": "2024-05-17",
+          "value": 52.56
+        },
+        {
+          "date": "2024-05-20",
+          "value": 53.32
+        },
+        {
+          "date": "2024-05-21",
+          "value": 51.88
+        },
+        {
+          "date": "2024-05-22",
+          "value": 51.21
+        },
+        {
+          "date": "2024-05-23",
+          "value": 53.48
+        },
+        {
+          "date": "2024-05-24",
+          "value": 55.1
+        },
+        {
+          "date": "2024-05-27",
+          "value": 55.0
+        },
+        {
+          "date": "2024-05-28",
+          "value": 55.08
+        },
+        {
+          "date": "2024-05-29",
+          "value": 56.3
+        },
+        {
+          "date": "2024-05-30",
+          "value": 552.0
+        },
+        {
+          "date": "2024-05-31",
+          "value": 56.1
+        },
+        {
+          "date": "2024-06-03",
+          "value": 57.07
+        },
+        {
+          "date": "2024-06-04",
+          "value": 56.07
+        },
+        {
+          "date": "2024-06-05",
+          "value": 55.62
+        },
+        {
+          "date": "2024-06-06",
+          "value": 55.43
+        },
+        {
+          "date": "2024-06-07",
+          "value": 54.76
+        },
+        {
+          "date": "2024-06-10",
+          "value": 52.49
+        },
+        {
+          "date": "2024-06-11",
+          "value": 50.97
+        },
+        {
+          "date": "2024-06-12",
+          "value": 51.05
+        },
+        {
+          "date": "2024-06-13",
+          "value": 53.64
+        },
+        {
+          "date": "2024-06-14",
+          "value": 55.01
+        },
+        {
+          "date": "2024-06-17",
+          "value": 54.91
+        },
+        {
+          "date": "2024-06-18",
+          "value": 52.42
+        },
+        {
+          "date": "2024-06-19",
+          "value": 51.2
+        },
+        {
+          "date": "2024-06-20",
+          "value": 50.02
+        },
+        {
+          "date": "2024-06-21",
+          "value": 49.52
+        },
+        {
+          "date": "2024-06-24",
+          "value": 49.66
+        },
+        {
+          "date": "2024-06-25",
+          "value": 49.76
+        },
+        {
+          "date": "2024-06-26",
+          "value": 52.74
+        },
+        {
+          "date": "2024-06-27",
+          "value": 52.66
+        }
+      ]
+    }
+  ]
+}

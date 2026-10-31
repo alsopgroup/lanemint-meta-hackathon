@@ -365,3 +365,263 @@ def check_csv(filename: str, csv_text: str) -> dict:
             round(estimated_cost, 6) if estimated_cost is not None else None
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Chart-image check (multimodal Muse Spark)
+#
+# Muse Spark 1.3 accepts image input through the same Chat Completions
+# path used above: a ``user`` message whose content is a list of parts —
+# a ``text`` part plus an ``image_url`` part carrying a base64 data URL
+# (Meta Model API docs: "Image understanding" and the "Vision input"
+# cookbook, https://dev.meta.ai/docs/image-understanding). Images go in
+# user messages only. We inline base64 so user uploads never need a
+# public URL. No other model/endpoint is substituted.
+# ---------------------------------------------------------------------------
+
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_SERIES_POINTS = 120
+MAX_SUMMARY_CHARS = 600
+_IMAGE_MEDIA_TYPES = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/webp": (b"RIFF",),  # also requires the WEBP tag; checked below
+    "image/gif": (b"GIF87a", b"GIF89a"),
+}
+
+_IMAGE_SYSTEM_PROMPT = """You are a financial data quality analyst. You inspect an image of a price chart, statement, or data table and report visible data quality problems, and extract the visible series when you can read it.
+
+Return valid JSON only, with exactly this shape:
+{"summary": "One or two plain-English sentences.", "findings": [{"type": "prices", "title": "One-day spike", "explain": "Plain-English explanation of what is visibly wrong."}], "series": [{"date": "2024-01-02", "value": 101.25}]}
+
+Rules:
+- "type" must be one of: "prices" (one-day spikes, bad ticks, zero/negative prints), "gaps" (visible gaps in the series, flat/stale stretches with no movement), "splits" (a sustained level shift by a clean ratio, like an unadjusted split), "dups" (visibly repeated/duplicated bars or rows).
+- Report only problems actually visible in the image. If the series looks clean, return an empty findings list.
+- "series" is your best reading of the plotted/tabulated values (date or label plus numeric value), in order, at most 120 points. If you cannot read values reliably, return an empty list rather than inventing numbers.
+- Do not return anything except the JSON object."""
+
+
+def validate_image(image_bytes: bytes, media_type: str) -> str:
+    """Enforce image caps and magic bytes; returns the normalised media type."""
+    media = (media_type or "").split(";")[0].strip().lower()
+    if media not in _IMAGE_MEDIA_TYPES:
+        raise MuseBadRequest("Image must be PNG, JPEG, WebP, or GIF")
+    if not image_bytes:
+        raise MuseBadRequest("Image is empty")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise MuseBadRequest(f"Image is too large (max {MAX_IMAGE_BYTES} bytes)")
+    if not any(image_bytes.startswith(sig) for sig in _IMAGE_MEDIA_TYPES[media]):
+        raise MuseBadRequest("Image bytes do not match the declared image type")
+    if media == "image/webp" and image_bytes[8:12] != b"WEBP":
+        raise MuseBadRequest("Image bytes do not match the declared image type")
+    return media
+
+
+def _parse_json_object(content: str) -> dict:
+    """Parse a model JSON object (fenced/prose-wrapped tolerated)."""
+    text = (content or "").strip()
+    if "```" in text:
+        start = text.find("```") + 3
+        if text[start:start + 4].lower() == "json":
+            start += 4
+        end = text.find("```", start)
+        text = text[start:end].strip() if end != -1 else text[start:].strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        parsed = None
+        start, end = text.find("{"), text.rfind("}")
+        if 0 <= start < end:
+            try:
+                parsed = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                parsed = None
+        if parsed is None:
+            print(f"[_parse_image_analysis] {_safe_exc_summary(exc)}")
+            raise MuseUpstreamError("Model did not return valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise MuseUpstreamError("Model response is not a JSON object")
+    return parsed
+
+
+def _parse_image_analysis(content: str) -> dict:
+    """Validate a chart-image analysis: findings, summary, extracted series."""
+    parsed = _parse_json_object(content)
+    raw = parsed.get("findings")
+    if not isinstance(raw, list):
+        raise MuseUpstreamError("Model response has no findings list")
+    findings: list[dict] = []
+    for item in raw[:MAX_FINDINGS]:
+        if not isinstance(item, dict):
+            continue
+        ftype = str(item.get("type") or "").strip()
+        if ftype not in ALLOWED_TYPES:
+            continue
+        title = re.sub(r"\s+", " ", str(item.get("title") or "Problem")).strip()
+        explain = re.sub(
+            r"\s+", " ", str(item.get("explain") or item.get("explanation") or "")
+        ).strip()
+        findings.append(
+            {
+                "type": ftype,
+                "title": (title or "Problem")[:MAX_TITLE_CHARS],
+                "explain": explain[:MAX_EXPLAIN_CHARS],
+            }
+        )
+    series: list[dict] = []
+    raw_series = parsed.get("series")
+    if isinstance(raw_series, list):
+        for item in raw_series[:MAX_SERIES_POINTS]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                value = float(item.get("value"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            label = re.sub(
+                r"\s+", " ", str(item.get("date") or item.get("label") or "")
+            ).strip()
+            series.append({"date": label[:32], "value": value})
+    summary = re.sub(r"\s+", " ", str(parsed.get("summary") or "")).strip()
+    return {
+        "summary": summary[:MAX_SUMMARY_CHARS],
+        "findings": findings,
+        "series": series,
+    }
+
+
+# Conservative per-image token allowance for vision input. Image token
+# cost scales with resolution, which cannot be known from the bytes
+# alone without decoding, so the spend guard never reserves on text
+# tokens only: every image call is charged at least this fixed
+# allowance, plus a size-based term from the base64 data URL actually
+# sent, capped at the upload size limit (MAX_IMAGE_BYTES).
+FIXED_IMAGE_TOKEN_ALLOWANCE = 8192
+
+
+def _estimated_image_prompt_tokens(image_size_bytes: int | None = None) -> int:
+    """Conservative upper-bound prompt tokens for one image call.
+
+    Text tokens (~4 chars/token over the system prompt plus the short
+    user instruction) + FIXED_IMAGE_TOKEN_ALLOWANCE + a size-based
+    term: the base64 data URL is ~4/3 the byte size, estimated at
+    ~4 chars/token. ``image_size_bytes=None`` (or any size above the
+    cap) estimates at MAX_IMAGE_BYTES, so a reserve computed before
+    the image is known is still an upper bound for any upload the
+    endpoint will accept.
+    """
+    if image_size_bytes is None:
+        size = MAX_IMAGE_BYTES
+    else:
+        size = min(max(int(image_size_bytes), 0), MAX_IMAGE_BYTES)
+    data_url_chars = 4 * math.ceil(size / 3) + len("data:image/webp;base64,")
+    size_based_tokens = math.ceil(data_url_chars / 4)
+    text_tokens = (len(_IMAGE_SYSTEM_PROMPT) + 256) // 4
+    return text_tokens + FIXED_IMAGE_TOKEN_ALLOWANCE + size_based_tokens
+
+
+def worst_case_image_cost_usd(image_size_bytes: int | None = None) -> float | None:
+    """Worst-case reserve for one image call (cost unknown without pricing).
+
+    Includes the image payload via _estimated_image_prompt_tokens —
+    at the upload size cap when the actual size is not supplied — so
+    the daily-budget reservation cannot underestimate a multimodal
+    call the way a text-only estimate would.
+    """
+    return _cost_usd(_estimated_image_prompt_tokens(image_size_bytes), _max_tokens())
+
+
+def check_chart_image(filename: str, image_bytes: bytes, media_type: str) -> dict:
+    """Call Muse Spark (image input) on a chart/table image.
+
+    Mirrors check_csv's protections: model pinned server-side,
+    reasoning_effort low by default, the shared max_tokens budget, one
+    billed attempt (max_retries=0). Raises MuseNotConfigured with no key.
+    """
+    import base64
+
+    api_key = os.getenv("META_API_KEY") or os.getenv("MODEL_API_KEY")
+    if not api_key:
+        raise MuseNotConfigured("META_API_KEY is not set")
+    media = validate_image(image_bytes, media_type)
+
+    base_url = os.getenv("META_BASE_URL", "https://api.meta.ai/v1")
+    model_name = os.getenv("META_MODEL_NAME", "muse-spark-1.3")
+    try:
+        from openai import OpenAI
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise MuseUpstreamError("openai package is not installed") from exc
+
+    client = OpenAI(base_url=base_url, api_key=api_key, timeout=90.0, max_retries=0)
+    data_url = f"data:{media};base64," + base64.b64encode(image_bytes).decode()
+    create_kwargs: dict = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": _IMAGE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Filename: {filename or 'chart.png'}\n"
+                            "Identify visible data problems in this price chart "
+                            "or table image and extract the series if readable."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "temperature": 0.1,
+        "max_tokens": _max_tokens(),
+    }
+    reasoning_effort = _reasoning_effort()
+    if reasoning_effort is not None:
+        create_kwargs["reasoning_effort"] = reasoning_effort
+    started = time.perf_counter()
+    try:
+        response = client.chat.completions.create(**create_kwargs)
+    except Exception as exc:  # upstream/network errors become a clean 502
+        print(f"[check_chart_image] {_safe_exc_summary(exc)}")
+        raise MuseUpstreamError("Muse request failed") from exc
+    latency_ms = round((time.perf_counter() - started) * 1000)
+
+    content = ""
+    finish_reason = None
+    if response.choices:
+        content = response.choices[0].message.content or ""
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+    if not content.strip():
+        reasoning_tokens = _reasoning_tokens(getattr(response, "usage", None))
+        print(
+            f"[check_chart_image] empty content finish_reason={finish_reason} "
+            f"reasoning_tokens={reasoning_tokens if reasoning_tokens is not None else 'unknown'}"
+        )
+        if finish_reason == "length":
+            raise MuseUpstreamError("Model ran out of tokens before answering")
+        raise MuseUpstreamError("Model returned an empty response")
+    result = _parse_image_analysis(content)
+    usage = getattr(response, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if prompt_tokens is None:
+        # No usage reported: fall back to the same conservative
+        # image-inclusive estimate the budget reserve uses, sized to
+        # the image actually sent — never a text-only estimate.
+        prompt_tokens = _estimated_image_prompt_tokens(len(image_bytes))
+    if completion_tokens is None:
+        completion_tokens = max(1, len(content) // 4)
+    estimated_cost = _cost_usd(prompt_tokens, completion_tokens)
+    return {
+        **result,
+        "mode": "live",
+        "simulated": False,
+        "latency_ms": latency_ms,
+        "model": model_name,
+        "estimated_cost_usd": (
+            round(estimated_cost, 6) if estimated_cost is not None else None
+        ),
+    }
