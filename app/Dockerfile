@@ -39,8 +39,9 @@ EXPOSE 8000
 
 # Railway sets $PORT and also health-checks /healthz itself
 # (railway.toml); this covers plain `docker run` / Compose use.
+# Exec form (no shell) so the probe's quoting cannot be mangled.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\", \"8000\")}/healthz', timeout=4)"
+    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8000') + '/healthz', timeout=4)"]
 
 # No secrets are baked in: META_API_KEY is supplied at runtime only.
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

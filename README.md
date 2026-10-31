@@ -3,19 +3,44 @@
 [![Tests](https://github.com/alsopgroup/lanemint-meta-hackathon/actions/workflows/test.yml/badge.svg)](https://github.com/alsopgroup/lanemint-meta-hackathon/actions/workflows/test.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
-> A synthetic benchmark for evaluating language models on financial data quality tasks
+> **One-line pitch:** a procedurally generated benchmark and live demo that test Meta's Muse models on hard quant-finance data-cleaning and exact numeric work — graded by a deterministic scorer, not by another model.
 
 ![LaneMint x Meta: synthetic market-data benchmark built with Meta's Muse models](docs/assets/banner.png)
 
-Built for Meta's AI Developer Hackathon (October 26 - November 4, 2026) by [LaneMint](https://lanemint.com).
+Built for Meta's Global AI Developer Hackathon (October 26 – November 4, 2026) by [LaneMint](https://lanemint.com), as a new project created during the hackathon.
 
----
+**▶ Live demo:** https://meta.lanemint.com · **🎬 Demo video:** https://youtu.be/r-mvSwYUFLc · **🐳 Quick start:** `docker compose up --build app` → http://localhost:8000
 
-**LaneMint × Meta Benchmark is a benchmark of hard quant-finance coding and data tasks, graded on hidden, procedurally generated synthetic market data.** Every task is generated from a seed, so the evaluation set is effectively unlimited and unseen by any model; the graded frontier tier asks a model to clean messy multi-asset price data and carry out long chains of exact numeric work — rolling risk, vendor reconciliation, factor exposure, and a full portfolio pipeline — where one wrong intermediate step fails the task. It exists to push Meta's Muse models to their frontier: the strongest model we ran passes only half of it. The project was built predominantly with Meta's **Muse Wonder** model in Cursor: after an initial scaffold (repo structure, data generator, runner, easy tier), all development from the hard tier onward was done with Muse Wonder.
-
-**Live demo:** https://meta.lanemint.com
-**Demo video:** coming Nov 3 <!-- TODO: replace this placeholder with the demo video link -->
 **Full technical reference:** the previous long-form README is preserved at [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
+## Contents
+
+- [At a glance for judges](#at-a-glance-for-judges)
+- [Try it in two minutes](#try-it-in-two-minutes)
+- [Meta models used](#meta-models-used)
+- [Architecture](#architecture)
+- [Headline results](#headline-results)
+- [Results](#results)
+- [How it works](#how-it-works)
+- [Reproduce](#reproduce)
+- [Run with Docker](#run-with-docker)
+- [Fine-tuning Muse Glimmer 30B](#fine-tuning-muse-glimmer-30b)
+- [The demo app](#the-demo-app)
+- [Limitations and honest notes](#limitations-and-honest-notes)
+- [License and credits](#license-and-credits)
+
+## At a glance for judges
+
+| Judging pillar | What to look at |
+|---|---|
+| **Impact & alignment** | Financial data quality is real, unglamorous, and consequential when it goes wrong. This benchmark measures whether a model can clean messy market data and carry exact numeric work through to a correct answer — and the live demo lets anyone try that checker on their own CSV. |
+| **Meta AI tooling** | Muse Spark 1.3 powers the live app and headlines the benchmark; Muse Spark Open and Muse Glimmer 30B are evaluated through Fireworks; Glimmer LoRA fine-tuning experiments run through a validated SFT pipeline. See [Meta models used](#meta-models-used). |
+| **Technical depth** | Procedurally generated, effectively unlimited unseen tasks; a deterministic scorer outside the model; an opt-in sandboxed Python tool mode for the runner; and pooled multi-seed results reported with confidence intervals. See [How it works](#how-it-works). |
+| **Demo completeness** | A live deployed app, a two-minute judge path, one-command Docker for both the app and an offline benchmark sample, and full reproduce commands. See [Try it in two minutes](#try-it-in-two-minutes) and [Run with Docker](#run-with-docker). |
+
+**LaneMint × Meta Benchmark is a benchmark of hard quant-finance coding and data tasks, graded on procedurally generated synthetic market data.** Because every task is generated, the evaluation set is effectively unlimited and unseen by any model; the graded frontier tier asks a model to clean messy multi-asset price data and carry out long chains of exact numeric work — rolling risk, vendor reconciliation, factor exposure, and a full portfolio pipeline — where one wrong intermediate step fails the task. It exists to push Meta's Muse models to their frontier: the strongest model we ran passes only half of it without tools.
+
+**Results in one line:** on the hardest held-out tool tier (`tools_frontier`, 90 tasks, tools on, 12 turns), Muse Spark 1.3 passes **70%**, Muse Spark Open **57%**, and Muse Glimmer 30B **30%** — and most Spark 1.3 misses are simply running out of turns on multi-stage work. Full tables are in [Results](#results).
 
 ## Try it in two minutes
 
@@ -82,14 +107,58 @@ Honest footnotes (also shown in the app):
 
 Most Spark 1.3 misses (25 of 27) are running out of turns on multi-stage stateful work. Per-family cells show tasks passed per family; the trace LoRA row is a partial run.
 
-**Secondary finding: fine-tuning Glimmer on answers/traces hurt it once tools were on.** On the frontier tier with tools on, Glimmer 30B (base) reaches roughly 85%, compared with roughly 15% for the trace LoRA and 0% for the answer LoRA; on `tools_frontier`, both LoRA variants score 0% against 30% for the base model.
+**Reading the LoRA rows honestly:** the Glimmer LoRA experiments were deliberately small in scope — limited training runs fitted into hackathon time and available compute — and under those constraints both variants underperformed Glimmer 30B (base) once tools were on (~15% / 0% vs ~85% on the frontier tier; 0% vs 30% on `tools_frontier`, with the trace-LoRA `tools_frontier` run only partial). The SFT pipeline itself is built and validated end to end (see [Fine-tuning](#fine-tuning-muse-glimmer-30b)); the fair conclusion is that this limited-scope experiment did not help, not that fine-tuning Glimmer cannot — a properly resourced training run remains open future work.
 
-## How Meta tools are used
+## Meta models used
+
+Every model below is wired into the code in this repo — file references are given so judges can verify each claim.
+
+| Model | Used for | Where in the repo |
+|---|---|---|
+| **Muse Spark 1.3** (Meta API) | Live mode of the web app, and the headline benchmark model | `app/muse_client.py` (default `META_MODEL_NAME=muse-spark-1.3`, Meta's OpenAI-compatible API at `https://api.meta.ai/v1`); `src/runner.py` uses the same defaults |
+| **Muse Spark Open** (Fireworks serverless) | Benchmark evaluation | The same runner, pointed at Fireworks' OpenAI-compatible endpoint via `META_BASE_URL` / `META_MODEL_NAME` |
+| **Muse Glimmer 30B** (Fireworks) | Benchmark evaluation, plus LoRA fine-tuning experiments | The same runner via Fireworks; `src/finetune_prep.py` + `src/finetune.py` build and validate the LoRA SFT pipeline (base model `accounts/fireworks/models/muse-glimmer-30b`) |
+| **Muse Wonder** (`muse-wonder-1.0`, in Cursor) | The coding model that built this project | All development from the hard tier onward — tiers, scorer, fine-tuning pipeline, demo app, tests and docs — was done with Muse Wonder in Cursor, after an initial scaffold (repo structure, data generator, runner, easy tier). See the development note in [docs/BENCHMARK.md](docs/BENCHMARK.md) |
+
+In short:
 
 - **Meta API — Muse Spark 1.3.** The flagship model is evaluated through Meta's OpenAI-compatible API (`https://api.meta.ai/v1`) by the runner (`src/runner.py`) and powers the live mode of the demo app.
 - **Fireworks — Muse Spark Open and Muse Glimmer 30B.** The open Muse models are evaluated through Fireworks (serverless for Spark Open; Glimmer 30B served on an H200), using the same runner pointed at Fireworks' OpenAI-compatible endpoint.
-- **Glimmer LoRA SFT pipeline.** `src/finetune_prep.py` + `src/finetune.py` build a seed-disjoint supervised fine-tuning dataset for Muse Glimmer 30B and validate it against Fireworks' SFT rules. The locked evaluation seeds (42/1001/1002) are refused as training seeds **by construction** — training uses separate seeds (planned: 2001–2040), directories must declare their seed, and an optional hash check against the built eval sets refuses the run on any overlap.
-- **Muse Wonder in Cursor.** After an initial scaffold (repo structure, data generator, runner, easy tier), all development from the hard tier onward was done with Meta's Muse Wonder model in Cursor — the hard and frontier tiers, scorer hardening, fine-tuning pipeline, demo app, tests, and this README — including the pilot-driven recalibration of the frontier families.
+- **Glimmer LoRA SFT pipeline.** `src/finetune_prep.py` + `src/finetune.py` build a seed-disjoint supervised fine-tuning dataset for Muse Glimmer 30B and validate it against Fireworks' SFT rules; nothing calls the training APIs automatically — the pipeline prints the commands for a human to review and run (see [Fine-tuning](#fine-tuning-muse-glimmer-30b)).
+- **Muse Wonder in Cursor.** After the initial scaffold, all development from the hard tier onward was done with Meta's Muse Wonder model in Cursor — including the pilot-driven recalibration of the frontier families.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph App["Live demo app — app/ (deployed at meta.lanemint.com)"]
+        UI["Browser UI<br/>upload a CSV or pick a sample"]
+        API["FastAPI service<br/>main.py"]
+        SIM["Clearly labelled<br/>simulated mode"]
+        LB["Leaderboard data<br/>app/data/leaderboard.json"]
+        UI --> API
+        API --> SIM
+        API --> LB
+    end
+    API -->|"live mode: server-side key only"| SPARK["Muse Spark 1.3<br/>Meta API"]
+    SIM -.->|"no key configured"| UI
+
+    subgraph Bench["Benchmark — src/"]
+        GEN["Task generator<br/>generate_tasks.py"]
+        TASKS["Generated synthetic<br/>task sets"]
+        RUN["Runner<br/>runner.py / tool_runner.py"]
+        SBX["Sandboxed Python tool<br/>(opt-in, tool mode)"]
+        SCORE["Deterministic scorer<br/>scorer.py"]
+        OUT["Pooled results<br/>with Wilson intervals"]
+        GEN --> TASKS --> RUN --> SCORE --> OUT
+        RUN -.->|"optional run_python calls"| SBX
+    end
+    RUN -->|"Meta API"| SPARK
+    RUN -->|"Fireworks endpoint"| OPEN["Muse Spark Open /<br/>Muse Glimmer 30B"]
+    OUT -.->|"published into the single<br/>leaderboard data file"| LB
+```
+
+Two independent paths share the same Muse models: the **app** answers one CSV at a time for a human (live Muse Spark when a server-side key is configured, otherwise a clearly labelled simulated mode), while the **benchmark** generates fresh synthetic task sets, runs a model over them (optionally with a sandboxed Python tool), and grades every answer with a deterministic scorer outside the model. Published leaderboard numbers live in the single data file the app renders.
 
 ## How it works
 
@@ -222,7 +291,7 @@ python -m src.finetune_prep --tier frontier --seeds 3001-3002 --count 4 --val-se
 python -m src.finetune --train-file finetune_data/train.jsonl --validation-file finetune_data/validation.jsonl --dry-run
 ```
 
-**Status:** LoRA results are reported in [Results](#results) above. With tools on, both LoRA variants underperform Glimmer 30B (base) — fine-tuning on answers/traces hurt Glimmer once tools were available.
+**Status:** LoRA results are reported in [Results](#results) above. Those experiments were kept deliberately small under hackathon time and compute constraints, and under those constraints both LoRA variants underperform Glimmer 30B (base) once tools are available. That is a limited-scope result, not a verdict on fine-tuning Glimmer: the data pipeline, seed-disjointness guards and validation above are the reusable output, and a larger training run is the obvious next step.
 
 ## The demo app
 
@@ -234,7 +303,7 @@ The app in `app/` (deployed at https://meta.lanemint.com) lets judges try the ea
 - **API failures count as failures.** Spark Open's 2% includes 5 tasks lost to API errors (dropped connections, 1 timeout) on the serving side, not wrong answers.
 - **F1 changed mid-flight.** Spark Open's and Glimmer base's seed-42 F1 results predate the current 4-window F1 (they used a 3-window version); all other results use the current version. Pooled totals mix the two only for those two models' seed-42 slice.
 - **One run per model.** Headline numbers are single pooled runs at low reasoning effort, not averages over repeated runs; the Wilson intervals are the honest precision statement.
-- **Fine-tuning hurt with tools on.** The answer- and trace-LoRA variants underperform Glimmer 30B (base) once tools are available (see [Results](#results)); how much of the Spark/Glimmer gap is trainable remains open.
+- **Fine-tuning scope.** The answer- and trace-LoRA variants underperform Glimmer 30B (base) once tools are available (see [Results](#results)), but those were small, deliberately constrained experiments run within hackathon time and compute limits — they show that limited-scope fine-tuning did not help here, not that Glimmer cannot be fine-tuned; how much of the Spark/Glimmer gap is trainable remains open.
 - **Demo vs benchmark.** The interactive demo exercises the easy-tier checker for accessibility; the graded frontier tier is run through the CLI pipeline above, not in the browser.
 
 ## License and credits
