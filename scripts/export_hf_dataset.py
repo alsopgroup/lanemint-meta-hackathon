@@ -1,0 +1,213 @@
+"""Build a Hugging Face dataset folder from NEW public seeds.
+
+Generates a frozen public task set (easy, hard, and frontier tiers)
+from public seeds that are disjoint from every reserved seed set:
+
+- held-out evaluation seeds 42, 1001, 1002 — refused, and their answer
+  keys are never included (nothing from an eval generation is read);
+- planned training seeds 2001-2040 — refused.
+
+Default public seeds: 5001, 5002. The output folder (default
+``hf_dataset/``, git-ignored) contains task CSVs, the generated tasks'
+own answer keys, a ``manifest.json``, and a dataset-card ``README.md``
+ready for ``hf upload`` — see ``docs/HUGGINGFACE.md``. This script
+never uploads anything and needs no Hugging Face token.
+
+Usage:
+    python scripts/export_hf_dataset.py [--output-dir hf_dataset]
+        [--seeds 5001,5002] [--count-easy 6] [--count-hard 6]
+        [--count-frontier 8]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+HELD_OUT_EVAL_SEEDS = {42, 1001, 1002}
+PLANNED_TRAINING_SEEDS = set(range(2001, 2041))
+DEFAULT_SEEDS = (5001, 5002)
+
+DATASET_CARD = """\
+---
+license: other
+language:
+  - en
+task_categories:
+  - question-answering
+tags:
+  - meta-ai
+  - muse-spark
+  - finance
+  - benchmark
+  - synthetic
+pretty_name: LaneMint x Meta Benchmark (public subset)
+size_categories:
+  - n<1K
+---
+
+# LaneMint x Meta Benchmark — public subset
+
+A frozen public subset of the LaneMint x Meta synthetic market-data
+benchmark: procedurally generated quant-finance data-quality tasks
+(clean messy vendor price files, then carry out exact numeric work),
+each with its generated answer key. Built for the Meta AI Developer
+Hackathon (Startups track, "Push the Frontier").
+
+**Status: pending upload.** This card is generated locally by
+`scripts/export_hf_dataset.py`; a human uploads it with their own
+Hugging Face token (see `docs/HUGGINGFACE.md` in the source repo).
+Planned home: `huggingface.co/datasets/<org>/lanemint-meta-benchmark`.
+
+## Contents
+
+- `data/easy/`, `data/hard/`, `data/frontier/` — task CSVs plus
+  `tasks.json` (the task wording given to a model) per seed.
+- `answers/easy/`, `answers/hard/`, `answers/frontier/` — the answer
+  keys generated with these public tasks.
+- `manifest.json` — seeds, per-tier/per-seed counts, and SHA-256 of
+  every file.
+
+## Seeds and held-out data
+
+Generated from NEW public seeds (default 5001, 5002) that are disjoint
+from the held-out evaluation seeds (42, 1001, 1002) and from the
+planned training seeds (2001-2040). **No held-out evaluation tasks or
+answer keys are included.** Same seed regenerates the same tasks
+byte for byte with the source repo's generator.
+
+## License
+
+No open-source license has been attached to the source repository yet
+— all rights are reserved by LaneMint; please ask before reusing the
+code or data outside this hackathon. All data is procedurally
+generated synthetic data; there is no real market data.
+
+## Regenerate
+
+From the source repository:
+
+```bash
+python scripts/export_hf_dataset.py
+```
+"""
+
+
+def _check_seeds(seeds: list[int]) -> None:
+    bad_eval = sorted(set(seeds) & HELD_OUT_EVAL_SEEDS)
+    bad_train = sorted(set(seeds) & PLANNED_TRAINING_SEEDS)
+    if bad_eval:
+        raise SystemExit(f"[export_hf_dataset] refused held-out eval seeds: {bad_eval}")
+    if bad_train:
+        raise SystemExit(
+            f"[export_hf_dataset] refused planned training seeds: {bad_train}"
+        )
+    if not seeds:
+        raise SystemExit("[export_hf_dataset] at least one seed is required")
+
+
+def _generate_tier(tier: str, seed: int, count: int, dest: Path) -> list[str]:
+    """Generate one tier/seed into a temp dir, then move files into dest."""
+    from src.generate_tasks import TaskGenerator
+    from src.hard_tier import HardTaskGenerator
+
+    if tier == "frontier":
+        from src.frontier_tier import FrontierTaskGenerator
+
+        generator = FrontierTaskGenerator(seed=seed)
+    elif tier == "hard":
+        generator = HardTaskGenerator(seed=seed)
+    else:
+        generator = TaskGenerator(seed=seed)
+
+    tmp = dest / f".tmp_{tier}_{seed}"
+    generator.generate_all_tasks(tmp, num_tasks=count)
+    moved: list[str] = []
+    data_dir = dest / "data" / tier / f"seed_{seed}"
+    answers_dir = dest / "answers" / tier / f"seed_{seed}"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    answers_dir.mkdir(parents=True, exist_ok=True)
+    for path in sorted(tmp.iterdir()):
+        if path.is_dir() and path.name == "answers":
+            for answer in sorted(path.iterdir()):
+                target = answers_dir / answer.name
+                shutil.move(str(answer), target)
+                moved.append(str(target.relative_to(dest)))
+        else:
+            target = data_dir / path.name
+            shutil.move(str(path), target)
+            moved.append(str(target.relative_to(dest)))
+    shutil.rmtree(tmp)  # the now-empty answers/ subdir remains behind
+    return moved
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "hf_dataset")
+    parser.add_argument(
+        "--seeds",
+        default=",".join(str(s) for s in DEFAULT_SEEDS),
+        help="Comma-separated NEW public seeds (default: 5001,5002)",
+    )
+    parser.add_argument("--count-easy", type=int, default=6)
+    parser.add_argument("--count-hard", type=int, default=6)
+    parser.add_argument("--count-frontier", type=int, default=8)
+    args = parser.parse_args()
+
+    seeds = [int(s) for s in str(args.seeds).split(",") if s.strip()]
+    _check_seeds(seeds)
+    counts = {"easy": args.count_easy, "hard": args.count_hard,
+              "frontier": args.count_frontier}
+    if any(c <= 0 for c in counts.values()):
+        raise SystemExit("[export_hf_dataset] counts must be positive")
+
+    out: Path = args.output_dir
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+
+    files: list[str] = []
+    per_tier: dict[str, int] = {}
+    for tier, count in counts.items():
+        per_tier[tier] = 0
+        for seed in seeds:
+            moved = _generate_tier(tier, seed, count, out)
+            files.extend(moved)
+            per_tier[tier] += count
+            print(f"[export_hf_dataset] {tier} seed={seed} tasks={count}")
+
+    hashes = {
+        rel: hashlib.sha256((out / rel).read_bytes()).hexdigest()
+        for rel in sorted(files)
+    }
+    manifest = {
+        "dataset": "lanemint-meta-benchmark (public subset, pending upload)",
+        "planned_url": "https://huggingface.co/datasets/<org>/lanemint-meta-benchmark",
+        "seeds": seeds,
+        "excluded_seeds": {
+            "held_out_eval": sorted(HELD_OUT_EVAL_SEEDS),
+            "planned_training": [2001, 2040],
+        },
+        "counts_per_tier": per_tier,
+        "total_tasks": sum(per_tier.values()),
+        "files_sha256": hashes,
+        "regenerate": "python scripts/export_hf_dataset.py",
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (out / "README.md").write_text(DATASET_CARD)
+    size = sum((out / rel).stat().st_size for rel in files)
+    print(
+        f"[export_hf_dataset] wrote {out} "
+        f"({manifest['total_tasks']} tasks, {len(files)} files, {size} bytes)"
+    )
+
+
+if __name__ == "__main__":
+    main()
