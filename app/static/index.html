@@ -13,6 +13,7 @@
 </head>
 <body>
 <input type="file" id="fileInput" accept=".csv,text/csv" hidden>
+<input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
 
 <header class="site-header">
   <div class="header-inner">
@@ -69,6 +70,23 @@
     <div id="stepAnalyze" hidden></div>
     <div id="stepFindings" hidden></div>
     <div id="stepScore" hidden></div>
+  </div>
+</section>
+
+<section id="image-check" class="app-section">
+  <div class="app-heading">
+    <h2>Chart image check</h2>
+    <span class="mode-text">Muse Spark vision · image input</span>
+  </div>
+  <div class="panel image-panel">
+    <p class="image-intro">Upload a screenshot of a price chart or data table. Muse Spark looks for visible spikes, gaps, flat stretches and split-like level shifts, and extracts the series into a table when it can read it. In simulated mode only the bundled sample charts below return results — clearly labelled simulated, from their public answer keys.</p>
+    <div class="image-samples" id="imageSamples"></div>
+    <div class="image-actions">
+      <button class="btn btn-secondary btn-md" id="imageUploadBtn" type="button">Upload chart image</button>
+      <span class="image-file-name" id="imageFileName">No image chosen</span>
+      <button class="btn btn-primary btn-md" id="imageRunBtn" type="button" disabled>Analyse image →</button>
+    </div>
+    <div id="imageResult" aria-live="polite"></div>
   </div>
 </section>
 

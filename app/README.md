@@ -24,6 +24,30 @@ Railway service** — it does not import anything from the repo root.
   If the live call fails, that run completes as clearly-labelled
   simulated demo results instead of hanging or faking a live run.
 
+## Chart image check (multimodal)
+
+The **Chart image check** panel accepts a chart image or screenshot of
+a price series (or a statement/table screenshot), PNG/JPEG/WebP/GIF up
+to 5 MB. Muse Spark 1.3 accepts image input through the same Meta
+Model API Chat Completions path as the CSV check (an `image_url`
+content part with a base64 data URL in a `user` message — see Meta's
+image-understanding docs); `check_chart_image` in `muse_client.py`
+sends exactly that, with the model pinned server-side,
+`reasoning_effort` low, and the shared token budget. It returns visible
+problems (spikes, gaps, flat stretches, split-like level shifts) and
+the extracted series as a table.
+
+- **Live:** `POST /api/check-image` goes through the same guard as
+  `/api/check` (origin check, hard size caps, per-IP and daily caps,
+  worst-case reservation); the key never reaches the browser.
+- **Simulated (no key):** the three bundled sample charts in
+  `static/assets/sample-charts/` (generated from the public
+  `samples/` data by `scripts/make_sample_charts.py`, manifest in
+  `data/sample_charts.json`) are recognised by SHA-256 and return
+  clearly labelled simulated results (`"simulated": true`). Any other
+  image returns `503` with mode `simulated` — no findings are invented
+  for images the demo has not seen.
+
 ## Leaderboard
 
 The page's Leaderboard section shows held-out results for both
@@ -52,7 +76,8 @@ returned to the browser.
 
 ## Live endpoint abuse limits
 
-`POST /api/check` calls the live model, so it is guarded
+`POST /api/check` (and `POST /api/check-image`, which shares the same
+guard, with its own larger body cap for base64 images) calls the live model, so it is guarded
 (`rate_limit.py`, in-memory — resets on redeploy and per replica,
 which fits a single Railway replica but is not a distributed limiter):
 
@@ -163,9 +188,10 @@ Alternatively, from this directory with the Railway CLI:
 
 ## Layout
 
-- `main.py` — FastAPI app: static page, `/healthz`, `/api/config`, `/api/check`, `/api/leaderboard`
+- `main.py` — FastAPI app: static page, `/healthz`, `/api/config`, `/api/check`, `/api/check-image`, `/api/sample-charts`, `/api/leaderboard`
 - `leaderboard.py` + `data/leaderboard.json` — held-out frontier results (single data file, validated on load)
-- `muse_client.py` — server-side Muse client + findings validation
+- `muse_client.py` — server-side Muse client + findings/image validation
+- `sample_charts.py` + `data/sample_charts.json` — bundled sample chart images and their simulated results
 - `rate_limit.py` — in-memory per-IP rate limit, daily call/spend budget, concurrency cap
 - `static/` — page, LaneMint design tokens (`css/`), ported demo logic (`js/app.js`)
 - `tests/test_api.py` — backend tests (health, config secrecy, fallback, live stub)

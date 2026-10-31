@@ -31,20 +31,27 @@ except ImportError:  # pragma: no cover
 
 from leaderboard import load_leaderboard
 from muse_client import (
+    MAX_IMAGE_BYTES,
     MuseBadRequest,
     MuseNotConfigured,
     MuseUpstreamError,
+    check_chart_image,
     check_csv,
     live_config,
     validate_csv,
+    validate_image,
     worst_case_cost_usd,
+    worst_case_image_cost_usd,
 )
 from rate_limit import guard
 from sample_answers import match_sample
+from sample_charts import list_sample_charts, match_sample_chart
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 MAX_BODY_BYTES = 80_000
+# Base64 inflates bytes by ~4/3; allow a 5 MB image plus JSON overhead.
+MAX_IMAGE_BODY_BYTES = (MAX_IMAGE_BYTES * 4 // 3) + 65_536
 
 app = FastAPI(title="Muse Data Check", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -137,7 +144,9 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-async def _read_json_payload(request: Request) -> tuple[dict | None, JSONResponse | None]:
+async def _read_json_payload(
+    request: Request, max_body_bytes: int = MAX_BODY_BYTES
+) -> tuple[dict | None, JSONResponse | None]:
     """Read the request body with a hard size bound, then parse JSON.
 
     Streaming the body (rather than trusting Content-Length) means
@@ -145,13 +154,13 @@ async def _read_json_payload(request: Request) -> tuple[dict | None, JSONRespons
     memory. Returns (payload, None) or (None, error_response).
     """
     content_length = request.headers.get("content-length")
-    if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+    if content_length and content_length.isdigit() and int(content_length) > max_body_bytes:
         return None, JSONResponse({"error": "Request body too large"}, status_code=413)
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
-        if total > MAX_BODY_BYTES:
+        if total > max_body_bytes:
             return None, JSONResponse({"error": "Request body too large"}, status_code=413)
         chunks.append(chunk)
     try:
@@ -223,6 +232,99 @@ async def api_check(request: Request) -> JSONResponse:
         # The upstream may have billed this attempt; settle at the
         # reserved worst case rather than letting it vanish from the
         # daily spend counter. exc text is generic by construction.
+        guard.settle(reserve_usd, reserve_usd)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    finally:
+        guard.release()
+    guard.settle(reserve_usd, float(result.pop("estimated_cost_usd", 0.0) or 0.0))
+    return JSONResponse(result)
+
+
+@app.get("/api/sample-charts")
+def sample_charts() -> dict:
+    """Bundled sample chart images the simulated mode can recognise."""
+    return {"samples": list_sample_charts()}
+
+
+@app.post("/api/check-image")
+async def api_check_image(request: Request) -> JSONResponse:
+    """Chart/table image check via Muse Spark image input (live), or
+    the clearly-labelled simulated result for a bundled sample image
+    when no key is configured. Same guards as /api/check: origin check,
+    hard size caps, per-IP/daily caps via the shared guard, model pinned
+    server-side, key never reaches the browser."""
+    if not _origin_allowed(request):
+        return JSONResponse({"error": "Cross-origin calls are not allowed"}, status_code=403)
+
+    payload, error = await _read_json_payload(request, MAX_IMAGE_BODY_BYTES)
+    if error is not None:
+        return error
+    assert payload is not None
+
+    filename = str(payload.get("filename") or "chart.png")[:200]
+    media_type = payload.get("media_type")
+    encoded = payload.get("image_base64")
+    if not isinstance(encoded, str) or not encoded.strip():
+        return JSONResponse(
+            {"error": "Field 'image_base64' must be a non-empty string"}, status_code=400
+        )
+    if not isinstance(media_type, str) or not media_type.strip():
+        return JSONResponse(
+            {"error": "Field 'media_type' must be a non-empty string"}, status_code=400
+        )
+    import base64
+    import binascii
+
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return JSONResponse({"error": "image_base64 is not valid base64"}, status_code=400)
+    # Validate before taking any live quota or simulated lookup.
+    try:
+        validate_image(image_bytes, media_type)
+    except MuseBadRequest as exc:
+        return JSONResponse({"error": str(exc)}, status_code=413)
+
+    if not live_config()["live"]:
+        simulated = match_sample_chart(image_bytes)
+        if simulated is not None:
+            return JSONResponse(simulated)
+        return JSONResponse(
+            {
+                "error": "Live mode is not configured; simulated image results "
+                "are only available for the bundled sample charts",
+                "mode": "simulated",
+            },
+            status_code=503,
+        )
+
+    worst_case = worst_case_image_cost_usd()
+    reserve_usd = worst_case if worst_case is not None else 0.0
+    allowed, retry_after, reason = guard.acquire(_client_ip(request), reserve_usd)
+    if not allowed:
+        return JSONResponse(
+            {"error": reason},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    try:
+        result = await run_in_threadpool(
+            check_chart_image, filename, image_bytes, media_type
+        )
+    except MuseBadRequest as exc:
+        guard.settle(reserve_usd, reserve_usd)
+        return JSONResponse({"error": str(exc)}, status_code=413)
+    except MuseNotConfigured:
+        guard.settle(reserve_usd, reserve_usd)
+        simulated = match_sample_chart(image_bytes)
+        if simulated is not None:
+            return JSONResponse(simulated)
+        return JSONResponse(
+            {"error": "Live mode is not configured; use simulated responses",
+             "mode": "simulated"},
+            status_code=503,
+        )
+    except MuseUpstreamError as exc:
         guard.settle(reserve_usd, reserve_usd)
         return JSONResponse({"error": str(exc)}, status_code=502)
     finally:
