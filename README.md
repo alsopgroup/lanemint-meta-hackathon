@@ -166,6 +166,44 @@ pip install -r app/requirements.txt httpx
 pytest app/tests -q       # demo app API, leaderboard, live/demo fallback
 ```
 
+## Run with Docker
+
+Only Docker (with the Compose plugin) is needed — no local Python. From a fresh clone:
+
+```bash
+# Optional: copy the env template if you want live mode later.
+# With no keys set, everything below still works in demo/offline mode.
+cp .env.example .env   # then fill in keys in .env only — never commit it
+
+# (1) Live web app (the same app/ service deployed at meta.lanemint.com):
+docker compose up --build app
+# open http://localhost:8000 · health: http://localhost:8000/healthz
+# Without META_API_KEY it runs in clearly labelled simulated/demo mode.
+# Set APP_PORT if 8000 is taken, e.g. APP_PORT=8080 docker compose up --build app
+
+# (2) Sample benchmark run (offline, no keys, no API calls):
+docker compose --profile benchmark run --rm benchmark
+# Generates a fresh easy-tier set (seed 123, 3 tasks), runs the runner
+# with --dry-run (stub model) and scores it. The stub's placeholder
+# answers are expected to score 0 — this proves the pipeline, not a
+# model. The scoring summary is printed in the terminal; the
+# throwaway container is then removed (`--rm`).
+```
+
+Any other benchmark command can be run in the same container by passing it through, e.g. `docker compose --profile benchmark run --rm benchmark python -m src.runner --help`. For a live run, put your key in the gitignored `.env` (or export it) and drop `--dry-run`; note that live mode needs `META_API_KEY` and Meta's Model API is region-gated to the US region. `FIREWORKS_API_KEY` and `META_SITE_API_KEY` are likewise only ever passed at runtime via the environment / `.env` file — no secrets are baked into either image.
+
+Without Compose, the equivalent plain Docker commands are:
+
+```bash
+docker build -t lanemint-meta-app ./app
+docker run --rm -p 8000:8000 lanemint-meta-app          # demo mode without keys
+
+docker build -f Dockerfile.benchmark -t lanemint-meta-benchmark .
+docker run --rm lanemint-meta-benchmark                 # offline sample run
+```
+
+This does not change the Railway deployment: Railway still builds `app/Dockerfile` with `app/` as its root directory, exactly as before.
+
 ## Fine-tuning Muse Glimmer 30B
 
 The fine-tuning path is designed so the headline evaluation can never leak into training:

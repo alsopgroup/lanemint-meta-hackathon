@@ -3,5 +3,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+# Secrets are runtime-only (Railway Variables / Compose env), never baked in
 .env
+.env.*
+!.env.example
 tests/
+Dockerfile
+.dockerignore
