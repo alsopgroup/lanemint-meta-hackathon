@@ -33,7 +33,7 @@ Quant researchers and data engineers spend much of their time cleaning vendor pr
 - [Run with Docker](#run-with-docker)
 - [Fine-tuning Muse Glimmer 30B](#fine-tuning-muse-glimmer-30b)
 - [The demo app](#the-demo-app)
-- [Hugging Face dataset (pending)](#hugging-face-dataset-pending)
+- [Hugging Face dataset](#hugging-face-dataset)
 - [Limitations and honest notes](#limitations-and-honest-notes)
 - [License and credits](#license-and-credits)
 
@@ -321,9 +321,9 @@ The app in `app/` (deployed at https://meta.lanemint.com) lets judges try the ea
 
 **Chart image check (multimodal).** The app also accepts a chart image or screenshot of a price series (or a statement/table screenshot): Muse Spark 1.3 receives it as image input through the Meta Model API (see [Meta models used](#meta-models-used)) and returns visible data problems — spikes, gaps, flat stretches, split-like level shifts — plus the extracted series as a table, shown in the UI. The same live-mode protections apply (image validated server-side, per-IP/daily caps, `reasoning_effort` low, model pinned server-side, key never reaches the browser). Without a key it runs in the clearly labelled simulated mode: the three bundled sample chart images (generated from the public `samples/` data by `scripts/make_sample_charts.py`) return their labelled simulated results, and any other image gets an honest "not a bundled sample" notice instead of invented findings — so judges and Docker users can try the feature with no credentials.
 
-## Hugging Face dataset (pending)
+## Hugging Face dataset
 
-A frozen public subset of the benchmark (easy, hard and frontier tiers, generated from new public seeds — never the held-out eval seeds) is published on Hugging Face at **https://huggingface.co/datasets/LaneMint/lanemint-meta-benchmark**. `scripts/export_hf_dataset.py` builds the dataset folder (task CSVs, answer keys, dataset card), and [docs/HUGGINGFACE.md](docs/HUGGINGFACE.md) has the exact `hf upload` commands used to publish it, plus what exists for the Glimmer LoRA work (no adapter weights in this repo).
+A frozen public subset of the benchmark (easy, hard and frontier tiers, generated from new public seeds — never the held-out eval seeds) is published on Hugging Face at **[huggingface.co/datasets/LaneMint/lanemint-meta-benchmark](https://huggingface.co/datasets/LaneMint/lanemint-meta-benchmark)**. `scripts/export_hf_dataset.py` builds the dataset folder (task CSVs, answer keys, dataset card), and [docs/HUGGINGFACE.md](docs/HUGGINGFACE.md) has the exact `hf upload` commands used to publish it, plus what exists for the Glimmer LoRA work (no adapter weights in this repo).
 
 ## Limitations and honest notes
 
