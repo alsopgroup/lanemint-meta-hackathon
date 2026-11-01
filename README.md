@@ -115,6 +115,17 @@ Honest footnotes (also shown in the app):
 
 Most Spark 1.3 misses (25 of 27) are running out of turns on multi-stage stateful work. Per-family cells show tasks passed per family; the trace LoRA row is a partial run.
 
+### How solid are these numbers?
+
+| Model | Passes (of 90) | 95% interval (Wilson) |
+|---|---|---|
+| Spark 1.3 | 63 (70.0%) | 59.9–78.5% |
+| Spark Open | 51 (56.7%) | 46.4–66.4% |
+| Glimmer base | 27 (30.0%) | 21.5–40.1% |
+| Glimmer + LoRA V3 | 26 (28.9%) | 20.5–39.0% |
+
+Held-out set: 30 tasks × 3 public seeds. In paired tests on the same items, both Spark models clearly beat Glimmer base (p < 0.001). Spark 1.3's lead over Spark Open is smaller and only just significant (p ≈ 0.04). LoRA V3 is statistically indistinguishable from Glimmer base (−1.1 pp, 95% CI −12 to +10 pp, p = 1.0).
+
 ### Failure analysis — pass vs turn-limit miss vs wrong answer
 
 ![Failure analysis — tools_frontier at 12 turns: Muse Spark 1.3 passes 63/90; of its 27 misses, 25 are turn-limit exhaustion and 2 are wrong answers](docs/assets/failure-analysis-tools-frontier.png)
