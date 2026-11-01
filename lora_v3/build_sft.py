@@ -41,6 +41,8 @@ for sd in sorted((ROOT / "runs" / ARM).glob("seed*")):
         assert msgs[-1]["role"] == "assistant" and not msgs[-1].get("tool_calls")
         out["validation" if s in VAL_SEEDS else "train"].append({"messages": msgs, "meta": {"seed": s, "task_id": tid, "type": t["type"], "turns": res["turns"]}})
         stats["kept"] += 1
+if len(out["validation"]) < 8:  # fallback: deterministic ~10% of train as validation
+    import random; tr = out["train"]; random.Random(0).shuffle(tr); k = max(8, len(tr) // 10); out["validation"] += tr[:k]; out["train"] = tr[k:]
 (ROOT / "sft").mkdir(exist_ok=True)
 for k, rows in out.items():
     p = ROOT / "sft" / f"{k}.jsonl"; p.write_text("".join(json.dumps(x) + "\n" for x in rows))

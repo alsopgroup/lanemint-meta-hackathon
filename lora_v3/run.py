@@ -166,7 +166,7 @@ elif a.arm == "open":
     MODEL = "accounts/fireworks/models/muse-spark-open"
     base = TaskRunner(base_url="https://api.fireworks.ai/inference/v1", api_key=os.environ["FIREWORKS_API_KEY"], model_name=MODEL, reasoning_effort="low")
     wrap_sdk(base.client, base.base_url)
-    inner = OpenAIChatClient(base.client, model_name=MODEL, provider="fireworks", reasoning_effort="low", call_timeout=100)
+    inner = OpenAIChatClient(base.client, model_name=MODEL, provider="fireworks", reasoning_effort="low", call_timeout=180)
 else:
     MODEL = f"glimmer-{a.glimmer_model}"; inner, cleanup = make_glimmer()
 client = Guarded(inner)
