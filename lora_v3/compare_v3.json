@@ -1,0 +1,66 @@
+{
+ "base": {
+  "total": {
+   "n": 30,
+   "pass": 7,
+   "err": 0,
+   "turn_limit": 21,
+   "empty_final": 18,
+   "turns": 359
+  },
+  "by_type": {
+   "tools_frontier_convention_risk": {
+    "n": 6,
+    "pass": 4
+   },
+   "tools_frontier_fx_calendar": {
+    "n": 6,
+    "pass": 0
+   },
+   "tools_frontier_portfolio_construction": {
+    "n": 6,
+    "pass": 0
+   },
+   "tools_frontier_reconciliation": {
+    "n": 6,
+    "pass": 0
+   },
+   "tools_frontier_split_holdings": {
+    "n": 6,
+    "pass": 3
+   }
+  }
+ },
+ "v3": {
+  "total": {
+   "n": 30,
+   "pass": 10,
+   "err": 0,
+   "turn_limit": 9,
+   "empty_final": 0,
+   "turns": 265
+  },
+  "by_type": {
+   "tools_frontier_convention_risk": {
+    "n": 6,
+    "pass": 3
+   },
+   "tools_frontier_fx_calendar": {
+    "n": 6,
+    "pass": 4
+   },
+   "tools_frontier_portfolio_construction": {
+    "n": 6,
+    "pass": 0
+   },
+   "tools_frontier_reconciliation": {
+    "n": 6,
+    "pass": 0
+   },
+   "tools_frontier_split_holdings": {
+    "n": 6,
+    "pass": 3
+   }
+  }
+ }
+}
