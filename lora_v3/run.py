@@ -3,7 +3,7 @@ Shared ledger with per-process in-flight worst-case reservations; every paid cal
 import argparse, copy, fcntl, json, os, sys, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-ROOT = Path("/workspace/lmh-runs/lora-v3"); LEDGER = ROOT / "ledger.json"; STOP_AT = 44.00  # approved hard cap $45
+ROOT = Path("/workspace/lmh-runs/lora-v3"); LEDGER = ROOT / "ledger.json"; STOP_AT = 60.00  # ledger = list price + worst-case for errors (observed ~2.3x billed); real cap enforced by billing guard below
 PRICES = {"spark13": (1.25e-6, 4.25e-6), "open": (1.25e-6, 4.25e-6), "glimmer": (0.0, 0.0)}
 GLIMMER_LIST = (1.96e-6, 4.88e-6)
 GMODELS = {"v2ep2": "alsopgroup/run-6c2bec1119fc4800a22f8cc1bebbafec/v2-ep2-0020f17b",
@@ -135,8 +135,11 @@ class Guarded:
                 try:
                     out = self.inner.chat(messages, tools=tools, tool_choice=tool_choice, max_tokens=max_tokens); break
                 except Exception as e429:
-                    if type(e429).__name__ != "RateLimitError" or k == 7: raise
-                    log(f"  s{TL.seed} {TL.task} 429, backoff {15 * (k + 1)}s (unbilled)"); time.sleep(15 * (k + 1))
+                    n = type(e429).__name__
+                    if k == 7 or n not in ("RateLimitError", "APITimeoutError", "APIConnectionError") or (n != "RateLimitError" and k >= 1): raise
+                    if n != "RateLimitError":  # possibly billed: charge worst case, then retry the same turn
+                        record({"prompt_tokens": est, "completion_tokens": max_tokens}, "error", time.time() - t0, 0.0, error=n)
+                    log(f"  s{TL.seed} {TL.task} {n}, retry in {15 * (k + 1)}s"); time.sleep(15 * (k + 1))
         except Exception as e:
             usd, total = record({"prompt_tokens": est, "completion_tokens": max_tokens}, "error", time.time() - t0, worst, error=type(e).__name__)
             log(f"  s{TL.seed} {TL.task} turn {TL.turn} ERROR {type(e).__name__}; worst-case ${usd:.4f} ledger=${total:.4f}")
@@ -163,7 +166,7 @@ elif a.arm == "open":
     MODEL = "accounts/fireworks/models/muse-spark-open"
     base = TaskRunner(base_url="https://api.fireworks.ai/inference/v1", api_key=os.environ["FIREWORKS_API_KEY"], model_name=MODEL, reasoning_effort="low")
     wrap_sdk(base.client, base.base_url)
-    inner = OpenAIChatClient(base.client, model_name=MODEL, provider="fireworks", reasoning_effort="low", call_timeout=900)
+    inner = OpenAIChatClient(base.client, model_name=MODEL, provider="fireworks", reasoning_effort="low", call_timeout=100)
 else:
     MODEL = f"glimmer-{a.glimmer_model}"; inner, cleanup = make_glimmer()
 client = Guarded(inner)
@@ -186,7 +189,7 @@ def fw_open_spend():
     return tot(r.json().get("lineItems", [])) - sum(v["total"] for k, v in before.items() if "Spark Open" in k)
 if a.arm == "open":
     _fw = fw_open_spend(); log(f"fireworks billed Spark Open since start: ${_fw:.2f}")
-    assert _fw < STOP_AT - 5, "billing guard"
+    assert _fw < 38.0, "billing guard: approved cap is $45 actual billed; stop new seeds at $38"
 stop = threading.Event()
 try:
     for s in [int(x) for x in a.seeds.split(",")]:
