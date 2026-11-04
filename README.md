@@ -15,7 +15,7 @@ On the held-out `tools_frontier` tier (tools on, 12 turns, 90 tasks), **Muse Spa
 
 Quant researchers and data engineers spend much of their time cleaning vendor price files before any real analysis can start. Bad ticks, duplicates, gaps and unadjusted splits silently corrupt backtests when they slip through, so a model that can do long, exact, multi-step data work reliably is the one they would actually use.
 
-**▶ Live demo:** https://meta.lanemint.com · **🎬 Demo video:** https://youtu.be/r-mvSwYUFLc · **🐳 Quick start:** `docker compose up --build app` → http://localhost:8000
+**▶ Live demo:** https://meta.lanemint.com · **🎬 Demo video:** https://youtu.be/vZs__XZ4xKo · **🐳 Quick start:** `docker compose up --build app` → http://localhost:8000
 
 **Full technical reference:** the previous long-form README is preserved at [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
