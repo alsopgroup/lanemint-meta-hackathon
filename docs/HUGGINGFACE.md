@@ -3,6 +3,12 @@
 **Status: published.** Dataset home:
 https://huggingface.co/datasets/LaneMint/lanemint-meta-benchmark
 
+V3 LoRA adapter home:
+https://huggingface.co/LaneMint/lanemint-glimmer-tools-lora-v3
+(LoRA r=32, alpha 64, on base `meta-models/Muse-Glimmer-30B`, trained
+via Fireworks serverless training on ~103 teacher examples from the
+public `tools_frontier` tier; see the honest V3 result in the README.)
+
 ## What gets uploaded
 
 `scripts/export_hf_dataset.py` builds a frozen public task set from
@@ -55,9 +61,12 @@ checkpoint files anywhere. The Glimmer LoRA work exists as:
   output model names `muse-glimmer-30b-lora-answer` / `-trace`);
 - the reported LoRA results in the README / `app/data/leaderboard.json`.
 
-The tuned models themselves lived on Fireworks under
+The earlier tuned models themselves lived on Fireworks under
 `accounts/<your-account>/models/muse-glimmer-30b-lora-<target>` (see
 `docs/BENCHMARK.md`). Per the release instructions, no Fireworks or
 other paid API was called to fetch them; if weights are ever released,
 export them from Fireworks with your own credentials and add them as
-a separate model repo — do not add them to this dataset folder.
+a separate model repo — do not add them to this dataset folder. The
+later V3 adapter is the exception now published as its own Hugging
+Face model repo, linked above; it is not stored in this repository
+or in the dataset folder.
