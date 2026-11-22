@@ -392,6 +392,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 if __name__ == "__main__":  # pragma: no cover
     import socket
+
     import uvicorn
 
     port = int(os.getenv("PORT", "8000"))
