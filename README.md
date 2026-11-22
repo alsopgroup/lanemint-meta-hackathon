@@ -15,7 +15,7 @@ On the held-out `tools_frontier` tier (tools on, 12 turns, 90 tasks), **Muse Spa
 
 Quant researchers and data engineers spend much of their time cleaning vendor price files before any real analysis can start. Bad ticks, duplicates, gaps and unadjusted splits silently corrupt backtests when they slip through, so a model that can do long, exact, multi-step data work reliably is the one they would actually use.
 
-**▶ Live demo:** https://meta.lanemint.com · **🎬 Demo video:** https://youtu.be/vZs__XZ4xKo · **🐳 Quick start:** `docker compose up --build app` → http://localhost:8000
+**▶ Live demo:** https://lanemint.tech/demo · **🎬 Demo video:** https://youtu.be/vZs__XZ4xKo · **🐳 Quick start:** `docker compose up --build app` → http://localhost:8000
 
 **Full technical reference:** the previous long-form README is preserved at [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
@@ -39,6 +39,7 @@ Both public artifacts for this project are on Hugging Face, so judges and automa
 - [How it works](#how-it-works)
 - [Reproduce](#reproduce)
 - [Run with Docker](#run-with-docker)
+- [Railway private networking deployment](#railway-private-networking-deployment)
 - [Fine-tuning Muse Glimmer 30B](#fine-tuning-muse-glimmer-30b)
 - [The demo app](#the-demo-app)
 - [Hugging Face dataset and adapter](#hugging-face-dataset-and-adapter)
@@ -60,7 +61,7 @@ Both public artifacts for this project are on Hugging Face, so judges and automa
 
 ## Try it in two minutes
 
-1. **Open the live app and click “Try a sample →”.** Go to [meta.lanemint.com](https://meta.lanemint.com) and press the **Try a sample →** button in the hero (or **Upload CSV** to pick a file yourself). The built-in sample runs straight away so you can see the checker flag problems and explain them in plain English.
+1. **Open the live app and click “Try a sample →”.** Go to [lanemint.tech/demo](https://lanemint.tech/demo) and press the **Try a sample →** button in the hero (or **Upload CSV** to pick a file yourself). The built-in sample runs straight away so you can see the checker flag problems and explain them in plain English.
 2. **Download a sample CSV and upload it.** Grab a ready-made CSV from [`samples/`](samples/) (for example `samples/task_001.csv`), upload it in the app, and run the check. Because that file exactly matches a public sample, the app recognises it and gives you the full score against its answer key, just like the built-in samples. Any other CSV still gets findings, but its Score tab stays disabled — scoring needs an answer key, and only the `samples/` files have one in the app. See [`samples/README.md`](samples/README.md) for what each file contains and how to read its answer key.
 3. **Generate your own fresh data.** One command makes a new, never-seen easy-tier set with its own answer keys:
 
@@ -316,6 +317,27 @@ docker run --rm lanemint-meta-benchmark                 # offline sample run
 
 This does not change the Railway deployment: Railway still builds `app/Dockerfile` with `app/` as its root directory, exactly as before.
 
+## Railway private networking deployment
+
+The FastAPI service in `app/` is deployed on Railway and accessed by the main site's Node server over Railway private networking. The service binds to `::` (dual-stack IPv4/IPv6) by default, which supports both public access and Railway's private network.
+
+**Configuration for the proxy:**
+
+- **Private hostname:** `<service-name>.railway.internal` (Railway provides this for each service)
+- **Port:** The service uses port `8000` by default (set via Railway's `PORT` env var)
+- **X-Real-IP header:** The proxy must forward the visitor's IP address in the `X-Real-IP` header. The service's rate limiting keys on this header to enforce per-visitor limits.
+- **Example proxy URL:** `http://lanemint-meta-hackathon.railway.internal:8000`
+
+**Environment variables:**
+
+- `HOST` — Bind address (default `::` for dual-stack). Set to `0.0.0.0` for IPv4-only if needed.
+- `PORT` — Service port (default `8000`). Railway sets this automatically.
+- `ALLOWED_ORIGINS` — Comma-separated list of additional allowed CORS origins (built-in: `https://lanemint.tech`, `https://www.lanemint.tech`, localhost for dev).
+- `DEMO_REDIRECT_URL` — Optional. When set, GET `/` redirects (302) to this URL instead of serving the static demo page.
+- `META_API_KEY` — Required for live Muse Spark mode. Without it, the service runs in simulated mode.
+
+**Rate limiting:** Per-visitor limits key on `X-Real-IP`, so the trusted proxy must forward the visitor's real IP address in that header.
+
 ## Fine-tuning Muse Glimmer 30B
 
 The fine-tuning path is designed so the headline evaluation can never leak into training:
@@ -338,7 +360,7 @@ python -m src.finetune --train-file finetune_data/train.jsonl --validation-file 
 
 ## The demo app
 
-The app in `app/` (deployed at https://meta.lanemint.com) lets judges try the easy-tier checker interactively: upload or pick a sample CSV, watch Muse Spark flag duplicates, gaps, bad prices and unadjusted splits in plain English, and see the deterministic score. With `META_API_KEY` set server-side it calls Muse Spark 1.3 live (the key never reaches the browser; per-IP and daily caps guard the endpoint); without a key it falls back to a clearly labelled simulated mode — the page always shows which mode you are in. Its leaderboard section renders the same `app/data/leaderboard.json` quoted above. See `app/README.md` for deployment (Railway) details.
+The app in `app/` powers the demo at https://lanemint.tech/demo. The FastAPI service in this directory is the backend API, deployed on Railway and accessed by the main site's Node server over Railway private networking. It handles CSV checking, chart image analysis via Muse Spark 1.3, and the leaderboard data. With `META_API_KEY` set server-side it calls Muse Spark 1.3 live (the key never reaches the browser; per-visitor rate and daily budget limits guard the endpoint, keyed on `X-Real-IP`); without a key it falls back to a clearly labelled simulated mode. Its leaderboard section renders the same `app/data/leaderboard.json` quoted above. See `app/README.md` for deployment (Railway) details.
 
 **Chart image check (multimodal).** The app also accepts a chart image or screenshot of a price series (or a statement/table screenshot): Muse Spark 1.3 receives it as image input through the Meta Model API (see [Meta models used](#meta-models-used)) and returns visible data problems — spikes, gaps, flat stretches, split-like level shifts — plus the extracted series as a table, shown in the UI. The same live-mode protections apply (image validated server-side, per-IP/daily caps, `reasoning_effort` low, model pinned server-side, key never reaches the browser). Without a key it runs in the clearly labelled simulated mode: the three bundled sample chart images (generated from the public `samples/` data by `scripts/make_sample_charts.py`) return their labelled simulated results, and any other image gets an honest "not a bundled sample" notice instead of invented findings — so judges and Docker users can try the feature with no credentials.
 

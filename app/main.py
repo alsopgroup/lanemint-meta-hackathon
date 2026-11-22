@@ -19,7 +19,8 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 try:  # Local development convenience; Railway uses real env vars.
@@ -53,7 +54,35 @@ MAX_BODY_BYTES = 80_000
 # Base64 inflates bytes by ~4/3; allow a 5 MB image plus JSON overhead.
 MAX_IMAGE_BODY_BYTES = (MAX_IMAGE_BYTES * 4 // 3) + 65_536
 
+# Built-in allowed origins for the new lanemint.tech site, plus localhost for dev.
+# ALLOWED_ORIGINS env var (comma-separated) adds extra origins on top of these.
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://lanemint.tech",
+    "https://www.lanemint.tech",
+    "http://localhost:3000",
+    "http://localhost:8000",
+]
+
 app = FastAPI(title="Muse Data Check", docs_url=None, redoc_url=None, openapi_url=None)
+
+# CORS middleware for browser access from lanemint.tech and localhost (local dev).
+# The main site's Node server proxies over Railway private networking, which sends
+# no Origin header, so CORS is not applied to those requests.
+def _get_allowed_origins() -> list[str]:
+    """Built-in lanemint.tech origins plus ALLOWED_ORIGINS env var additions."""
+    origins = DEFAULT_ALLOWED_ORIGINS.copy()
+    extra = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if extra:
+        origins.extend(item.strip() for item in extra.split(",") if item.strip())
+    return origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_get_allowed_origins(),
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    allow_credentials=False,
+)
 
 
 @app.get("/healthz")
@@ -95,21 +124,22 @@ async def api_sample_match(request: Request) -> JSONResponse:
 def _origin_allowed(request: Request) -> bool:
     """Reject cross-origin browser calls to the paid endpoint.
 
-    Same-origin fetches send an Origin whose host matches Host. Origins
-    in ALLOWED_ORIGINS (comma-separated) are also accepted. Requests
-    with no Origin header (curl, health tooling) are not blocked here —
-    the rate/budget limits are the control for non-browser clients.
+    Built-in allowed origins (lanemint.tech, localhost) plus ALLOWED_ORIGINS
+    env var additions are accepted. Same-origin fetches (Origin host matches
+    Host) are also allowed. Requests with no Origin header (server-to-server
+    proxy, curl, health tooling) pass through — the rate/budget limits are
+    the control for non-browser clients.
     """
     origin = request.headers.get("origin")
     if not origin:
         return True
-    allowed = {
-        item.strip().rstrip("/")
-        for item in os.getenv("ALLOWED_ORIGINS", "").split(",")
-        if item.strip()
-    }
-    if origin.rstrip("/") in allowed:
+    # Normalize: strip trailing slash
+    origin_normalized = origin.rstrip("/")
+    # Check against built-in + env var allowed origins
+    allowed = {o.rstrip("/") for o in _get_allowed_origins()}
+    if origin_normalized in allowed:
         return True
+    # Same-origin fallback
     origin_host = urlparse(origin).netloc
     return bool(origin_host) and origin_host == (request.headers.get("host") or "")
 
@@ -348,8 +378,12 @@ def leaderboard() -> JSONResponse:
             {"error": "Leaderboard data is unavailable"}, status_code=500)
 
 
-@app.get("/")
-def index() -> FileResponse:
+@app.get("/", response_class=FileResponse)
+def index():
+    """Serve the demo page, or redirect when DEMO_REDIRECT_URL is set."""
+    redirect_url = os.getenv("DEMO_REDIRECT_URL", "").strip()
+    if redirect_url:
+        return RedirectResponse(url=redirect_url, status_code=302)
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -359,4 +393,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    # HOST env var: '::' for Railway (dual-stack IPv4/IPv6), '0.0.0.0' for local.
+    # Default '::' works for Railway private networking and public access.
+    host = os.getenv("HOST", "::")
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)

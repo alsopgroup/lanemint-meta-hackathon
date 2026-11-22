@@ -616,3 +616,73 @@ def test_parse_findings_prose_without_json_still_rejected(capsys):
     with pytest.raises(muse_client.MuseUpstreamError):
         muse_client._parse_findings("I found {nothing} to report", num_rows=3)
     assert "JSONDecodeError" in capsys.readouterr().out
+
+
+# --- CORS and root redirect tests ---
+
+def test_cors_preflight_allowed_origin():
+    """CORS preflight from lanemint.tech is accepted."""
+    resp = client.options(
+        "/api/check",
+        headers={
+            "Origin": "https://lanemint.tech",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "https://lanemint.tech"
+    assert "POST" in resp.headers.get("access-control-allow-methods", "")
+
+
+def test_cors_post_allowed_origin(monkeypatch):
+    """POST from lanemint.tech passes CORS and origin check."""
+    monkeypatch.delenv("META_API_KEY", raising=False)
+    resp = client.post(
+        "/api/check",
+        json={"filename": "x.csv", "csv": CSV},
+        headers={"Origin": "https://lanemint.tech"},
+    )
+    # Should pass CORS and origin check; fails at 503 (no key)
+    assert resp.status_code == 503
+    assert resp.json()["mode"] == "simulated"
+
+
+def test_cors_disallowed_origin_rejected():
+    """POST from a disallowed origin is rejected by _origin_allowed."""
+    resp = client.post(
+        "/api/check",
+        json={"filename": "x.csv", "csv": CSV},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert resp.status_code == 403
+    assert "not allowed" in resp.json()["error"]
+
+
+def test_cors_no_origin_header_passes():
+    """Requests with no Origin header (server-to-server) pass the check."""
+    # This is already tested in test_check_without_key_falls_back, but
+    # explicitly confirm that no Origin header means the origin check passes.
+    resp = client.post(
+        "/api/check",
+        json={"filename": "x.csv", "csv": CSV},
+        # No Origin header
+    )
+    # Should pass origin check; fails at 503 (no key)
+    assert resp.status_code == 503
+
+
+def test_root_redirect_when_env_set(monkeypatch):
+    """GET / redirects when DEMO_REDIRECT_URL is set."""
+    monkeypatch.setenv("DEMO_REDIRECT_URL", "https://lanemint.tech/demo")
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers.get("location") == "https://lanemint.tech/demo"
+
+
+def test_root_serves_page_when_env_unset(monkeypatch):
+    """GET / serves the static page when DEMO_REDIRECT_URL is unset."""
+    monkeypatch.delenv("DEMO_REDIRECT_URL", raising=False)
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "Muse data check" in resp.text
