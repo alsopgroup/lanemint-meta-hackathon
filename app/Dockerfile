@@ -44,5 +44,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8000') + '/healthz', timeout=4)"]
 
 # No secrets are baked in: META_API_KEY is supplied at runtime only.
-# HOST defaults to '::' (dual-stack IPv4/IPv6) for Railway private networking.
-CMD ["sh", "-c", "uvicorn main:app --host ${HOST:-::} --port ${PORT:-8000}"]
+# HOST defaults to 0.0.0.0 (binds all IPv4 interfaces, including Railway private networking).
+CMD ["sh", "-c", "uvicorn main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000}"]

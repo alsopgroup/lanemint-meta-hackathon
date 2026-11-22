@@ -393,8 +393,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
 
-    # HOST env var: '::' for Railway (dual-stack IPv4/IPv6), '0.0.0.0' for local.
-    # Default '::' works for Railway private networking and public access.
-    host = os.getenv("HOST", "::")
+    # HOST env var: bind address for uvicorn (default 0.0.0.0 for all IPv4 interfaces).
+    # 0.0.0.0 works for Railway private networking, healthchecks, and local development.
+    host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host=host, port=port)
