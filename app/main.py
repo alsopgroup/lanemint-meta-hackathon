@@ -391,10 +391,25 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 if __name__ == "__main__":  # pragma: no cover
+    import socket
+
     import uvicorn
 
-    # HOST env var: bind address for uvicorn (default 0.0.0.0 for all IPv4 interfaces).
-    # 0.0.0.0 works for Railway private networking, healthchecks, and local development.
-    host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host=host, port=port)
+    host = os.getenv("HOST")
+
+    if host:
+        # HOST env var explicitly set: use it directly
+        uvicorn.run(app, host=host, port=port)
+    else:
+        # No HOST set: create dual-stack socket (IPv4 + IPv6) for Railway.
+        # Railway private networking can be IPv6-only in legacy environments,
+        # and the healthcheck needs IPv4 (127.0.0.1). Bind to :: with
+        # IPV6_V6ONLY=0 to accept both IPv4 and IPv6 connections.
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("::", port))
+        sock.listen()
+        sock.set_inheritable(True)
+        uvicorn.run(app, fd=sock.fileno())

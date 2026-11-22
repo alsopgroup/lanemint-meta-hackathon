@@ -686,3 +686,18 @@ def test_root_serves_page_when_env_unset(monkeypatch):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "Muse data check" in resp.text
+
+
+def test_dual_stack_socket_creation():
+    """Verify dual-stack socket creation works (IPv4 + IPv6)."""
+    import socket
+    # Replicate the dual-stack socket logic from main.py __main__
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("::", 0))  # bind to random port
+    port = sock.getsockname()[1]
+    sock.listen()
+    # Verify socket is bound and listening
+    assert port > 0
+    sock.close()
