@@ -330,7 +330,7 @@ The FastAPI service in `app/` is deployed on Railway and accessed by the main si
 
 **Environment variables:**
 
-- `HOST` — Bind address (default `::` for dual-stack). Set to `0.0.0.0` for IPv4-only if needed.
+- `HOST` — Bind address (default `0.0.0.0` for all IPv4 interfaces). Railway private networking uses IPv4.
 - `PORT` — Service port (default `8000`). Railway sets this automatically.
 - `ALLOWED_ORIGINS` — Comma-separated list of additional allowed CORS origins (built-in: `https://lanemint.tech`, `https://www.lanemint.tech`, localhost for dev).
 - `DEMO_REDIRECT_URL` — Optional. When set, GET `/` redirects (302) to this URL instead of serving the static demo page.
